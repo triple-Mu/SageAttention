@@ -75,6 +75,8 @@ for i in range(device_count):
         warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
         continue
     compute_capabilities.add(f"{major}.{minor}")
+for sa in SUPPORTED_ARCHS:
+    compute_capabilities.add(sa)
 
 nvcc_cuda_version = get_nvcc_cuda_version(CUDA_HOME)
 if not compute_capabilities:
@@ -96,6 +98,8 @@ if nvcc_cuda_version < Version("12.8") and any(cc.startswith("12.0") for cc in c
         "CUDA 12.8 or higher is required for compute capability 12.0.")
 
 # Add target compute capabilities to NVCC flags.
+TOTAL_NVCC_FLAGS = []
+QUERY_NVCC_FLAGS = {}
 for capability in compute_capabilities:
     if capability.startswith("8.0"):
         HAS_SM80 = True
@@ -112,10 +116,17 @@ for capability in compute_capabilities:
     elif capability.startswith("12.0"):
         HAS_SM120 = True
         num = "120" # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
-    NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
+    else:
+        continue
+    CUR_NVCC_FLAGS = ["-gencode", f"arch=compute_{num},code=sm_{num}"]
     if capability.endswith("+PTX"):
-        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+        CUR_NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+    TOTAL_NVCC_FLAGS += CUR_NVCC_FLAGS
+    QUERY_NVCC_FLAGS[num] = CUR_NVCC_FLAGS
 
+print(f'{CUR_NVCC_FLAGS=}')
+for k, v in QUERY_NVCC_FLAGS.items():
+    print(f'{k=} {v=}')
 ext_modules = []
 
 if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
@@ -127,7 +138,7 @@ if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": QUERY_NVCC_FLAGS["80"],
         },
     )
     ext_modules.append(qattn_extension)
@@ -141,7 +152,7 @@ if HAS_SM89 or HAS_SM120:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": QUERY_NVCC_FLAGS["89"],
         },
     )
     ext_modules.append(qattn_extension)
@@ -155,7 +166,7 @@ if HAS_SM90:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": QUERY_NVCC_FLAGS["90a"],
         },
         extra_link_args=['-lcuda'],
     )
@@ -167,7 +178,7 @@ fused_extension = CUDAExtension(
     sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
     extra_compile_args={
         "cxx": CXX_FLAGS,
-        "nvcc": NVCC_FLAGS,
+        "nvcc": TOTAL_NVCC_FLAGS,
     },
 )
 ext_modules.append(fused_extension)
