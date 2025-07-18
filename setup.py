@@ -175,7 +175,6 @@ if HAS_SM90:
             "cxx": CXX_FLAGS,
             "nvcc": EXTRA_NVCC_FLAGS['90a'],
         },
-        extra_link_args=['-lcuda'],
         extra_link_args=LINK_ARGS,
     )
     ext_modules.append(qattn_extension)
