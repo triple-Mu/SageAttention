@@ -83,7 +83,7 @@ __device__ __forceinline__ uint32_t get_warp_idx_k()
 template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter, 
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA, typename T>
 __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &smem_offset,
-                                                    const uint32_t &gmem_stride,
+                                                    const int64_t &gmem_stride,
                                                     const smem_t<swizzle_mode, stride> &smem)
 {
   static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
@@ -113,7 +113,7 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
 template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter, 
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA, typename T>
 __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &smem_offset,
-                                                    const uint32_t &gmem_stride,
+                                                    const int64_t &gmem_stride,
                                                     const smem_t<swizzle_mode, stride> &smem, uint32_t base_idx, uint32_t max_len)
 {
   static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
@@ -143,7 +143,7 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
 template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter, 
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA>
 __device__ __forceinline__ void load_fp8_V_global_to_share(int8_t **lane_ptr, uint32_t &smem_offset,
-                                                    const uint32_t &gmem_stride,
+                                                    const int64_t &gmem_stride,
                                                     const smem_t<swizzle_mode, stride> &smem)
 {
   static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);

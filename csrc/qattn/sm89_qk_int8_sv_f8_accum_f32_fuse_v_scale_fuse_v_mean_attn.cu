@@ -53,13 +53,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tenso
   const int batch_size = query.size(0);
   const int head_dim = query.size(3);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
+  int64_t stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
 
   if (tensor_layout == 0)
   {

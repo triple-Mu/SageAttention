@@ -27,7 +27,7 @@
 #include "attn_utils.cuh"
 
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, CUtensorMapL2promotion_enum promotion_mode=CU_TENSOR_MAP_L2_PROMOTION_NONE, typename T>
-CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int stride1, int stride2, int stride3) {
+CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int64_t stride1, int64_t stride2, int64_t stride3) {
     constexpr int smem_stride = BlockMinorSize * sizeof(T);
     static_assert(sizeof(T) == 2 || sizeof(T) == 1);
     static_assert(smem_stride == 32 || smem_stride == 64 || smem_stride == 128);
@@ -128,7 +128,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
                                         const __grid_constant__ CUtensorMap tensorMapK,
                                         const __grid_constant__ CUtensorMap tensorMapV,
                                         float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
-                                        DTypeOut* O, float *__restrict__ Lse, uint32_t stride_bz_o, uint32_t stride_h_o, uint32_t stride_seq_o,
+                                        DTypeOut* O, float *__restrict__ Lse, int64_t stride_bz_o, int64_t stride_h_o, int64_t stride_seq_o,
                                         const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                                         float sm_scale)
 {
@@ -609,13 +609,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
   const int batch_size = query.size(0);
   const int head_dim = query.size(3);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, padded_kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
+  int64_t stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
 
   assert(value.size(0) == batch_size);
 
@@ -791,7 +791,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
   int stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, padded_kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
+  int64_t stride_seq_q, stride_h_q, stride_seq_k, stride_h_k, stride_h_v, stride_d_v, stride_seq_o, stride_h_o;
 
   assert(value.size(0) == batch_size);
 

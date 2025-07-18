@@ -46,10 +46,10 @@ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint3
 __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, DTypeOut *__restrict__ V_mean,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
-                      const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
-                      const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
-                      const uint32_t stride_bz_v, const uint32_t stride_seq_v, const uint32_t stride_h_v,
-                      const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
+                      const int64_t stride_bz_q, const int64_t stride_seq_q, const int64_t stride_h_q,
+                      const int64_t stride_bz_k, const int64_t stride_seq_k, const int64_t stride_h_k,
+                      const int64_t stride_bz_v, const int64_t stride_seq_v, const int64_t stride_h_v,
+                      const int64_t stride_bz_o, const int64_t stride_seq_o, const int64_t stride_h_o,
                       float sm_scale)
 {
   // compile time check
@@ -713,14 +713,14 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
   const int head_dim = query.size(3);
   const int batch_size = query.size(0);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
+  int64_t stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
+  int64_t stride_h_q, stride_h_k, stride_h_v, stride_h_o;
 
   if (tensor_layout == 0)
   {
@@ -887,14 +887,14 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
   const int head_dim = query.size(3);
   const int batch_size = query.size(0);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
+  int64_t stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
+  int64_t stride_h_q, stride_h_k, stride_h_v, stride_h_o;
 
   if (tensor_layout == 0)
   {
@@ -1062,14 +1062,14 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
   const int head_dim = query.size(3);
   const int batch_size = query.size(0);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
+  int64_t stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
+  int64_t stride_h_q, stride_h_k, stride_h_v, stride_h_o;
 
   if (tensor_layout == 0)
   {
@@ -1241,14 +1241,14 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
   const int head_dim = query.size(3);
   const int batch_size = query.size(0);
 
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+  int64_t stride_bz_q = query.stride(0);
+  int64_t stride_bz_k = key.stride(0);
+  int64_t stride_bz_v = value.stride(0);
+  int64_t stride_bz_o = output.stride(0);
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
+  int64_t stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
+  int64_t stride_h_q, stride_h_k, stride_h_v, stride_h_o;
 
   if (tensor_layout == 0)
   {
