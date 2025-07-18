@@ -717,7 +717,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
             
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            auto stream = c10::cuda::getCurrentCUDAStream();
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,
@@ -733,7 +734,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
       });
     });
   });
-
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return lse;
 }
 
@@ -895,7 +896,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
             
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            auto stream = c10::cuda::getCurrentCUDAStream();
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,
@@ -911,6 +913,6 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
       });
     });
   });
-
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return lse;
 }
