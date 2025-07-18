@@ -34,9 +34,12 @@ HAS_SM120 = False
 SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "12.0"}
 
 # Compiler flags.
-CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+# CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+CXX_FLAGS = ["-g", "-O0", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
 NVCC_FLAGS = [
-    "-O3",
+    # "-O3",
+    "-g",
+    "-O0",
     "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -45,6 +48,7 @@ NVCC_FLAGS = [
     "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
 ]
+LINK_ARGS= ["-g", "-O0"]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
@@ -134,6 +138,7 @@ if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
             "cxx": CXX_FLAGS,
             "nvcc": EXTRA_NVCC_FLAGS['80'],
         },
+        extra_link_args=LINK_ARGS,
     )
     ext_modules.append(qattn_extension)
 
@@ -155,6 +160,7 @@ if HAS_SM89 or HAS_SM120:
             "cxx": CXX_FLAGS,
             "nvcc": EXTRA_NVCC_FLAGS['89'],
         },
+        extra_link_args=LINK_ARGS,
     )
     ext_modules.append(qattn_extension)
 
@@ -170,6 +176,7 @@ if HAS_SM90:
             "nvcc": EXTRA_NVCC_FLAGS['90a'],
         },
         extra_link_args=['-lcuda'],
+        extra_link_args=LINK_ARGS,
     )
     ext_modules.append(qattn_extension)
 
@@ -181,6 +188,7 @@ fused_extension = CUDAExtension(
         "cxx": CXX_FLAGS,
         "nvcc": TOTAL_NVCC_FLAGS,
     },
+    extra_link_args=LINK_ARGS,
 )
 ext_modules.append(fused_extension)
 
