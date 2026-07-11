@@ -73,6 +73,92 @@ def test_v_pad_zero_scale_and_roundtrip():
     assert ((deq - vt).abs() <= bound + 1e-7).all()
 
 
+# ---- 阈值：初值，Task 5 在 H200 实测标定后按 max_observed×3 固化 ----
+SIM_DIFF_MAX = 1e-4        # 一级：1-cossim（kernel vs 量化模拟，残差仅 FP22 累加 + exp2/rcp 舍入）
+SIM_MAXREL_MAX = 2e-2      # 一级：max|diff|/max|ref|（s≥4096 放宽为 4e-2，FP22 误差随 s 增长）
+E2E_DIFF_MAX = 2e-3        # 二级：1-cossim（vs fp32 SDPA，量化损失应在论文水平）
+E2E_L1_MAX = 7e-2          # 二级：相对 L1
+
+
+def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    """1 - 余弦相似度（bench/utils.py 同款）。"""
+    x, y = x.double(), y.double()
+    return (1 - 2 * (x * y).sum() / (x * x + y * y).sum()).item()
+
+
+def rel_l1(x: torch.Tensor, ref: torch.Tensor) -> float:
+    return ((x - ref).abs().sum() / ref.abs().sum()).item()
+
+
+# ============ 参考实现 ============
+
+def ref_sdpa(q, k, v, is_causal, sm_scale):
+    """fp32 SDPA 参考（支持 GQA）。输入 NHD，返回 [b, s_q, n_q, d] fp32。"""
+    n_q, n_kv = q.shape[2], k.shape[2]
+    qf = q.permute(0, 2, 1, 3).float()
+    kf = k.permute(0, 2, 1, 3).float()
+    vf = v.permute(0, 2, 1, 3).float()
+    if n_q != n_kv:
+        r = n_q // n_kv
+        kf = kf.repeat_interleave(r, dim=1)
+        vf = vf.repeat_interleave(r, dim=1)
+    s = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale
+    if is_causal:
+        mask = torch.ones(q.shape[1], k.shape[1], dtype=torch.bool, device=q.device).tril()
+        s = s.masked_fill(~mask, float("-inf"))
+    p = torch.softmax(s, dim=-1)
+    return torch.matmul(p, vf).permute(0, 2, 1, 3)
+
+
+def ref_quant_sim(q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, is_causal, sm_scale):
+    """fp32 精确模拟量化 attention，与 kernel 逐块同构：
+    per-128 列块 online softmax，P 在 running-max 域 ×448 转 e4m3 后累加，
+    row_sum 用量化前 f32 P。残差仅剩 kernel 的 FP22 累加与 exp2/rcp 舍入。
+    注意：P→e4m3 发生在 running-max 域，与全局 softmax 后量化不可交换（实测差 3e-4）。
+    返回 [b, s_q, n_q, d] fp32。
+    """
+    b, s_q, n_q, d = q_int8.shape
+    s_k, n_kv = k_int8.shape[1], k_int8.shape[2]
+    g = n_q // n_kv
+    dev = q_int8.device
+
+    qf = q_int8.permute(0, 2, 1, 3).float()
+    kf = k_int8.permute(0, 2, 1, 3).float()
+    vf = v_fp8.float()[..., :s_k]                    # pad 列在 kernel 中被 mask 压零，等价于截断
+    if g != 1:
+        kf = kf.repeat_interleave(g, dim=1)
+        vf = vf.repeat_interleave(g, dim=1)
+        k_scale = k_scale.repeat_interleave(g, dim=1)
+        v_scale = v_scale.repeat_interleave(g, dim=1)
+
+    qs_row = q_scale.repeat_interleave(16, dim=-1)[..., :s_q]     # 行 r → scale[r//16]
+    ks_col = k_scale.repeat_interleave(128, dim=-1)[..., :s_k]    # 列 j → scale[j//128]
+
+    S = torch.matmul(qf, kf.transpose(-1, -2))       # |S|<2^24，fp32 精确
+    S = S * qs_row[..., :, None] * ks_col[..., None, :]
+    if is_causal:
+        mask = torch.ones(s_q, s_k, dtype=torch.bool, device=dev).tril()
+        S = S.masked_fill(~mask, float("-inf"))
+
+    CTA_K = 128
+    c = sm_scale * LOG2E
+    m_run = torch.full((b, n_q, s_q, 1), -5e6, device=dev)   # 有限大负数避免 -inf 参与运算出 NaN
+    d_run = torch.zeros_like(m_run)
+    acc = torch.zeros(b, n_q, s_q, d, device=dev)
+    for it in range((s_k + CTA_K - 1) // CTA_K):
+        sl = slice(it * CTA_K, min((it + 1) * CTA_K, s_k))
+        sb = S[..., sl]
+        m_new = torch.maximum(m_run, sb.amax(-1, keepdim=True))
+        resc = torch.exp2((m_run - m_new) * c)
+        pb = torch.exp2((sb - m_new) * c)
+        d_run = d_run * resc + pb.sum(-1, keepdim=True)       # row_sum 用量化前 P
+        pb448 = (pb * 448.0).to(torch.float8_e4m3fn).float()
+        acc = acc * resc + torch.matmul(pb448, vf[..., sl].transpose(-1, -2))
+        m_run = m_new
+    o = acc * (v_scale / 448.0)[:, :, None, :] / d_run
+    return o.permute(0, 2, 1, 3)
+
+
 # ============ kernel 编译冒烟（需 H200 + cutlass DSL）============
 
 def _sm90_available():
@@ -88,6 +174,112 @@ def test_compile_smoke():
     kern = SageAttnSm90.from_args(128, False, torch.float16, 1)
     assert kern.compiled_kernel is not None
     assert SageAttnSm90.from_args(128, False, torch.float16, 1) is kern   # 缓存命中
+
+
+def _sage_call():
+    try:
+        from .core import sageattn_qk_int8_pv_fp8_hopper
+    except ImportError:
+        from core import sageattn_qk_int8_pv_fp8_hopper
+    return sageattn_qk_int8_pv_fp8_hopper
+
+
+def _run_two_level(q, k, v, is_causal, smooth_k=True, check_l2=True):
+    """一级：kernel vs 量化模拟逐元素紧阈值；二级：端到端 vs fp32 SDPA 松阈值。
+    check_l2=False 供对抗性输入使用（量化模型固有损失超阈值，二级比对无意义）。"""
+    dtype = q.dtype
+    d = q.shape[-1]
+    s_max_dim = max(q.shape[1], k.shape[1])
+    sm_scale = d ** -0.5
+    o = _sage_call()(q, k, v, is_causal=is_causal, sm_scale=sm_scale, smooth_k=smooth_k)
+    assert o.shape == q.shape and o.dtype == dtype
+    of = o.float()
+
+    # km 表达式与 core.py 端到端内部完全一致 → 量化输入 bit-identical
+    km = k.mean(dim=1, keepdim=True) if smooth_k else None
+    q_i8, q_sc = quant_q_int8_per_warp(q)
+    k_i8, k_sc = quant_k_int8_per_block(k, km)
+    v_f8, v_sc = quant_v_fp8_per_channel(v)
+    o_sim = ref_quant_sim(q_i8, q_sc, k_i8, k_sc, v_f8, v_sc, is_causal, sm_scale)
+    o_sim = o_sim.to(dtype).float()                  # 两侧同 cast，剔除输出精度影响
+    d1 = calc_diff(of, o_sim)
+    maxrel = ((of - o_sim).abs().max() / o_sim.abs().max().clamp_min(1e-6)).item()
+    maxrel_lim = SIM_MAXREL_MAX if s_max_dim < 4096 else 2 * SIM_MAXREL_MAX
+    assert d1 < SIM_DIFF_MAX, f"level1 1-cossim={d1:.3e}"
+    assert maxrel < maxrel_lim, f"level1 maxrel={maxrel:.3e}"
+
+    if not check_l2:
+        print(f"  L1: 1-cos={d1:.2e} maxrel={maxrel:.2e} | L2: skipped")
+        return
+    o_ref = ref_sdpa(q, k, v, is_causal, sm_scale)
+    d2, l2 = calc_diff(of, o_ref), rel_l1(of, o_ref)
+    assert d2 < E2E_DIFF_MAX, f"level2 1-cossim={d2:.3e}"
+    assert l2 < E2E_L1_MAX, f"level2 rel_l1={l2:.3e}"
+    print(f"  L1: 1-cos={d1:.2e} maxrel={maxrel:.2e} | L2: 1-cos={d2:.2e} rel_l1={l2:.2e}")
+
+
+def _mk_qkv(b, n_q, n_kv, s_q, s_k, d, dtype, seed=42):
+    torch.manual_seed(seed)
+    dev = "cuda"
+    q = torch.randn(b, s_q, n_q, d, dtype=dtype, device=dev)
+    # K 加通道偏置让 smooth_k 起实际作用
+    k = torch.randn(b, s_k, n_kv, d, dtype=dtype, device=dev) \
+        + torch.randn(1, 1, n_kv, d, dtype=dtype, device=dev) * 2
+    v = torch.randn(b, s_k, n_kv, d, dtype=dtype, device=dev)
+    return q, k, v
+
+
+# (b, n_q, n_kv, s_q, s_k, d)；大组合标 slow（迭代时 -m "not slow" 跳过）
+_SHAPES = (
+    [(b, n, n, s, s, d) for b in (1, 2) for n in (8, 24)
+     for s in (1024, 4096, 337) for d in (64, 128)]
+    + [(1, 8, 8, s, s, d) for s in (64, 100, 128) for d in (64, 128)]   # 单 KV 块边界
+    + [(1, 4, 4, 337, 1024, 128)]                                       # s_q != s_k（仅 non-causal）
+    + [(2, 8, 4, 1024, 1024, 128), (2, 8, 4, 1024, 1024, 64)]           # GQA
+)
+
+
+def _params():
+    out = []
+    for c in _SHAPES:
+        b, n_q, n_kv, s_q, s_k, d = c
+        marks = [pytest.mark.slow] if b * n_q * max(s_q, s_k) >= 2 * 24 * 4096 else []
+        out.append(pytest.param(*c, marks=marks,
+                                id=f"b{b}nq{n_q}nkv{n_kv}sq{s_q}sk{s_k}d{d}"))
+    return out
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("b,n_q,n_kv,s_q,s_k,d", _params())
+def test_kernel_two_level(b, n_q, n_kv, s_q, s_k, d, is_causal, dtype):
+    if is_causal and s_q != s_k:
+        pytest.skip("causal 要求 s_q == s_k")
+    q, k, v = _mk_qkv(b, n_q, n_kv, s_q, s_k, d, dtype)
+    _run_two_level(q, k, v, is_causal)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
+@pytest.mark.parametrize("is_causal", [False, True], ids=["full", "causal"])
+def test_kernel_scale_indexing(is_causal):
+    """异质量级 stress：相邻 warp 段 / K 块 / V channel 的 amax 差 4 倍，
+    kernel 侧任一 scale 索引错位都会被一级比对放大为数量级误差，稳定检出。
+    仅一级比对：该输入 max|logit|≈3.7e4，int8 噪声过 exp 后二级固有损失
+    1-cossim=3.8e-2/8.7e-2（full/causal，sim-vs-sdpa 实测，与 kernel 无关）。"""
+    b, n, s, d = 1, 4, 512, 128
+    q, k, v = _mk_qkv(b, n, n, s, s, d, torch.float16, seed=0)
+    dev = q.device
+    q = q * (4.0 ** (torch.arange(s, device=dev) // 16 % 4))[None, :, None, None].half()
+    k = k * (4.0 ** (torch.arange(s, device=dev) // 128 % 4))[None, :, None, None].half()
+    v = v * (4.0 ** (torch.arange(d, device=dev) % 4))[None, None, None, :].half()
+    _run_two_level(q, k, v, is_causal, check_l2=False)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
+def test_kernel_no_smooth_k():
+    q, k, v = _mk_qkv(1, 8, 8, 1024, 1024, 128, torch.float16)
+    _run_two_level(q, k, v, is_causal=False, smooth_k=False)
 
 
 if __name__ == "__main__":
