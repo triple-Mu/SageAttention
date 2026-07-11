@@ -5,7 +5,6 @@ import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 try:
     from .core import quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel

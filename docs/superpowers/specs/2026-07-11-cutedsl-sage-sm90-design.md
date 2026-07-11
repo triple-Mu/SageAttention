@@ -56,7 +56,7 @@ cutedsl_sage/
 ### 线程组织与 pipeline
 
 - 256 线程 = 2 warpgroup：WG math（consumer，`warpgroup_reg_alloc(240)`）+ WG load（producer，`warpgroup_reg_dealloc(24)`）
-- `PipelineTmaAsync` 管 K/V stage：d=128 时 kv_stage=3 起步（smem ≈ Q 8KB + 3×(16KB K + 16KB V) = 104KB ≤ 228KB），d=64 可加深
+- `PipelineTmaAsync` 管 K/V stage：d=128 时 kv_stage=3 起步（smem ≈ Q 8KB + 3×(16KB K + 16KB V) = 104KB ≤ 228KB），d=64 可加深（实施定稿：K/V 共用环形缓冲，kv_stage=6/10，见 plan）
 - tile = (CTA_Q=64, CTA_K=128)；grid = `(ceil(s_q/64), b, n_q)`，对齐骨架 `s_idx, b_idx, head_block_idx = cute.arch.block_idx()` 约定；GQA：`kv_head = head // (n_q // n_kv)`
 
 ### 数据通路
@@ -101,3 +101,4 @@ cutedsl_sage/
     FP22 累加误差仍远小于量化固有损失，32K 内单级累加可接受，暂不需要两级累加
 - torch 量化实现的端到端性能不是本期目标；kernel 本体性能优化（2 math WG ping-pong 等）留作后续
 - 本地开发机为 sm86，无法本地运行，编译/数值问题只能远程迭代
+- 环境事实：nvidia-cutlass-dsl 4.6.0 安装时把 cuda-bindings 降到 12.8.0，与 torch 2.11 声明的 >=12.9.4 产生 pip 依赖告警——冒烟与全量测试均无实际影响，遇 cuda-bindings 相关报错先查此处
