@@ -94,5 +94,10 @@ cutedsl_sage/
 
 - `nvidia-cutlass-dsl` 需 ≥4.2（`--enable-tvm-ffi`）；DSL API 迭代快，以实际安装版本自带 examples 校对 fmha.py 用法
 - 单级 FP32 累加（FP22）超长序列精度衰减——已知取舍，两级累加留作后续迭代
+  - 2026-07-12 H200 实测（`test_fp22_long_seq`，b=1 n=2 d=128 fp16 non-causal）：
+    s=16384 一级 1-cossim=6.76e-6、maxrel=1.44e-2；s=32768 一级 1-cossim=1.37e-5、maxrel=1.32e-2
+    （对比全矩阵 s≤4096 的一级 1-cossim max 3.24e-6：随 s 近似线性增长，16K≈2×、32K≈4×）
+  - 二级端到端 1-cossim 在 16K/32K 分别为 7.25e-4/7.81e-4，与 s≤4096 矩阵（max 8.55e-4）持平——
+    FP22 累加误差仍远小于量化固有损失，32K 内单级累加可接受，暂不需要两级累加
 - torch 量化实现的端到端性能不是本期目标；kernel 本体性能优化（2 math WG ping-pong 等）留作后续
 - 本地开发机为 sm86，无法本地运行，编译/数值问题只能远程迭代

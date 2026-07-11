@@ -73,11 +73,15 @@ def test_v_pad_zero_scale_and_roundtrip():
     assert ((deq - vt).abs() <= bound + 1e-7).all()
 
 
-# ---- 阈值：初值，Task 5 在 H200 实测标定后按 max_observed×3 固化 ----
-SIM_DIFF_MAX = 1e-4        # 一级：1-cossim（kernel vs 量化模拟，残差仅 FP22 累加 + exp2/rcp 舍入）
+# ---- 阈值：2026-07-12 H200 全矩阵实测标定（kernel @ 7d027e9），规则 max_observed×3
+#      取整到一位有效数字；若 ×3 比原阈值松则保持原值（收紧原则）----
+SIM_DIFF_MAX = 1e-5        # 一级：1-cossim（kernel vs 量化模拟，残差仅 FP22 累加 + exp2/rcp 舍入）
+                           #   实测 max 3.24e-6 ×3=9.7e-6 → 1e-5（原 1e-4）
 SIM_MAXREL_MAX = 2e-2      # 一级：max|diff|/max|ref|（s≥4096 放宽为 4e-2，FP22 误差随 s 增长）
+                           #   实测 max 7.21e-3 (s<4096) ×3=2.16e-2 → 2e-2 不变；s≥4096 实测 max 8.4e-3
 E2E_DIFF_MAX = 2e-3        # 二级：1-cossim（vs fp32 SDPA，量化损失应在论文水平）
-E2E_L1_MAX = 7e-2          # 二级：相对 L1
+                           #   实测 max 8.55e-4 ×3=2.6e-3 取整反而更松 → 保持 2e-3（余量 2.3×）
+E2E_L1_MAX = 7e-2          # 二级：相对 L1。实测 max 4.12e-2 ×3=1.2e-1 更松 → 保持 7e-2（余量 1.7×）
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -280,6 +284,28 @@ def test_kernel_scale_indexing(is_causal):
 def test_kernel_no_smooth_k():
     q, k, v = _mk_qkv(1, 8, 8, 1024, 1024, 128, torch.float16)
     _run_two_level(q, k, v, is_causal=False, smooth_k=False)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
+@pytest.mark.parametrize("s", [16384, 32768])
+def test_fp22_long_seq(s):
+    """单级 FP32(FP22) 累加的长序列误差趋势观察：只按二级（松）阈值断言，
+    一级指标打印出来供人工评估是否需要两级累加。
+    n=2 控制 ref_quant_sim 显存（s=32768 时 S 矩阵 2×32768²×4B ≈ 8.6GB/份）。"""
+    q, k, v = _mk_qkv(1, 2, 2, s, s, 128, torch.float16)
+    sm_scale = 128 ** -0.5
+    o = _sage_call()(q, k, v, is_causal=False, sm_scale=sm_scale).float()
+    km = k.mean(dim=1, keepdim=True)
+    q_i8, q_sc = quant_q_int8_per_warp(q)
+    k_i8, k_sc = quant_k_int8_per_block(k, km)
+    v_f8, v_sc = quant_v_fp8_per_channel(v)
+    o_sim = ref_quant_sim(q_i8, q_sc, k_i8, k_sc, v_f8, v_sc, False, sm_scale).float()
+    o_ref = ref_sdpa(q, k, v, False, sm_scale)
+    print(f"\n[s={s}] L1: 1-cos={calc_diff(o, o_sim):.2e} "
+          f"maxrel={((o - o_sim).abs().max() / o_sim.abs().max()).item():.2e} | "
+          f"L2: 1-cos={calc_diff(o, o_ref):.2e} rel_l1={rel_l1(o, o_ref):.2e}")
+    assert calc_diff(o, o_ref) < E2E_DIFF_MAX
 
 
 if __name__ == "__main__":
