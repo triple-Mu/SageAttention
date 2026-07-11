@@ -73,5 +73,22 @@ def test_v_pad_zero_scale_and_roundtrip():
     assert ((deq - vt).abs() <= bound + 1e-7).all()
 
 
+# ============ kernel 编译冒烟（需 H200 + cutlass DSL）============
+
+def _sm90_available():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
+def test_compile_smoke():
+    try:
+        from .core import SageAttnSm90
+    except ImportError:
+        from core import SageAttnSm90
+    kern = SageAttnSm90.from_args(128, False, torch.float16, 1)
+    assert kern.compiled_kernel is not None
+    assert SageAttnSm90.from_args(128, False, torch.float16, 1) is kern   # 缓存命中
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
