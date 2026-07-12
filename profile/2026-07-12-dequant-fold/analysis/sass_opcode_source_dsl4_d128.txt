@@ -1,0 +1,178 @@
+== source_dsl4_d128: warp inst_executed by SASS opcode (total 635,471,057) ==
+FFMA                     138,412,032   21.78%
+FMNMX                     71,303,168   11.22%
+FADD                      69,337,088   10.91%
+MUFU.EX2                  69,206,016   10.89%
+I2FP.F32.S32              67,108,864   10.56%
+FSEL                      34,734,080    5.47%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C      33,554,432    5.28%
+UMOV                      20,668,416    3.25%
+PRMT                      16,777,216    2.64%
+UIADD3                    16,596,992    2.61%
+FMUL                      10,485,760    1.65%
+IMAD.MOV.U32               6,125,894    0.96%
+BRA                        5,642,922    0.89%
+IMAD.U32                   5,267,683    0.83%
+SHFL.BFLY                  4,325,376    0.68%
+ULEA                       4,292,608    0.68%
+ULOP3.LUT                  4,194,304    0.66%
+IGMMA.64x128x32.S8.S8.SAT       4,194,304    0.66%
+QGMMA.64x128x32.F32.E4M3.E4M3       4,194,304    0.66%
+USEL                       4,128,768    0.65%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       3,801,315    0.60%
+LOP3.LUT                   3,497,984    0.55%
+VIADD                      3,375,104    0.53%
+CS2R                       2,129,920    0.34%
+WARPGROUP.DEPBAR.LE        2,129,920    0.34%
+SYNCS.ARRIVE.TRANS64.ART0       2,129,920    0.34%
+USHF.R.U32.HI              2,097,152    0.33%
+WARPGROUP.ARRIVE           2,097,152    0.33%
+FSETP.NEU.AND              2,097,152    0.33%
+UISETP.NE.U32.AND          2,064,384    0.32%
+UIADD3.X                   1,613,824    0.25%
+ISETP.NE.U32.AND           1,384,448    0.22%
+
+== stall samples by SASS opcode ==
+total samples: 164,062
+WARPGROUP.DEPBAR.LE       30,338   18.49%
+BRA                       25,533   15.56%
+MUFU.EX2                  24,228   14.77%
+FMNMX                     15,464    9.43%
+FFMA                      13,084    7.98%
+I2FP.F32.S32               9,659    5.89%
+FADD                       6,015    3.67%
+FSEL                       5,044    3.07%
+LOP3.LUT                   4,168    2.54%
+PRMT                       3,787    2.31%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C       2,907    1.77%
+IGMMA.64x128x32.S8.S8.SAT       2,048    1.25%
+QGMMA.64x128x32.F32.E4M3.E4M3       1,799    1.10%
+ULEA                       1,662    1.01%
+UIADD3                     1,553    0.95%
+UMOV                       1,515    0.92%
+FMUL                       1,189    0.72%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       1,179    0.72%
+IMAD.U32                     894    0.54%
+IMAD.MOV.U32                 740    0.45%
+
+== top 40 PCs by pcsamp samples ==
+pc=0x79d46579ff10 samples= 14,945 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=14759
+pc=0x79d4657a19c0 samples= 14,594 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=14354
+pc=0x79d46579ed10 samples=  6,623 inst_exec=      65,536
+    @!P0  BRA 0x79d4657a9890
+    long_scoreboard=6611
+pc=0x79d46579eec0 samples=  5,925 inst_exec=      65,536
+    @!P0  BRA 0x79d4657a9950
+    long_scoreboard=5918
+pc=0x79d46579e960 samples=  5,257 inst_exec=      65,536
+    @!P0  BRA 0x79d4657a9690
+    long_scoreboard=5238
+pc=0x79d46579eb20 samples=  4,921 inst_exec=      65,536
+    @!P0  BRA 0x79d4657a9790
+    long_scoreboard=4911
+pc=0x79d46579fec0 samples=  3,351 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    math_pipe_throttle=1894 not_selected=1232 wait=173
+pc=0x79d4657a0480 samples=  1,642 inst_exec=   1,015,808
+    FMNMX R149, R28, R25, !PT
+    short_scoreboard=1413
+pc=0x79d46579f8d0 samples=  1,251 inst_exec=      32,768
+    @!P0  BRA 0x79d4657a9af0
+    long_scoreboard=1243
+pc=0x79d46579fdb0 samples=  1,043 inst_exec=   1,015,808
+    IGMMA.64x128x32.S8.S8.SAT R24, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=968 selected=59
+pc=0x79d4657a0ab0 samples=    894 inst_exec=   1,015,808
+    MUFU.EX2 R29, R29
+    mio_throttle=393 wait=379 not_selected=77
+pc=0x79d4657a0b40 samples=    867 inst_exec=   1,015,808
+    MUFU.EX2 R52, R52
+    wait=376 mio_throttle=366 not_selected=71 selected=52
+pc=0x79d4657a0b30 samples=    861 inst_exec=   1,015,808
+    MUFU.EX2 R37, R37
+    mio_throttle=390 wait=333 not_selected=82 selected=53
+pc=0x79d4657a0a90 samples=    860 inst_exec=   1,015,808
+    MUFU.EX2 R33, R33
+    mio_throttle=431 wait=252 not_selected=122 selected=51
+pc=0x79d4657a0aa0 samples=    853 inst_exec=   1,015,808
+    MUFU.EX2 R46, R46
+    wait=364 mio_throttle=361 selected=65 not_selected=63
+pc=0x79d4657a1880 samples=    795 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R96, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=675 not_selected=56 selected=42
+pc=0x79d4657a0fa0 samples=    774 inst_exec=   1,015,808
+    MUFU.EX2 R39, R39
+    wait=282 mio_throttle=232 not_selected=165 selected=62
+pc=0x79d4657a1800 samples=    735 inst_exec=   1,015,808
+    ULEA UR4, UR7, UR12, 0xa
+    not_selected=363 branch_resolving=157 no_instructions=134 math_pipe_throttle=53
+pc=0x79d4657a1930 samples=    707 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R104, gdesc[UR8], R24
+    wait=537 not_selected=73 selected=52 dispatch_stall=45
+pc=0x79d46579fc30 samples=    689 inst_exec=   1,015,808
+    ULEA UR16, UR4, UR41, 0x3
+    no_instructions=484 branch_resolving=155
+pc=0x79d4657a0b70 samples=    686 inst_exec=   1,015,808
+    MUFU.EX2 R50, R50
+    mio_throttle=296 wait=283 selected=59 not_selected=45
+pc=0x79d4657a1830 samples=    664 inst_exec=   1,015,808
+    S2R R154, SR_TID.X
+    not_selected=354 wait=224 selected=53
+pc=0x79d46579ff00 samples=    653 inst_exec=   1,015,808
+    SYNCS.PHASECHK.TRANS64.TRYWAIT P0, [UR8+0x10], R156
+    wait=515 selected=49 dispatch_stall=47 not_selected=42
+pc=0x79d46579fd60 samples=    638 inst_exec=   1,015,808
+    @!P0  BRA 0x79d4657a9b50
+    long_scoreboard=544 selected=56 not_selected=37
+pc=0x79d4657a0910 samples=    636 inst_exec=   1,015,808
+    MUFU.EX2 R42, R44
+    mio_throttle=405 wait=96 not_selected=75 selected=55
+pc=0x79d4657a09c0 samples=    635 inst_exec=   1,015,808
+    MUFU.EX2 R45, R45
+    mio_throttle=379 wait=116 not_selected=71 selected=65
+pc=0x79d46579ff70 samples=    593 inst_exec=   1,015,808
+    FMNMX R24, R177, R24, !PT
+    math_pipe_throttle=240 not_selected=218 wait=69 selected=60
+pc=0x79d4657a1000 samples=    566 inst_exec=   1,015,808
+    MUFU.EX2 R80, R84
+    wait=303 mio_throttle=175 selected=55 not_selected=32
+pc=0x79d4657a0b50 samples=    556 inst_exec=   1,015,808
+    FMNMX R97, R60, R97, !PT
+    short_scoreboard=319 math_pipe_throttle=95 not_selected=78 selected=48
+pc=0x79d4657a0990 samples=    552 inst_exec=   1,015,808
+    MUFU.EX2 R59, R59
+    mio_throttle=232 wait=149 not_selected=117 selected=46
+pc=0x79d4657a1320 samples=    550 inst_exec=   1,015,808
+    MUFU.EX2 R63, R63
+    wait=403 mio_throttle=72 selected=50
+pc=0x79d4657a1660 samples=    535 inst_exec=   1,015,808
+    MUFU.EX2 R28, R83
+    wait=341 mio_throttle=75 not_selected=62 selected=53
+pc=0x79d46579e5d0 samples=    526 inst_exec=      65,536
+    STL [R1], R4
+    barrier=505
+pc=0x79d4657a04e0 samples=    526 inst_exec=   1,015,808
+    FADD R40, -R32, R98
+    not_selected=230 wait=220 selected=65
+pc=0x79d4657a1700 samples=    518 inst_exec=   1,015,808
+    MUFU.EX2 R66, R66
+    wait=345 mio_throttle=83 selected=51 not_selected=39
+pc=0x79d4657a0ec0 samples=    511 inst_exec=   1,015,808
+    MUFU.EX2 R81, R81
+    not_selected=198 wait=130 mio_throttle=83 selected=72 dispatch_stall=28
+pc=0x79d4657a1680 samples=    511 inst_exec=   1,015,808
+    MUFU.EX2 R60, R60
+    wait=317 mio_throttle=81 selected=60 not_selected=52
+pc=0x79d4657a19a0 samples=    509 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    wait=196 math_pipe_throttle=117 not_selected=114 selected=51 dispatch_stall=31
+pc=0x79d4657a1720 samples=    496 inst_exec=   1,015,808
+    MUFU.EX2 R155, R155
+    wait=335 not_selected=54 selected=52 mio_throttle=51
+pc=0x79d4657a1580 samples=    486 inst_exec=   1,015,808
+    MUFU.EX2 R65, R65
+    wait=285 mio_throttle=99 selected=48 not_selected=46
