@@ -121,7 +121,9 @@ class SageAttnSm90(CutedslKernel):
         self.v_dtype = cutlass.Float8E4M3FN
         self.o_dtype = o_dtype
         self.qk_acc_dtype = cutlass.Int32      # s8s8s32，|S|<2^24 转 f32 无损
-        self.pv_acc_dtype = cutlass.Float32    # 单级 FP32（FP22）累加
+        # 两级 PV 累加（CUDA inst_buf 同款）：块内 wgmma FP22 局部累加到 acc_pv_temp，
+        # 跨块在 CUDA core 上真 fp32 FFMA 累加到 acc_pv
+        self.pv_acc_dtype = cutlass.Float32
 
         # fmha.py:160-170
         self.qk_mma_tiler = (self.CTA_Q, self.CTA_K, head_dim)
@@ -495,6 +497,8 @@ class SageAttnSm90(CutedslKernel):
                 (self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
             acc_pv = pv_thr_mma.make_fragment_C(pv_acc_shape)
             acc_pv.fill(0.0)
+            # 两级累加的块内 temp：每块 PV wgmma 从 ScaleD=0 写起，无需初始化
+            acc_pv_temp = pv_thr_mma.make_fragment_C(pv_acc_shape)
             qk_acc_shape = qk_thr_mma.partition_shape_C(
                 (self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
 
@@ -502,6 +506,7 @@ class SageAttnSm90(CutedslKernel):
                 cute.size(self.layout_acc_mn(pv_tiled_mma, acc_pv.layout), mode=[0]))
             s_max = cute.make_rmem_tensor_like(s_max_layout, Float32)
             a_sum = cute.make_rmem_tensor_like(s_max, Float32)
+            o_scale = cute.make_rmem_tensor_like(s_max, Float32)  # per-row scale_pv
             s_max.fill(-Float32.inf)     # 统一初值 → 无 is_first 特判：
             a_sum.fill(0.0)              # 首次 rescale 因子 exp2(-inf)=0，acc_pv 已清零
 
@@ -510,14 +515,16 @@ class SageAttnSm90(CutedslKernel):
             load_kv_consumer, kv_iter, s_max, a_sum = self.compute(
                 False, trip_count - 1, kv_iter,
                 qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
-                q_handle, tSrQ, tSrK, tOrV, acc_pv, s_max, a_sum,
+                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+                s_max, a_sum, o_scale,
                 ptScP, bidx_q, qk_acc_shape,
                 q_scale_val, mKScale, b_idx, kv_head,
                 scale_softmax_log2, seqlen_k)
             load_kv_consumer, kv_iter, s_max, a_sum = self.compute(
                 True, Int32(1), kv_iter,
                 qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
-                q_handle, tSrQ, tSrK, tOrV, acc_pv, s_max, a_sum,
+                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+                s_max, a_sum, o_scale,
                 ptScP, bidx_q, qk_acc_shape,
                 q_scale_val, mKScale, b_idx, kv_head,
                 scale_softmax_log2, seqlen_k)
@@ -616,8 +623,10 @@ class SageAttnSm90(CutedslKernel):
         tSrK: cute.Tensor,
         tOrV: cute.Tensor,
         acc_pv: cute.Tensor,
+        acc_pv_temp: cute.Tensor,
         s_max: cute.Tensor,
         a_sum: cute.Tensor,
+        o_scale: cute.Tensor,
         ptScP: cute.Tensor,
         bidx_q: Int32,
         qk_acc_shape: cute.Shape,
@@ -668,23 +677,36 @@ class SageAttnSm90(CutedslKernel):
                             acc_s[i] = -Float32.inf
 
             s_max, a_sum = self.softmax_step(
-                acc_s, qk_tiled_mma, s_max, a_sum, acc_pv, pv_tiled_mma,
-                scale_softmax_log2)
+                acc_s, qk_tiled_mma, s_max, a_sum, o_scale, scale_softmax_log2)
 
             # acc_s 已是 P448 = 448·P ∈ [0,448]（softmax_step 内 exp2 常量偏移），直接转 e4m3
             acc_p_op = self.make_acc_into_op(
                 acc_s, pv_tiled_mma.tv_layout_A, self.v_dtype)  # fmha.py:1275
             v_handle = load_kv_consumer.wait_and_advance(tok)
 
+            # 两级累加第 1 级：本块 PV wgmma 写独立 acc_pv_temp（首 k32 ScaleD=0），
+            # 块内 4 次 k32 仍 FP22 局部累加——与 CUDA inst_buf 的 RO_temp 同构
             cute.nvgpu.warpgroup.fence()                        # fmha.py:1282
-            pv_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-            cute.gemm(pv_tiled_mma, acc_pv, acc_p_op,
-                      tOrV[(None, None, None, v_handle.index)], acc_pv)
+            self.gemm_zero_acc(
+                pv_tiled_mma, acc_p_op,
+                tOrV[(None, None, None, v_handle.index)], acc_pv_temp)
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
 
             k_handle.release()
             v_handle.release()
+
+            # 两级累加第 2 级：跨块在 CUDA core 上真 fp32，
+            # acc_pv = acc_pv·scale_pv + temp（FFMA 融 rescale，sm90.cu:353 同款语义）
+            acc_pv_mn = cute.make_tensor(
+                acc_pv.iterator, self.layout_acc_mn(pv_tiled_mma, acc_pv.layout))
+            acc_temp_mn = cute.make_tensor(
+                acc_pv_temp.iterator,
+                self.layout_acc_mn(pv_tiled_mma, acc_pv_temp.layout))
+            for i in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[0])):
+                for j in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[1])):
+                    acc_pv_mn[(i, j)] = (
+                        acc_pv_mn[(i, j)] * o_scale[i] + acc_temp_mn[(i, j)])
         return load_kv_consumer, kv_iter, s_max, a_sum
 
     # ---------------- online softmax（fmha.py:1301-1397 改造：m 统一初值 -inf）----------------
@@ -695,14 +717,11 @@ class SageAttnSm90(CutedslKernel):
         qk_tiled_mma: cute.TiledMma,
         s_max: cute.Tensor,
         a_sum: cute.Tensor,
-        acc_pv: cute.Tensor,
-        pv_tiled_mma: cute.TiledMma,
+        o_scale: cute.Tensor,
         scale_softmax_log2: Float32,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         acc_s_mn = cute.make_tensor(
             acc_s.iterator, self.layout_acc_mn(qk_tiled_mma, acc_s.layout))
-        acc_pv_mn = cute.make_tensor(
-            acc_pv.iterator, self.layout_acc_mn(pv_tiled_mma, acc_pv.layout))
         reduction_target_qk = self.reduction_target_n(qk_tiled_mma)
         red_rank = cute.rank(reduction_target_qk)
         s_max_prev = cute.make_rmem_tensor_like(s_max, Float32)
@@ -735,8 +754,9 @@ class SageAttnSm90(CutedslKernel):
             # 配对（acc 累加的也是 P448·V），448 代数上完全相消
             a_sum[i] = a_sum[i] * scale_pv + acc_s_mn[(i, None)].load().reduce(
                 cute.ReductionOp.ADD, Float32.zero, 0)         # fmha.py:1393
-            for j in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[1])):
-                acc_pv_mn[(i, j)] *= scale_pv
+            # 两级累加：acc_pv 的 rescale 不再逐列 FMUL，记下 per-row scale_pv，
+            # PV gemm 后在 compute 里 FFMA 融进跨块累加
+            o_scale[i] = scale_pv
 
         return s_max, a_sum
 

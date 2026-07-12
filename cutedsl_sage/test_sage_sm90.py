@@ -291,8 +291,8 @@ def test_kernel_no_smooth_k():
 @pytest.mark.skipif(not _sm90_available(), reason="需要 sm90 GPU")
 @pytest.mark.parametrize("s", [16384, 32768])
 def test_fp22_long_seq(s):
-    """单级 FP32(FP22) 累加的长序列误差趋势观察：只按二级（松）阈值断言，
-    一级指标打印出来供人工评估是否需要两级累加。
+    """长序列误差趋势观察（两级累加后块内仍有 FP22 局部累加）：只按二级（松）阈值断言，
+    一级指标打印出来供人工评估。
     n=2 控制 ref_quant_sim 显存（s=32768 时 S 矩阵 2×32768²×4B ≈ 8.6GB/份）。"""
     q, k, v = _mk_qkv(1, 2, 2, s, s, 128, torch.float16)
     sm_scale = 128 ** -0.5

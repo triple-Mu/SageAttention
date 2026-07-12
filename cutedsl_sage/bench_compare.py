@@ -4,7 +4,7 @@
 #
 # 口径说明：
 # - CUDA 侧用 qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf（fp32+fp32 两级累加 + fuse v_scale），
-#   与 Python API 实际使用的变体一致；CuTeDSL 为单级 FP32（FP22）累加 + fuse v_scale。
+#   与 Python API 实际使用的变体一致；CuTeDSL 同为两级累加 + fuse v_scale。
 # - 计时统一 triton.testing.do_bench(warmup=25, rep=100) 取中值。
 import sys
 
@@ -108,7 +108,7 @@ def main():
     torch.manual_seed(0)
     dev_name = torch.cuda.get_device_name()
     print(f"GPU: {dev_name} | torch {torch.__version__} | batch={BATCH} heads={HEADS}")
-    print(f"kernel-only 口径：预量化输入，per_warp；CUDA=fp32+fp32 两级累加，CuTeDSL=单级 FP32(FP22) 累加，均 fuse v_scale\n")
+    print(f"kernel-only 口径：预量化输入，per_warp；两侧均 fp32+fp32 两级累加、fuse v_scale\n")
 
     print("## Kernel-only TFLOPS\n")
     print("| seq | d | causal | CUDA TFLOPS | CuTeDSL TFLOPS | SDPA TFLOPS | CuTeDSL/CUDA |")
