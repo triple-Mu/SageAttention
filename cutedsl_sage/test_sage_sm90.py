@@ -7,12 +7,11 @@ import pytest
 import torch
 
 try:
-    from .core import quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
+    from .core import LOG2_448, quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
 except ImportError:
-    from core import quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
+    from core import LOG2_448, quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
 
 LOG2E = math.log2(math.e)
-LOG2_448 = math.log2(448.0)   # 与 core.py 的 exp2 常量偏移一致（P1.2）
 
 
 # ============ 量化函数单测 ============
