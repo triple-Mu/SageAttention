@@ -156,6 +156,18 @@ _TORCH_TO_CUTLASS = {
 }
 
 
+def _tree_fmax(acc_s_mn, i, lo, hi):
+    """行内 rowmax 的树形归约（模块级纯 Python，trace 期展开成 FMNMX 二叉树）。
+    cute.arch.fmax → FMNMX（cutlass.max 会编成 NaN 语义 FSETP+FSEL）；S 在 mask 后
+    只含普通值与 -inf、无 NaN，语义安全。fmax 精确可结合 → 与串行链逐位一致；
+    关键路径 31→5 级（串行链在 dequant FMUL 循环删除后会裸暴露成主要 stall）。"""
+    if hi - lo == 1:
+        return acc_s_mn[(i, lo)]
+    mid = (lo + hi) // 2
+    return cute.arch.fmax(
+        _tree_fmax(acc_s_mn, i, lo, mid), _tree_fmax(acc_s_mn, i, mid, hi))
+
+
 class SageAttnSm90(CutedslKernel):
     # 独立缓存，key = (head_dim, is_causal, out_dtype, gqa_ratio)
     compile_cache: dict = {}
@@ -711,27 +723,30 @@ class SageAttnSm90(CutedslKernel):
             tok = load_kv_consumer.try_wait()                   # fmha.py:1253
             cute.nvgpu.warpgroup.wait_group(0)
 
-            # dequant：S_f32 = f32(S_i32) · q_scale(per-warp) · k_scale(per-block)
+            # dequant 折叠：acc_s 保持 raw 域（f32(S_i32)，不乘 scale）。
+            # dequant = q_scale·k_scale > 0 → max 保序，rowmax 在 raw 域做、每行一次
+            # ×dequant 回 deq 域，逐元素 ×dequant 折进 softmax_step 的 exp2 FFMA 系数
+            # （c′=c·dequant），消掉原 64 次/块的 FMUL 循环。
             # TensorSSA.to 支持 int→float（tensor.py:1772 sitofp），Int32→Float32 无损
             acc_s = cute.make_rmem_tensor_like(acc_qk, Float32)
             acc_s.store(acc_qk.load().to(Float32))
             dequant = q_scale_val * k_scale_val
-            for i in cutlass.range_constexpr(cute.size(acc_s)):
-                acc_s[i] = acc_s[i] * dequant
 
             if const_expr(masked):
-                # residual mask（k 尾块）+ causal 对角 mask，均在 dequant 后 S_f32 上做
+                # residual mask（k 尾块）+ causal 对角 mask，在 raw 域 S_f32 上置 -inf
+                # （与 deq 域等价：dequant·(-inf)=-inf，c′>0 时 exp2(-inf·c′−…)=0）；
+                # select_ 显式单条 FSEL，替代 if 置写展开的链式 FSEL codegen
                 for i in cutlass.range_constexpr(cute.size(acc_s)):
                     q_pos = tScP[i][0]
                     k_pos = tScP[i][1]
-                    if k_pos >= seqlen_k:
-                        acc_s[i] = -Float32.inf
+                    keep = k_pos < seqlen_k
                     if const_expr(self.is_causal):
-                        if k_pos > q_pos:
-                            acc_s[i] = -Float32.inf
+                        keep = keep & (k_pos <= q_pos)
+                    acc_s[i] = cutlass.select_(keep, acc_s[i], -Float32.inf)
 
             s_max, a_sum = self.softmax_step(
-                acc_s, qk_tiled_mma, s_max, a_sum, o_scale, scale_softmax_log2)
+                acc_s, qk_tiled_mma, s_max, a_sum, o_scale, scale_softmax_log2,
+                dequant)
 
             # acc_s 已是 P448 = 448·P ∈ [0,448]（softmax_step 内 exp2 常量偏移），直接转 e4m3
             acc_p_op = self.make_acc_into_op(
@@ -773,32 +788,37 @@ class SageAttnSm90(CutedslKernel):
         a_sum: cute.Tensor,
         o_scale: cute.Tensor,
         scale_softmax_log2: Float32,
+        dequant: Float32,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         acc_s_mn = cute.make_tensor(
             acc_s.iterator, self.layout_acc_mn(qk_tiled_mma, acc_s.layout))
         reduction_target_qk = self.reduction_target_n(qk_tiled_mma)
         red_rank = cute.rank(reduction_target_qk)
         s_max_prev = cute.make_rmem_tensor_like(s_max, Float32)
+        # dequant 折叠：acc_s 是 raw 域，exp2 系数用 c′ = c·dequant（每块每 warp 1 次 FMUL）
+        scale_raw_log2 = scale_softmax_log2 * dequant
 
         for i in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[0])):
             s_max_prev[i] = s_max[i]
-            for j in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[1])):
-                # cute.arch.fmax → FMNMX（cutlass.max 会编成 NaN 语义 FSETP+FSEL）；
-                # S 在 mask 后只含普通值与 -inf、无 NaN，语义安全
-                s_max[i] = cute.arch.fmax(s_max[i], acc_s_mn[(i, j)])
+            # 块局部 rowmax 在 raw 域做（每块重求，不跨块）；dequant>0 且 IEEE 舍入单调
+            # → fl(dequant·max_j x) ≡ max_j fl(dequant·x)，s_max 与折叠前逐位一致
+            m_raw = _tree_fmax(acc_s_mn, i, 0, cute.size(acc_s_mn, mode=[1]))
             for r in cutlass.range_constexpr(red_rank):        # quad reduction
-                s_max[i] = cute.arch.warp_reduction_max(
-                    s_max[i], threads_in_group=reduction_target_qk.shape[r])
+                m_raw = cute.arch.warp_reduction_max(
+                    m_raw, threads_in_group=reduction_target_qk.shape[r])
+            # 每行 1 次 FMUL 回 deq 域（替代原 64 次/块），跨块 s_max 仍在 deq 域跟踪
+            # （跨块 k_scale 不同，raw 域不可比）；整行被 mask 时 dequant·(-inf)=-inf
+            s_max[i] = cute.arch.fmax(s_max[i], dequant * m_raw)
 
             local_max = s_max[i]
             if s_max[i] == -Float32.inf:      # 整行被 mask 时避免 -inf 参与运算
                 local_max = 0.0
-            # ×448 折进 exp2（P1.2）：arg = c·S − (c·m − log2 448)，exp2 直接得 P448=448·P，
-            # 消掉独立的 ×448 FMUL 循环；每元素仍是 1 条 FFMA + 1 条 MUFU.EX2
+            # ×448 折进 exp2（P1.2）：arg = c′·S_raw − (c·m − log2 448)，exp2 直接得
+            # P448=448·P；每元素仍是 1 条 FFMA + 1 条 MUFU.EX2（系数 c→c′ 零增量）
             scale_max = scale_softmax_log2 * local_max - LOG2_448
             for j in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[1])):
                 acc_s_mn[(i, j)] = cute.math.exp2(
-                    scale_softmax_log2 * acc_s_mn[(i, j)] - scale_max, fastmath=True)
+                    scale_raw_log2 * acc_s_mn[(i, j)] - scale_max, fastmath=True)
 
             # 首迭代 s_max_prev=-inf → scale_pv=0，旧 acc（已清零）与旧 sum 均被清除；
             # m 变化补偿项 scale_pv 不带 448 偏移（两次 448 在分子分母中相消）
