@@ -1,0 +1,180 @@
+== source_dsl2_d128: warp inst_executed by SASS opcode (total 767,521,368) ==
+FFMA                     138,412,032   18.03%
+FMUL                      74,448,896    9.70%
+FMNMX                     71,303,168    9.29%
+FADD                      69,337,088    9.03%
+MUFU.EX2                  69,206,016    9.02%
+I2FP.F32.S32              67,108,864    8.74%
+SEL                       53,411,840    6.96%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C      33,554,432    4.37%
+PRMT                      33,554,432    4.37%
+UMOV                      20,668,416    2.69%
+SHFL.IDX                  16,777,216    2.19%
+UIADD3                    16,596,992    2.16%
+IMAD.MOV.U32              10,325,166    1.35%
+LOP3.LUT                   7,692,288    1.00%
+BRA                        5,654,189    0.74%
+IMAD.U32                   5,278,454    0.69%
+VIADD                      4,423,680    0.58%
+SHFL.BFLY                  4,325,376    0.56%
+ULEA                       4,292,608    0.56%
+ULOP3.LUT                  4,194,304    0.55%
+IGMMA.64x128x32.S8.S8.SAT       4,194,304    0.55%
+QGMMA.64x128x32.F32.E4M3.E4M3       4,194,304    0.55%
+USEL                       4,128,768    0.54%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       3,812,086    0.50%
+SHF.R.U32.HI               2,367,488    0.31%
+FSEL                       2,195,456    0.29%
+CS2R                       2,129,920    0.28%
+WARPGROUP.DEPBAR.LE        2,129,920    0.28%
+SYNCS.ARRIVE.TRANS64.ART0       2,129,920    0.28%
+USHF.R.U32.HI              2,097,152    0.27%
+WARPGROUP.ARRIVE           2,097,152    0.27%
+FSETP.NEU.AND              2,097,152    0.27%
+UISETP.NE.U32.AND          2,064,384    0.27%
+UIADD3.X                   1,613,824    0.21%
+
+== stall samples by SASS opcode ==
+total samples: 171,487
+WARPGROUP.DEPBAR.LE       28,845   16.82%
+BRA                       25,412   14.82%
+MUFU.EX2                  17,920   10.45%
+FFMA                      14,943    8.71%
+I2FP.F32.S32              11,876    6.93%
+FMNMX                      8,677    5.06%
+PRMT                       8,326    4.86%
+SEL                        7,453    4.35%
+FADD                       6,936    4.04%
+FMUL                       5,706    3.33%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C       3,699    2.16%
+LOP3.LUT                   3,226    1.88%
+QGMMA.64x128x32.F32.E4M3.E4M3       2,725    1.59%
+SHFL.IDX                   2,426    1.41%
+IGMMA.64x128x32.S8.S8.SAT       2,234    1.30%
+UIADD3                     1,754    1.02%
+UMOV                       1,592    0.93%
+ULEA                       1,572    0.92%
+IMAD.MOV.U32               1,290    0.75%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       1,192    0.70%
+
+== top 40 PCs by pcsamp samples ==
+pc=0x7d7b9d79ff10 samples= 14,399 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=14255
+pc=0x7d7b9d7a2180 samples= 13,660 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=13446
+pc=0x7d7b9d79ed10 samples=  6,710 inst_exec=      65,536
+    @!P0  BRA 0x7d7b9d7aabd0
+    long_scoreboard=6698
+pc=0x7d7b9d79eec0 samples=  5,841 inst_exec=      65,536
+    @!P0  BRA 0x7d7b9d7aac90
+    long_scoreboard=5830
+pc=0x7d7b9d79e960 samples=  5,447 inst_exec=      65,536
+    @!P0  BRA 0x7d7b9d7aa9d0
+    long_scoreboard=5430
+pc=0x7d7b9d79eb20 samples=  5,157 inst_exec=      65,536
+    @!P0  BRA 0x7d7b9d7aaad0
+    long_scoreboard=5148
+pc=0x7d7b9d79fec0 samples=  1,814 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    math_pipe_throttle=882 not_selected=606 wait=202
+pc=0x7d7b9d7a06a0 samples=  1,712 inst_exec=   1,015,808
+    FMNMX R149, R35, R30, !PT
+    short_scoreboard=1514
+pc=0x7d7b9d7a2060 samples=  1,541 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R96, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=1408
+pc=0x7d7b9d79fdb0 samples=  1,268 inst_exec=   1,015,808
+    IGMMA.64x128x32.S8.S8.SAT R24, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=1179
+pc=0x7d7b9d7a1f60 samples=  1,252 inst_exec=   1,015,808
+    PRMT R98, R40, R110, R99
+    short_scoreboard=884 not_selected=164 math_pipe_throttle=144
+pc=0x7d7b9d7a1d80 samples=  1,066 inst_exec=   1,015,808
+    PRMT R104, R50, R110, R105
+    short_scoreboard=816 wait=87 selected=60 not_selected=56
+pc=0x7d7b9d79fc30 samples=    954 inst_exec=   1,015,808
+    ULEA UR16, UR4, UR41, 0x3
+    no_instructions=712 branch_resolving=158 not_selected=62
+pc=0x7d7b9d79f8d0 samples=    930 inst_exec=      32,768
+    @!P0  BRA 0x7d7b9d7aae30
+    long_scoreboard=924
+pc=0x7d7b9d7a2160 samples=    924 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    math_pipe_throttle=297 not_selected=245 wait=218 dispatch_stall=116 selected=48
+pc=0x7d7b9d7a1f80 samples=    836 inst_exec=   1,015,808
+    PRMT R110, R54, R110, R25
+    short_scoreboard=431 not_selected=243 selected=52 math_pipe_throttle=48 wait=42
+pc=0x7d7b9d7a0000 samples=    749 inst_exec=   1,015,808
+    I2FP.F32.S32 R39, R39
+    not_selected=354 math_pipe_throttle=275 wait=72 selected=40
+pc=0x7d7b9d7a1840 samples=    747 inst_exec=   1,015,808
+    MUFU.EX2 R60, R60
+    wait=427 mio_throttle=180 not_selected=83 selected=51
+pc=0x7d7b9d7a0ec0 samples=    737 inst_exec=   1,015,808
+    MUFU.EX2 R72, R72
+    wait=368 mio_throttle=236 not_selected=78 selected=53
+pc=0x7d7b9d7a1b10 samples=    719 inst_exec=   1,015,808
+    MUFU.EX2 R25, R104
+    wait=463 mio_throttle=151 not_selected=52 selected=46
+pc=0x7d7b9d7a0f30 samples=    691 inst_exec=   1,015,808
+    MUFU.EX2 R42, R42
+    wait=335 mio_throttle=193 not_selected=103 selected=42
+pc=0x7d7b9d7a20f0 samples=    682 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R104, gdesc[UR8], R24
+    wait=546 not_selected=58 selected=42 dispatch_stall=36
+pc=0x7d7b9d79ff00 samples=    674 inst_exec=   1,015,808
+    SYNCS.PHASECHK.TRANS64.TRYWAIT P0, [UR8+0x10], R155
+    wait=570 selected=52
+pc=0x7d7b9d7a0f50 samples=    640 inst_exec=   1,015,808
+    MUFU.EX2 R50, R50
+    wait=374 mio_throttle=171 not_selected=52 selected=43
+pc=0x7d7b9d7a1e50 samples=    639 inst_exec=   1,015,808
+    MUFU.EX2 R159, R27
+    wait=282 mio_throttle=177 not_selected=99 selected=54
+pc=0x7d7b9d7a0940 samples=    626 inst_exec=   1,015,808
+    I2FP.F32.S32 R35, R44
+    short_scoreboard=244 not_selected=168 math_pipe_throttle=146 selected=57
+pc=0x7d7b9d7a14e0 samples=    615 inst_exec=   1,015,808
+    F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C R68, R32, R29, RZ
+    short_scoreboard=281 math_pipe_throttle=141 not_selected=138 selected=53
+pc=0x7d7b9d7a0f40 samples=    614 inst_exec=   1,015,808
+    MUFU.EX2 R49, R49
+    wait=377 mio_throttle=131 not_selected=61 selected=44
+pc=0x7d7b9d7a1c40 samples=    605 inst_exec=   1,015,808
+    SEL R56, R37, R56, !P1
+    not_selected=198 math_pipe_throttle=186 wait=89 dispatch_stall=71 selected=61
+pc=0x7d7b9d7a1800 samples=    599 inst_exec=   1,015,808
+    MUFU.EX2 R65, R65
+    wait=384 mio_throttle=86 selected=61 not_selected=59
+pc=0x7d7b9d7a05e0 samples=    580 inst_exec=   1,015,808
+    I2FP.F32.S32 R49, R49
+    not_selected=239 math_pipe_throttle=229 selected=57 wait=54
+pc=0x7d7b9d7a0eb0 samples=    577 inst_exec=   1,015,808
+    MUFU.EX2 R41, R41
+    wait=323 mio_throttle=144 not_selected=59 selected=51
+pc=0x7d7b9d7a0560 samples=    568 inst_exec=   1,015,808
+    I2FP.F32.S32 R29, R29
+    not_selected=273 math_pipe_throttle=161 wait=58 selected=49
+pc=0x7d7b9d7a0d60 samples=    548 inst_exec=   1,015,808
+    MUFU.EX2 R38, R38
+    mio_throttle=321 not_selected=86 wait=78 selected=63
+pc=0x7d7b9d7a1ab0 samples=    538 inst_exec=   1,015,808
+    MUFU.EX2 R57, R57
+    wait=210 mio_throttle=206 selected=57 not_selected=45
+pc=0x7d7b9d7a14d0 samples=    528 inst_exec=   1,015,808
+    MUFU.EX2 R78, R78
+    wait=376 mio_throttle=67 selected=54
+pc=0x7d7b9d79fed0 samples=    498 inst_exec=   1,015,808
+    IMAD.U32 R155, R153, -0x80000000, RZ
+    wait=294 dispatch_stall=60 math_pipe_throttle=57 selected=48 not_selected=39
+pc=0x7d7b9d7a0b10 samples=    496 inst_exec=   1,015,808
+    FMNMX R41, R168, R39, !PT
+    wait=180 not_selected=150 math_pipe_throttle=119 selected=44
+pc=0x7d7b9d79e5d0 samples=    493 inst_exec=      65,536
+    STL [R1], R4
+    barrier=467
+pc=0x7d7b9d7a04b0 samples=    485 inst_exec=   1,015,808
+    I2FP.F32.S32 R27, R86
+    not_selected=274 wait=79 selected=58 math_pipe_throttle=41 dispatch_stall=33
