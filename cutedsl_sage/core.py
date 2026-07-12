@@ -131,9 +131,11 @@ class SageAttnSm90(CutedslKernel):
         self.cluster_shape_mnk = (1, 1, 1)
 
         # K/V 共用一个环形 smem 缓冲（fmha.py:601），每次 KV 迭代占 2 个 stage（K 一个 V 一个），
-        # 一个 stage = 128*d 字节（K 块与 V 块字节数恒等）
+        # 一个 stage = 128*d 字节（K 块与 V 块字节数恒等）。
+        # P2a：目标 2 CTA/SM，smem 预算 113KB/CTA —— d=128 用 4 stage（合计 ~81KB），
+        # d=64 每 stage 仅 8KB、10 stage 合计 ~93KB 本就达标，维持不变
         self.q_stage = 1
-        self.kv_stage = 6 if head_dim == 128 else 10
+        self.kv_stage = 4 if head_dim == 128 else 10
         self.epi_stage = 2
 
         self.num_threads_per_warp_group = 128
@@ -142,7 +144,8 @@ class SageAttnSm90(CutedslKernel):
         self.load_warp_group_id = 0
         self.math_warp_group_id = 1
         self.num_regs_load = 24
-        self.num_regs_mma = 240
+        # P2a：2 CTA/SM 要求 (mma+load)·128·2 ≤ 64K regs/SM → 240→224（(224+24)·256=63488）
+        self.num_regs_mma = 224
         self.buffer_align_bytes = 1024
 
     # ---------------- host：编译缓存 ----------------
@@ -337,7 +340,9 @@ class SageAttnSm90(CutedslKernel):
             cluster=self.cluster_shape_mnk,
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
-            min_blocks_per_mp=1,
+            # P2a：nvvm.minctasm=2（ptxas 按 2 CTA/SM 限制 launch 期寄存器 ≤128/线程，
+            # 运行期由 warpgroup_reg_alloc/dealloc 重分配 224/24）+ smem carveout 提示
+            min_blocks_per_mp=2,
         )
 
     # ---------------- device kernel ----------------
