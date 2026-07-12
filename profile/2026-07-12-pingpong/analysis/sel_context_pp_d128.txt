@@ -1,0 +1,89 @@
+SEL: 2160 个 PC，总 inst_executed = 87,883,776
+  exec=      32,768 × 2142 个 PC
+  exec=     983,040 × 18 个 PC
+
+== 前 12 个热 SEL 的上下文 ==
+
+-- pc=0x7fc03d7a9a40 exec=983,040 --
+    SEL R30, R54, R39, !P1
+    SHFL.IDX PT, R79, R79, R158, 0x1c1f
+ >> SEL R39, R39, R54, !P1
+    PRMT R102, R46, R157, R75
+    SHFL.IDX PT, R30, R30, R159, 0x1c1f
+
+-- pc=0x7fc03d7a9a20 exec=983,040 --
+    FADD R35, R35, R102
+    FFMA R152, R167, R152, R64
+ >> SEL R30, R54, R39, !P1
+    SHFL.IDX PT, R79, R79, R158, 0x1c1f
+    SEL R39, R39, R54, !P1
+
+-- pc=0x7fc03d7a9960 exec=983,040 --
+    SEL R77, R24, R77, !P1
+    SEL R24, R79, R66, !P1
+ >> SEL R79, R66, R79, !P1
+    SHFL.IDX PT, R42, R42, R159, 0x1c1f
+    PRMT R100, R44, R157, R29
+
+-- pc=0x7fc03d7a9950 exec=983,040 --
+    MUFU.EX2 R167, R38
+    SEL R77, R24, R77, !P1
+ >> SEL R24, R79, R66, !P1
+    SEL R79, R66, R79, !P1
+    SHFL.IDX PT, R42, R42, R159, 0x1c1f
+
+-- pc=0x7fc03d7a9940 exec=983,040 --
+    SEL R42, R77, R24, !P1
+    MUFU.EX2 R167, R38
+ >> SEL R77, R24, R77, !P1
+    SEL R24, R79, R66, !P1
+    SEL R79, R66, R79, !P1
+
+-- pc=0x7fc03d7a9920 exec=983,040 --
+    PRMT R39, R42, 0x5410, R39
+    FADD R33, R33, R106
+ >> SEL R42, R77, R24, !P1
+    MUFU.EX2 R167, R38
+    SEL R77, R24, R77, !P1
+
+-- pc=0x7fc03d7a97e0 exec=983,040 --
+    MUFU.EX2 R59, R59
+    SEL R32, R43, R36, !P1
+ >> SEL R43, R36, R43, !P1
+    SHFL.IDX PT, R32, R32, R159, 0x1c1f
+    MUFU.EX2 R64, R64
+
+-- pc=0x7fc03d7a97d0 exec=983,040 --
+    FADD R31, R31, R30
+    MUFU.EX2 R59, R59
+ >> SEL R32, R43, R36, !P1
+    SEL R43, R36, R43, !P1
+    SHFL.IDX PT, R32, R32, R159, 0x1c1f
+
+-- pc=0x7fc03d7a9660 exec=983,040 --
+    SEL R26, R37, R34, !P1
+    MUFU.EX2 R40, R40
+ >> SEL R37, R34, R37, !P1
+    SHFL.IDX PT, R26, R26, R159, 0x1c1f
+    MUFU.EX2 R55, R55
+
+-- pc=0x7fc03d7a9640 exec=983,040 --
+    PRMT R103, R46, R156, R75
+    FADD R27, R27, R26
+ >> SEL R26, R37, R34, !P1
+    MUFU.EX2 R40, R40
+    SEL R37, R34, R37, !P1
+
+-- pc=0x7fc03d7a95a0 exec=983,040 --
+    PRMT R37, R37, 0x5410, R36
+    FADD R51, R56, R51
+ >> SEL R67, R32, R67, !P1
+    MUFU.EX2 R52, R52
+    SHFL.IDX PT, R48, R48, R159, 0x1c1f
+
+-- pc=0x7fc03d7a9570 exec=983,040 --
+    F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C R37, R56, R51, RZ
+    FADD R51, R51, R48
+ >> SEL R48, R67, R32, !P1
+    PRMT R37, R37, 0x5410, R36
+    FADD R51, R56, R51
