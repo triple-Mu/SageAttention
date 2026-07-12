@@ -200,20 +200,20 @@ class SageAttnSm90(CutedslKernel):
 
         # K/V 共用一个环形 smem 缓冲（fmha.py:601），每次 KV 迭代占 2 个 stage（K 一个 V 一个），
         # 一个 stage = 128*d 字节（K 块与 V 块字节数恒等）。
-        # P2a：目标 2 CTA/SM，smem 预算 113KB/CTA —— d=128 用 4 stage（合计 ~81KB），
-        # d=64 每 stage 仅 8KB、10 stage 合计 ~93KB 本就达标，维持不变
+        # P3：目标 3 CTA/SM，smem 预算 ≤75.7KB/CTA —— d=128 用 3 stage（实测 66.56KB），
+        # d=64 用 7 stage（实测 70.85KB；8 stage 78.85KB 会把 smem 占用限到 2 CTA/SM）
         self.q_stage = 1
-        self.kv_stage = 4 if head_dim == 128 else 10
+        self.kv_stage = 3 if head_dim == 128 else 7
         self.epi_stage = 2
 
         self.num_threads_per_warp_group = 128
         self.num_warps_per_warp_group = 4
-        self.threads_per_cta = 256            # WG0 = load, WG1 = math
-        self.load_warp_group_id = 0
-        self.math_warp_group_id = 1
-        self.num_regs_load = 24
-        # P2a：2 CTA/SM 要求 (mma+load)·128·2 ≤ 64K regs/SM → 240→224（(224+24)·256=63488）
-        self.num_regs_mma = 224
+        # P3：128 线程单 WG 全 consumer（CUDA 版同构）：warp0 兼职发 TMA，无独立
+        # producer WG、无 setmaxnreg。3 CTA/SM 由 minctasm=3 达成（launch 期
+        # ptxas 预算 65536/(128·3)→168 regs/线程；256 线程结构下该预算只有 ~80，
+        # PV RS-wgmma 无法编译（NVVM backend error），故须此结构）
+        self.threads_per_cta = 128
+        self.epi_barrier_id = 1               # named barrier（epilogue r2s/TMA 同步）
         self.buffer_align_bytes = 1024
 
     # ---------------- host：编译缓存 ----------------
@@ -408,9 +408,8 @@ class SageAttnSm90(CutedslKernel):
             cluster=self.cluster_shape_mnk,
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
-            # P2a：nvvm.minctasm=2（ptxas 按 2 CTA/SM 限制 launch 期寄存器 ≤128/线程，
-            # 运行期由 warpgroup_reg_alloc/dealloc 重分配 224/24）+ smem carveout 提示
-            min_blocks_per_mp=2,
+            # P3：nvvm.minctasm=3（ptxas 按 3 CTA/SM 分配 launch 期寄存器 ≤168/线程）
+            min_blocks_per_mp=3,
         )
 
     # ---------------- device kernel ----------------
@@ -446,8 +445,6 @@ class SageAttnSm90(CutedslKernel):
         tma_store_pipeline = self.make_and_init_tma_store_pipeline()
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.num_threads_per_warp_group)
 
         # smem 张量；V 与 K 共用同一缓冲、按 stage 交替（fmha.py:593-602）
         sQ = storage.sQ.get_tensor(
@@ -502,176 +499,203 @@ class SageAttnSm90(CutedslKernel):
             cpasync.prefetch_descriptor(tma_atom_v)
             cpasync.prefetch_descriptor(tma_atom_o)
 
-        # ---------------- producer：load warpgroup ----------------
-        if warp_group_idx == self.load_warp_group_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
-            if warp_idx == 0:
-                # Q 单 stage 一次装载
-                q_handle = load_q_producer.acquire_and_advance()
-                tQgQ = tQgQ_qdl[(None, None, 0, head_idx, b_idx)]
-                cute.copy(tma_atom_q, tQgQ[(None, bidx_q)],
-                          tQsQ[(None, q_handle.index)],
-                          tma_bar_ptr=q_handle.barrier)       # fmha.py:705-711
+        # ---------------- 单 WG（128 线程全 consumer）：warp0 兼职 TMA producer ----------------
+        # 发射 token 序 = 消费序：K0,V0,K1,V1,…（偶=K、奇=V，块号 token//2）。
+        # prologue 预填充 min(kv_stage, 2·trip_count) 个 token 占满环形缓冲；
+        # mainloop 内每 release 一个 stage 由 warp0 补发下一 token（issue_kv）
+        tKgK = tKgK_kdl[(None, None, 0, kv_head, b_idx)]
+        tVgV = tVgV_dkl[(None, 0, None, kv_head, b_idx)]
+        kv_issue = Int32(0)
+        kv_issue_limit = trip_count * 2
+        if warp_idx == 0:
+            # Q 单 stage 一次装载
+            q_handle_p = load_q_producer.acquire_and_advance()
+            tQgQ = tQgQ_qdl[(None, None, 0, head_idx, b_idx)]
+            cute.copy(tma_atom_q, tQgQ[(None, bidx_q)],
+                      tQsQ[(None, q_handle_p.index)],
+                      tma_bar_ptr=q_handle_p.barrier)         # fmha.py:705-711
+            prefill = min(Int32(self.kv_stage), kv_issue_limit)
+            while kv_issue < prefill:
+                h = load_kv_producer.acquire_and_advance()
+                if kv_issue % 2 == 0:
+                    cute.copy(tma_atom_k, tKgK[(None, kv_issue // 2)],
+                              tKsK[(None, h.index)], tma_bar_ptr=h.barrier)
+                else:
+                    cute.copy(tma_atom_v, tVgV[(None, kv_issue // 2)],
+                              tVsV[(None, h.index)], tma_bar_ptr=h.barrier)
+                kv_issue += 1
 
-                tKgK = tKgK_kdl[(None, None, 0, kv_head, b_idx)]
-                tVgV = tVgV_dkl[(None, 0, None, kv_head, b_idx)]
-                kv_iter = Int32(0)
-                while kv_iter < trip_count:                   # K/V 交替入队
-                    k_handle = load_kv_producer.acquire_and_advance()
-                    cute.copy(tma_atom_k, tKgK[(None, kv_iter)],
-                              tKsK[(None, k_handle.index)],
-                              tma_bar_ptr=k_handle.barrier)
-                    v_handle = load_kv_producer.acquire_and_advance()
-                    cute.copy(tma_atom_v, tVgV[(None, kv_iter)],
-                              tVsV[(None, v_handle.index)],
-                              tma_bar_ptr=v_handle.barrier)
-                    kv_iter += 1
+        # per-warp q_scale：idx = ((b*n_q+h)*ceil(s_q/64) + bx)*4 + warp（sm90.cu:177）；
+        # acc fragment 行 = 16*warp + lane/4 (+8) 恰在该 warp 的 16 行段内，每 warp 一个标量
+        q_scale_val = mQScale[(b_idx, head_idx, bidx_q * 4 + warp_idx)]
 
-        # ---------------- consumer：math warpgroup ----------------
-        if warp_group_idx == self.math_warp_group_id:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
+        # v_scale 预存 smem，epilogue 按列取用；448 已在 row_sum448 分母中相消（P1.2）
+        if tidx < self.head_dim:
+            sVScale[tidx] = mVScale[(b_idx, kv_head, tidx)]
+        pipeline.arrive_and_wait(                          # named barrier（fmha.py:1171）
+            barrier_id=self.epi_barrier_id,
+            num_threads=self.num_threads_per_warp_group)
 
-            # per-warp q_scale：idx = ((b*n_q+h)*ceil(s_q/64) + bx)*4 + warp（sm90.cu:177）；
-            # acc fragment 行 = 16*warp_local + lane/4 (+8) 恰在该 warp 的 16 行段内，每 warp 一个标量
-            warp_local = warp_idx - self.math_warp_group_id * self.num_warps_per_warp_group
-            q_scale_val = mQScale[(b_idx, head_idx, bidx_q * 4 + warp_local)]
+        # mainloop 前置（fmha.py:813-845）
+        tSsQ = qk_thr_mma.partition_A(sQ)
+        tSsK = qk_thr_mma.partition_B(sK)
+        tSrQ = qk_thr_mma.make_fragment_A(tSsQ)
+        tSrK = qk_thr_mma.make_fragment_B(tSsK)
+        tOsV = pv_thr_mma.partition_B(sV)
+        tOrV = pv_thr_mma.make_fragment_B(tOsV)
 
-            # v_scale 预存 smem，epilogue 按列取用；448 已在 row_sum448 分母中相消（P1.2）
-            t_local = tidx - self.num_threads_per_warp_group
-            if t_local < self.head_dim:
-                sVScale[t_local] = mVScale[(b_idx, kv_head, t_local)]
-            pipeline.arrive_and_wait(                          # named barrier（fmha.py:1171）
-                barrier_id=self.math_warp_group_id,
+        q_handle = load_q_consumer.wait()                  # fmha.py:826
+
+        # 全局 (q_idx, k_idx) 坐标（fmha.py:796/829 identity-tensor 技术）
+        cP = cute.make_identity_tensor((seqlen_q, seqlen_k))
+        gPcP = cute.local_tile(cP, self.qk_mma_tiler[:2], (None, None))
+        ptScP = qk_thr_mma.partition_C(gPcP)
+
+        pv_acc_shape = pv_thr_mma.partition_shape_C(
+            (self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
+        acc_pv = pv_thr_mma.make_fragment_C(pv_acc_shape)
+        acc_pv.fill(0.0)
+        # 两级累加的块内 temp：每块 PV wgmma 从 ScaleD=0 写起，无需初始化
+        acc_pv_temp = pv_thr_mma.make_fragment_C(pv_acc_shape)
+        qk_acc_shape = qk_thr_mma.partition_shape_C(
+            (self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
+
+        s_max_layout = cute.make_layout(
+            cute.size(self.layout_acc_mn(pv_tiled_mma, acc_pv.layout), mode=[0]))
+        s_max = cute.make_rmem_tensor_like(s_max_layout, Float32)
+        a_sum = cute.make_rmem_tensor_like(s_max, Float32)
+        o_scale = cute.make_rmem_tensor_like(s_max, Float32)  # per-row scale_pv
+        s_max.fill(-Float32.inf)     # 统一初值 → 无 is_first 特判：
+        a_sum.fill(0.0)              # 首次 rescale 因子 exp2(-inf)=0，acc_pv 已清零
+
+        # 前 trip_count-1 块不 mask，最后 1 块做 residual(+causal) mask
+        kv_iter = Int32(0)
+        (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
+         s_max, a_sum) = self.compute(
+            False, trip_count - 1, kv_iter,
+            qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
+            q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+            s_max, a_sum, o_scale,
+            ptScP, bidx_q, qk_acc_shape,
+            q_scale_val, mKScale, b_idx, kv_head,
+            scale_softmax_log2, seqlen_k,
+            warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
+            tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
+        (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
+         s_max, a_sum) = self.compute(
+            True, Int32(1), kv_iter,
+            qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
+            q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+            s_max, a_sum, o_scale,
+            ptScP, bidx_q, qk_acc_shape,
+            q_scale_val, mKScale, b_idx, kv_head,
+            scale_softmax_log2, seqlen_k,
+            warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
+            tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
+
+        cute.nvgpu.warpgroup.wait_group(0)
+        q_handle.release()                                 # fmha.py:1037
+
+        # ---- tail：行和归约 + O = acc · v_scale / row_sum448（fmha.py:1503-1561 改造）
+        # acc = Σ P448_q·V_q，row_sum448 = 448·ΣP（量化前），448 相消 ----
+        reduction_target_pv = self.reduction_target_n(pv_tiled_mma)
+        for r in cutlass.range_constexpr(cute.rank(reduction_target_pv)):
+            for i in cutlass.range_constexpr(cute.size(a_sum)):
+                a_sum[i] = cute.arch.warp_reduction_sum(
+                    a_sum[i], threads_in_group=reduction_target_pv.shape[r])
+
+        acc_mn = cute.make_tensor(
+            acc_pv.iterator, self.layout_acc_mn(pv_tiled_mma, acc_pv.layout))
+        cO = cute.make_identity_tensor(
+            (self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
+        tOcO = pv_thr_mma.partition_C(cO)
+        tOcO_mn = cute.make_tensor(
+            tOcO.iterator, self.layout_acc_mn(pv_tiled_mma, tOcO.layout))
+        for i in cutlass.range_constexpr(cute.size(acc_mn, mode=[0])):
+            inv_sum = cute.arch.rcp_approx(a_sum[i])       # fmha.py:1548
+            if a_sum[i] == 0.0 or a_sum[i] != a_sum[i]:
+                inv_sum = 1.0
+            for j in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
+                col = tOcO_mn[(i, j)][1]                   # per-channel v_scale 列索引
+                acc_mn[(i, j)] = acc_mn[(i, j)] * inv_sum * sVScale[col]
+
+        # ---- epilogue：r2s(StMatrix) + TMA store（fmha.py:1092-1190，单 math WG）----
+        copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+            self.o_layout, elem_ty_d=self.o_dtype, elem_ty_acc=self.pv_acc_dtype)
+        copy_atom_O = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(self.o_layout.is_m_major_c(), 4),
+            self.o_dtype)
+        tiled_copy_O_Atom = cute.make_tiled_copy_C_atom(copy_atom_O, pv_tiled_mma)
+        tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_O_Atom)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(
+            tidx % self.num_threads_per_warp_group)
+        tRS_sD = thr_copy_r2s.partition_D(sO)
+        tRS_rAcc = tiled_copy_r2s.retile(acc_pv)
+
+        rD_shape = cute.shape(thr_copy_r2s.partition_S(sO))
+        tRS_rD_layout = cute.make_layout(rD_shape[:3])
+        tRS_rD = cute.make_rmem_tensor_like(tRS_rD_layout, self.pv_acc_dtype)
+        size_tRS_rD = cute.size(tRS_rD)
+
+        gD = cute.local_tile(mO_qdl, self.pv_mma_tiler[:2],
+                             (bidx_q, 0, head_idx, b_idx))   # fmha.py:1130
+        sepi_for_tma_partition = cute.group_modes(sO, 0, 2)
+        tcgc_for_tma_partition = cute.zipped_divide(gD, self.epi_tile)
+        bSG_sD, bSG_gD = cpasync.tma_partition(
+            tma_atom_o, 0, cute.make_layout(1),
+            sepi_for_tma_partition, tcgc_for_tma_partition)
+        epi_tile_num = cute.size(tcgc_for_tma_partition, mode=[1])
+
+        for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+            tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD_layout, self.o_dtype)
+            acc_vec = tRS_rD.load()
+            tRS_rD_out.store(acc_vec.to(self.o_dtype))
+            epi_buffer = epi_idx % self.epi_stage
+            cute.copy(tiled_copy_r2s, tRS_rD_out,
+                      tRS_sD[(None, None, None, epi_buffer, 0)])
+            # 4.6.0 的 fence_proxy 只接受字符串字面量（nvvm_wrappers.py:1038），
+            # 语义同底本的 ProxyKind.async_shared + SharedSpace.shared_cta
+            cute.arch.fence_proxy("async.shared", space="cta")
+            pipeline.arrive_and_wait(
+                barrier_id=self.epi_barrier_id,
                 num_threads=self.num_threads_per_warp_group)
-
-            # mainloop 前置（fmha.py:813-845）
-            tSsQ = qk_thr_mma.partition_A(sQ)
-            tSsK = qk_thr_mma.partition_B(sK)
-            tSrQ = qk_thr_mma.make_fragment_A(tSsQ)
-            tSrK = qk_thr_mma.make_fragment_B(tSsK)
-            tOsV = pv_thr_mma.partition_B(sV)
-            tOrV = pv_thr_mma.make_fragment_B(tOsV)
-
-            q_handle = load_q_consumer.wait()                  # fmha.py:826
-
-            # 全局 (q_idx, k_idx) 坐标（fmha.py:796/829 identity-tensor 技术）
-            cP = cute.make_identity_tensor((seqlen_q, seqlen_k))
-            gPcP = cute.local_tile(cP, self.qk_mma_tiler[:2], (None, None))
-            ptScP = qk_thr_mma.partition_C(gPcP)
-
-            pv_acc_shape = pv_thr_mma.partition_shape_C(
-                (self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
-            acc_pv = pv_thr_mma.make_fragment_C(pv_acc_shape)
-            acc_pv.fill(0.0)
-            # 两级累加的块内 temp：每块 PV wgmma 从 ScaleD=0 写起，无需初始化
-            acc_pv_temp = pv_thr_mma.make_fragment_C(pv_acc_shape)
-            qk_acc_shape = qk_thr_mma.partition_shape_C(
-                (self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
-
-            s_max_layout = cute.make_layout(
-                cute.size(self.layout_acc_mn(pv_tiled_mma, acc_pv.layout), mode=[0]))
-            s_max = cute.make_rmem_tensor_like(s_max_layout, Float32)
-            a_sum = cute.make_rmem_tensor_like(s_max, Float32)
-            o_scale = cute.make_rmem_tensor_like(s_max, Float32)  # per-row scale_pv
-            s_max.fill(-Float32.inf)     # 统一初值 → 无 is_first 特判：
-            a_sum.fill(0.0)              # 首次 rescale 因子 exp2(-inf)=0，acc_pv 已清零
-
-            # 前 trip_count-1 块不 mask，最后 1 块做 residual(+causal) mask
-            kv_iter = Int32(0)
-            load_kv_consumer, kv_iter, s_max, a_sum = self.compute(
-                False, trip_count - 1, kv_iter,
-                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
-                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
-                s_max, a_sum, o_scale,
-                ptScP, bidx_q, qk_acc_shape,
-                q_scale_val, mKScale, b_idx, kv_head,
-                scale_softmax_log2, seqlen_k)
-            load_kv_consumer, kv_iter, s_max, a_sum = self.compute(
-                True, Int32(1), kv_iter,
-                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
-                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
-                s_max, a_sum, o_scale,
-                ptScP, bidx_q, qk_acc_shape,
-                q_scale_val, mKScale, b_idx, kv_head,
-                scale_softmax_log2, seqlen_k)
-
-            cute.nvgpu.warpgroup.wait_group(0)
-            q_handle.release()                                 # fmha.py:1037
-
-            # ---- tail：行和归约 + O = acc · v_scale / row_sum448（fmha.py:1503-1561 改造）
-            # acc = Σ P448_q·V_q，row_sum448 = 448·ΣP（量化前），448 相消 ----
-            reduction_target_pv = self.reduction_target_n(pv_tiled_mma)
-            for r in cutlass.range_constexpr(cute.rank(reduction_target_pv)):
-                for i in cutlass.range_constexpr(cute.size(a_sum)):
-                    a_sum[i] = cute.arch.warp_reduction_sum(
-                        a_sum[i], threads_in_group=reduction_target_pv.shape[r])
-
-            acc_mn = cute.make_tensor(
-                acc_pv.iterator, self.layout_acc_mn(pv_tiled_mma, acc_pv.layout))
-            cO = cute.make_identity_tensor(
-                (self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
-            tOcO = pv_thr_mma.partition_C(cO)
-            tOcO_mn = cute.make_tensor(
-                tOcO.iterator, self.layout_acc_mn(pv_tiled_mma, tOcO.layout))
-            for i in cutlass.range_constexpr(cute.size(acc_mn, mode=[0])):
-                inv_sum = cute.arch.rcp_approx(a_sum[i])       # fmha.py:1548
-                if a_sum[i] == 0.0 or a_sum[i] != a_sum[i]:
-                    inv_sum = 1.0
-                for j in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
-                    col = tOcO_mn[(i, j)][1]                   # per-channel v_scale 列索引
-                    acc_mn[(i, j)] = acc_mn[(i, j)] * inv_sum * sVScale[col]
-
-            # ---- epilogue：r2s(StMatrix) + TMA store（fmha.py:1092-1190，单 math WG）----
-            copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                self.o_layout, elem_ty_d=self.o_dtype, elem_ty_acc=self.pv_acc_dtype)
-            copy_atom_O = cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(self.o_layout.is_m_major_c(), 4),
-                self.o_dtype)
-            tiled_copy_O_Atom = cute.make_tiled_copy_C_atom(copy_atom_O, pv_tiled_mma)
-            tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_O_Atom)
-            thr_copy_r2s = tiled_copy_r2s.get_slice(
-                tidx % self.num_threads_per_warp_group)
-            tRS_sD = thr_copy_r2s.partition_D(sO)
-            tRS_rAcc = tiled_copy_r2s.retile(acc_pv)
-
-            rD_shape = cute.shape(thr_copy_r2s.partition_S(sO))
-            tRS_rD_layout = cute.make_layout(rD_shape[:3])
-            tRS_rD = cute.make_rmem_tensor_like(tRS_rD_layout, self.pv_acc_dtype)
-            size_tRS_rD = cute.size(tRS_rD)
-
-            gD = cute.local_tile(mO_qdl, self.pv_mma_tiler[:2],
-                                 (bidx_q, 0, head_idx, b_idx))   # fmha.py:1130
-            sepi_for_tma_partition = cute.group_modes(sO, 0, 2)
-            tcgc_for_tma_partition = cute.zipped_divide(gD, self.epi_tile)
-            bSG_sD, bSG_gD = cpasync.tma_partition(
-                tma_atom_o, 0, cute.make_layout(1),
-                sepi_for_tma_partition, tcgc_for_tma_partition)
-            epi_tile_num = cute.size(tcgc_for_tma_partition, mode=[1])
-
-            for epi_idx in cutlass.range_constexpr(epi_tile_num):
-                for epi_v in cutlass.range_constexpr(size_tRS_rD):
-                    tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
-                tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD_layout, self.o_dtype)
-                acc_vec = tRS_rD.load()
-                tRS_rD_out.store(acc_vec.to(self.o_dtype))
-                epi_buffer = epi_idx % self.epi_stage
-                cute.copy(tiled_copy_r2s, tRS_rD_out,
-                          tRS_sD[(None, None, None, epi_buffer, 0)])
-                # 4.6.0 的 fence_proxy 只接受字符串字面量（nvvm_wrappers.py:1038），
-                # 语义同底本的 ProxyKind.async_shared + SharedSpace.shared_cta
-                cute.arch.fence_proxy("async.shared", space="cta")
-                pipeline.arrive_and_wait(
-                    barrier_id=self.math_warp_group_id,
-                    num_threads=self.num_threads_per_warp_group)
-                if warp_idx == 4:            # math WG 首 warp 发 TMA store
-                    cute.copy(tma_atom_o, bSG_sD[(None, epi_buffer, 0)],
-                              bSG_gD[(None, epi_idx)])
-                    tma_store_pipeline.producer_commit()
-                    tma_store_pipeline.producer_acquire()
-                pipeline.arrive_and_wait(
-                    barrier_id=self.math_warp_group_id,
-                    num_threads=self.num_threads_per_warp_group)
+            if warp_idx == 0:            # warp0 发 TMA store
+                cute.copy(tma_atom_o, bSG_sD[(None, epi_buffer, 0)],
+                          bSG_gD[(None, epi_idx)])
+                tma_store_pipeline.producer_commit()
+                tma_store_pipeline.producer_acquire()
+            pipeline.arrive_and_wait(
+                barrier_id=self.epi_barrier_id,
+                num_threads=self.num_threads_per_warp_group)
         return
+
+    # ---------------- TMA 补发（warp0 兼职 producer；token 偶=K 奇=V，块号 token//2）----------------
+    @cute.jit
+    def issue_kv(
+        self,
+        warp_idx: Int32,
+        kv_issue: Int32,
+        kv_issue_limit: Int32,
+        load_kv_producer: pipeline.PipelineProducer,
+        tma_atom_k: cute.CopyAtom,
+        tKgK: cute.Tensor,
+        tKsK: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        tVgV: cute.Tensor,
+        tVsV: cute.Tensor,
+    ):
+        if (warp_idx == 0) & (kv_issue < kv_issue_limit):
+            h = load_kv_producer.acquire_and_advance()
+            if kv_issue % 2 == 0:
+                cute.copy(tma_atom_k, tKgK[(None, kv_issue // 2)],
+                          tKsK[(None, h.index)], tma_bar_ptr=h.barrier)
+            else:
+                cute.copy(tma_atom_v, tVgV[(None, kv_issue // 2)],
+                          tVsV[(None, h.index)], tma_bar_ptr=h.barrier)
+            kv_issue += 1
+        return kv_issue, load_kv_producer
 
     # ---------------- mainloop 迭代（fmha.py:1199-1299 改造：dequant + 运行时 scale）----------------
     @cute.jit
@@ -702,7 +726,17 @@ class SageAttnSm90(CutedslKernel):
         kv_head: Int32,
         scale_softmax_log2: Float32,
         seqlen_k: Int32,
-    ) -> Tuple[pipeline.PipelineConsumer, Int32, cute.Tensor, cute.Tensor]:
+        warp_idx: Int32,
+        load_kv_producer: pipeline.PipelineProducer,
+        kv_issue: Int32,
+        kv_issue_limit: Int32,
+        tma_atom_k: cute.CopyAtom,
+        tKgK: cute.Tensor,
+        tKsK: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        tVgV: cute.Tensor,
+        tVsV: cute.Tensor,
+    ):
         while k_tile_count > 0:
             k_tile_count -= 1
             tScP = cute.slice_(ptScP, (None, None, None, bidx_q, kv_iter))  # fmha.py:1233
@@ -722,6 +756,11 @@ class SageAttnSm90(CutedslKernel):
             cute.nvgpu.warpgroup.commit_group()
             tok = load_kv_consumer.try_wait()                   # fmha.py:1253
             cute.nvgpu.warpgroup.wait_group(0)
+            # K 已被 QK wgmma 消费完，立即释放并由 warp0 补发下一 TMA token
+            k_handle.release()
+            kv_issue, load_kv_producer = self.issue_kv(
+                warp_idx, kv_issue, kv_issue_limit, load_kv_producer,
+                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
 
             # dequant 折叠：acc_s 保持 raw 域（f32(S_i32)，不乘 scale）。
             # dequant = q_scale·k_scale > 0 → max 保序，rowmax 在 raw 域做、每行一次
@@ -762,8 +801,10 @@ class SageAttnSm90(CutedslKernel):
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
 
-            k_handle.release()
             v_handle.release()
+            kv_issue, load_kv_producer = self.issue_kv(
+                warp_idx, kv_issue, kv_issue_limit, load_kv_producer,
+                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
 
             # 两级累加第 2 级：跨块在 CUDA core 上真 fp32，
             # acc_pv = acc_pv·scale_pv + temp（FFMA 融 rescale，sm90.cu:353 同款语义）
@@ -776,7 +817,7 @@ class SageAttnSm90(CutedslKernel):
                 for j in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[1])):
                     acc_pv_mn[(i, j)] = (
                         acc_pv_mn[(i, j)] * o_scale[i] + acc_temp_mn[(i, j)])
-        return load_kv_consumer, kv_iter, s_max, a_sum
+        return load_kv_consumer, load_kv_producer, kv_iter, kv_issue, s_max, a_sum
 
     # ---------------- online softmax（fmha.py:1301-1397 改造：m 统一初值 -inf）----------------
     @cute.jit
