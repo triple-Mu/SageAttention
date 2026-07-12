@@ -1,0 +1,178 @@
+== source_dsl3_d128: warp inst_executed by SASS opcode (total 724,487,814) ==
+FFMA                     138,412,032   19.10%
+FMUL                      74,448,896   10.28%
+FMNMX                     71,303,168    9.84%
+FADD                      69,337,088    9.57%
+MUFU.EX2                  69,206,016    9.55%
+I2FP.F32.S32              67,108,864    9.26%
+PRMT                      38,797,312    5.36%
+SEL                       34,537,472    4.77%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C      33,554,432    4.63%
+UMOV                      20,668,416    2.85%
+UIADD3                    16,596,992    2.29%
+IMAD.MOV.U32               6,128,182    0.85%
+BRA                        5,646,315    0.78%
+IMAD.U32                   5,270,692    0.73%
+LOP3.LUT                   4,546,560    0.63%
+SHFL.BFLY                  4,325,376    0.60%
+ULEA                       4,292,608    0.59%
+ULOP3.LUT                  4,194,304    0.58%
+IGMMA.64x128x32.S8.S8.SAT       4,194,304    0.58%
+QGMMA.64x128x32.F32.E4M3.E4M3       4,194,304    0.58%
+USEL                       4,128,768    0.57%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       3,804,324    0.53%
+VIADD                      3,375,104    0.47%
+FSEL                       2,195,456    0.30%
+CS2R                       2,129,920    0.29%
+WARPGROUP.DEPBAR.LE        2,129,920    0.29%
+SYNCS.ARRIVE.TRANS64.ART0       2,129,920    0.29%
+USHF.R.U32.HI              2,097,152    0.29%
+WARPGROUP.ARRIVE           2,097,152    0.29%
+FSETP.NEU.AND              2,097,152    0.29%
+UISETP.NE.U32.AND          2,064,384    0.28%
+UIADD3.X                   1,613,824    0.22%
+
+== stall samples by SASS opcode ==
+total samples: 165,301
+WARPGROUP.DEPBAR.LE       26,559   16.07%
+BRA                       25,563   15.46%
+MUFU.EX2                  24,113   14.59%
+FFMA                      14,660    8.87%
+I2FP.F32.S32              10,595    6.41%
+FMNMX                      8,236    4.98%
+PRMT                       7,419    4.49%
+FADD                       6,463    3.91%
+FMUL                       5,912    3.58%
+SEL                        3,977    2.41%
+LOP3.LUT                   3,844    2.33%
+F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C       2,826    1.71%
+QGMMA.64x128x32.F32.E4M3.E4M3       2,580    1.56%
+IGMMA.64x128x32.S8.S8.SAT       2,413    1.46%
+UMOV                       1,644    0.99%
+UIADD3                     1,553    0.94%
+ULEA                       1,420    0.86%
+SYNCS.PHASECHK.TRANS64.TRYWAIT       1,206    0.73%
+IMAD.U32                   1,058    0.64%
+IMAD.MOV.U32               1,011    0.61%
+
+== top 40 PCs by pcsamp samples ==
+pc=0x71b2bd7a1ef0 samples= 13,209 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=12717
+pc=0x71b2bd79ff00 samples= 12,756 inst_exec=   1,015,808
+    WARPGROUP.DEPBAR.LE gsb0, 0x0
+    barrier=12521
+pc=0x71b2bd79ed10 samples=  6,651 inst_exec=      65,536
+    @!P0  BRA 0x71b2bd7aa6b0
+    long_scoreboard=6641
+pc=0x71b2bd79eec0 samples=  6,567 inst_exec=      65,536
+    @!P0  BRA 0x71b2bd7aa770
+    long_scoreboard=6552
+pc=0x71b2bd79e960 samples=  5,020 inst_exec=      65,536
+    @!P0  BRA 0x71b2bd7aa4b0
+    long_scoreboard=5005
+pc=0x71b2bd79eb20 samples=  4,348 inst_exec=      65,536
+    @!P0  BRA 0x71b2bd7aa5b0
+    long_scoreboard=4335
+pc=0x71b2bd79feb0 samples=  1,911 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    math_pipe_throttle=993 not_selected=610 wait=209
+pc=0x71b2bd7a0680 samples=  1,521 inst_exec=   1,015,808
+    FMNMX R149, R43, R30, !PT
+    short_scoreboard=1339
+pc=0x71b2bd7a1db0 samples=  1,489 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R96, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=1237 not_selected=151
+pc=0x71b2bd79fda0 samples=  1,435 inst_exec=   1,015,808
+    IGMMA.64x128x32.S8.S8.SAT R24, gdesc[UR8], RZ, !UPT
+    warpgroup_arrive=1331
+pc=0x71b2bd7a1ed0 samples=  1,298 inst_exec=   1,015,808
+    LOP3.LUT R153, R153, UR6, RZ, 0x3c, !PT
+    math_pipe_throttle=513 not_selected=323 wait=216 dispatch_stall=176 selected=70
+pc=0x71b2bd79f8d0 samples=  1,259 inst_exec=      32,768
+    @!P0  BRA 0x71b2bd7aa910
+    long_scoreboard=1253
+pc=0x71b2bd79fc30 samples=    868 inst_exec=   1,015,808
+    ULEA UR16, UR4, UR41, 0x3
+    no_instructions=622 branch_resolving=137 not_selected=87
+pc=0x71b2bd7a11d0 samples=    846 inst_exec=   1,015,808
+    MUFU.EX2 R71, R36
+    wait=407 not_selected=235 mio_throttle=130 selected=60
+pc=0x71b2bd79fff0 samples=    827 inst_exec=   1,015,808
+    I2FP.F32.S32 R39, R39
+    not_selected=343 math_pipe_throttle=319 wait=105
+pc=0x71b2bd7a0e70 samples=    794 inst_exec=   1,015,808
+    MUFU.EX2 R39, R39
+    wait=456 mio_throttle=180 not_selected=103 selected=52
+pc=0x71b2bd7a1e60 samples=    794 inst_exec=   1,015,808
+    QGMMA.64x128x32.F32.E4M3.E4M3 R24, R104, gdesc[UR8], R24
+    wait=535 not_selected=113 dispatch_stall=93 selected=53
+pc=0x71b2bd7a1640 samples=    784 inst_exec=   1,015,808
+    MUFU.EX2 R52, R52
+    wait=395 not_selected=241 mio_throttle=82 selected=57
+pc=0x71b2bd7a0f10 samples=    756 inst_exec=   1,015,808
+    MUFU.EX2 R76, R76
+    wait=409 mio_throttle=216 not_selected=72 selected=53
+pc=0x71b2bd7a0b60 samples=    716 inst_exec=   1,015,808
+    FMNMX R43, R180, R43, !PT
+    not_selected=249 math_pipe_throttle=215 wait=184 selected=62
+pc=0x71b2bd7a0e80 samples=    692 inst_exec=   1,015,808
+    MUFU.EX2 R60, R60
+    wait=381 mio_throttle=180 not_selected=73 selected=56
+pc=0x71b2bd79fef0 samples=    679 inst_exec=   1,015,808
+    SYNCS.PHASECHK.TRANS64.TRYWAIT P0, [UR8+0x10], R155
+    wait=563 selected=59
+pc=0x71b2bd7a0f00 samples=    666 inst_exec=   1,015,808
+    MUFU.EX2 R43, R43
+    wait=378 mio_throttle=190 selected=53 not_selected=44
+pc=0x71b2bd7a1220 samples=    628 inst_exec=   1,015,808
+    MUFU.EX2 R162, R162
+    wait=436 mio_throttle=112 selected=55
+pc=0x71b2bd79fd60 samples=    624 inst_exec=   1,015,808
+    @!P0  BRA 0x71b2bd7aa970
+    long_scoreboard=540 selected=44 not_selected=36
+pc=0x71b2bd7a0ef0 samples=    614 inst_exec=   1,015,808
+    MUFU.EX2 R68, R68
+    wait=312 mio_throttle=197 selected=58 not_selected=44
+pc=0x71b2bd7a1b00 samples=    607 inst_exec=   1,015,808
+    MUFU.EX2 R62, R62
+    wait=316 not_selected=164 mio_throttle=77 selected=39
+pc=0x71b2bd7a19a0 samples=    580 inst_exec=   1,015,808
+    PRMT R102, R40, 0x5410, R43
+    not_selected=196 math_pipe_throttle=188 short_scoreboard=130 selected=57
+pc=0x71b2bd7a1b30 samples=    580 inst_exec=   1,015,808
+    MUFU.EX2 R35, R84
+    wait=334 not_selected=110 mio_throttle=94 selected=42
+pc=0x71b2bd7a1b40 samples=    577 inst_exec=   1,015,808
+    MUFU.EX2 R98, R98
+    wait=398 mio_throttle=77 not_selected=49 selected=46
+pc=0x71b2bd7a1670 samples=    571 inst_exec=   1,015,808
+    PRMT R43, R36, 0x5410, R43
+    not_selected=177 wait=164 math_pipe_throttle=163 selected=59
+pc=0x71b2bd7a1200 samples=    552 inst_exec=   1,015,808
+    MUFU.EX2 R73, R35
+    wait=288 mio_throttle=127 not_selected=69 selected=58
+pc=0x71b2bd7a18a0 samples=    550 inst_exec=   1,015,808
+    MUFU.EX2 R50, R50
+    wait=296 mio_throttle=128 not_selected=75 selected=44
+pc=0x71b2bd7a1a20 samples=    546 inst_exec=   1,015,808
+    MUFU.EX2 R57, R57
+    wait=402 mio_throttle=51 selected=50 not_selected=40
+pc=0x71b2bd7a17f0 samples=    545 inst_exec=   1,015,808
+    MUFU.EX2 R42, R42
+    wait=321 not_selected=111 selected=56 mio_throttle=53
+pc=0x71b2bd79e5d0 samples=    538 inst_exec=      65,536
+    STL [R1], R4
+    barrier=512
+pc=0x71b2bd7a1710 samples=    537 inst_exec=   1,015,808
+    MUFU.EX2 R46, R46
+    wait=369 mio_throttle=83 selected=47 not_selected=34
+pc=0x71b2bd7a1820 samples=    529 inst_exec=   1,015,808
+    MUFU.EX2 R184, R184
+    wait=317 mio_throttle=108 selected=49 not_selected=48
+pc=0x71b2bd7a1e10 samples=    528 inst_exec=   1,015,808
+    LOP3.LUT P0, RZ, R154, 0x1f, RZ, 0xc0, !PT
+    math_pipe_throttle=175 short_scoreboard=145 not_selected=125 selected=58
+pc=0x71b2bd7a1c00 samples=    514 inst_exec=   1,015,808
+    MUFU.EX2 R156, R34
+    wait=285 mio_throttle=88 not_selected=69 selected=43 dispatch_stall=29
