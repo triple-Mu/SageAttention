@@ -1,4 +1,4 @@
-# CuteDSL SageAttention (Hopper)：torch 量化 + CuTe-DSL kernel + 端到端 API。
+# CuteDSL SageAttention (Hopper)：量化（triton kernel + torch fallback）+ CuTe-DSL kernel + 端到端 API。
 # kernel 部分见文件下半部（Task 3 追加）。
 import math
 from typing import Optional, Tuple
@@ -6,9 +6,25 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-# ===== torch 量化（正确性优先，后续可换 triton/融合 kernel）=====
+# ===== 量化：triton kernel（CUDA，quant_triton.py）+ torch 参考实现（对照/CPU fallback）=====
+# 两条路径输出 bit-identical（test_triton_matches_torch 钉死）。
+
+try:
+    from . import quant_triton
+except ImportError:
+    try:
+        import quant_triton
+    except ImportError:          # triton 不可用（如 CPU-only 环境）→ 恒走 torch 路径
+        quant_triton = None
+
+USE_TRITON_QUANT = True          # bench/调试开关：False 强制走 torch 路径
 
 _AMAX_EPS = 1e-7    # 防除零下限，与 CUDA 版一致（csrc/fused/fused.cu:147）
+
+
+def _triton_ok(t: torch.Tensor) -> bool:
+    return (quant_triton is not None and USE_TRITON_QUANT
+            and t.is_cuda and t.stride(-1) == 1 and t.shape[-1] in (64, 128))
 
 
 def quant_q_int8_per_warp(q: torch.Tensor):
@@ -18,6 +34,35 @@ def quant_q_int8_per_warp(q: torch.Tensor):
     scale 段序 = seq 顺序的 16 行段（行 r 对应索引 r//16），与 CUDA quant_per_warp_int8_cuda 一致。
     尾块补零行不抬高 amax；全 padding 段 scale 钳到 _AMAX_EPS/127（非 0/NaN）。
     """
+    if _triton_ok(q):
+        return quant_triton.quant_q_int8_per_warp(q)
+    return _quant_q_int8_per_warp_torch(q)
+
+
+def quant_k_int8_per_block(k: torch.Tensor, km: Optional[torch.Tensor] = None):
+    """K per-block int8 量化（BLKK=128），量化前减 km（smooth_k）。
+
+    k: [b, s, n_kv, d]，km: [b, 1, n_kv, d] 或 None
+    -> (k_int8 [b,s,n_kv,d] int8, k_scale [b, n_kv, ceil(s/128)] fp32)
+    先减 km 再补零，保证 padding 行不污染尾块 amax。
+    """
+    if _triton_ok(k) and (km is None or km.stride(-1) == 1):
+        return quant_triton.quant_k_int8_per_block(k, km)
+    return _quant_k_int8_per_block_torch(k, km)
+
+
+def quant_v_fp8_per_channel(v: torch.Tensor):
+    """V per-channel e4m3 量化并 materialize 为 [b, n_kv, d, s_pad] contiguous。
+
+    v: [b, s, n_kv, d]；s_pad = ceil(s/128)*128，尾部零补（e4m3 精确 0）。
+    v_scale = amax/448（amax 仅统计有效 seq），v_fp8 = v·448/amax。无 token permute。
+    """
+    if _triton_ok(v):
+        return quant_triton.quant_v_fp8_per_channel(v)
+    return _quant_v_fp8_per_channel_torch(v)
+
+
+def _quant_q_int8_per_warp_torch(q: torch.Tensor):
     b, s, n, d = q.shape
     nblk = (s + 63) // 64
     s_pad = nblk * 64
@@ -33,13 +78,7 @@ def quant_q_int8_per_warp(q: torch.Tensor):
     return q_int8.view(b, s_pad, n, d)[:, :s].contiguous(), q_scale
 
 
-def quant_k_int8_per_block(k: torch.Tensor, km: Optional[torch.Tensor] = None):
-    """K per-block int8 量化（BLKK=128），量化前减 km（smooth_k）。
-
-    k: [b, s, n_kv, d]，km: [b, 1, n_kv, d] 或 None
-    -> (k_int8 [b,s,n_kv,d] int8, k_scale [b, n_kv, ceil(s/128)] fp32)
-    先减 km 再补零，保证 padding 行不污染尾块 amax。
-    """
+def _quant_k_int8_per_block_torch(k: torch.Tensor, km: Optional[torch.Tensor] = None):
     b, s, n, d = k.shape
     nblk = (s + 127) // 128
     s_pad = nblk * 128
@@ -56,12 +95,7 @@ def quant_k_int8_per_block(k: torch.Tensor, km: Optional[torch.Tensor] = None):
     return k_int8.view(b, s_pad, n, d)[:, :s].contiguous(), k_scale
 
 
-def quant_v_fp8_per_channel(v: torch.Tensor):
-    """V per-channel e4m3 量化并 materialize 为 [b, n_kv, d, s_pad] contiguous。
-
-    v: [b, s, n_kv, d]；s_pad = ceil(s/128)*128，尾部零补（e4m3 精确 0）。
-    v_scale = amax/448（amax 仅统计有效 seq），v_fp8 = v·448/amax。无 token permute。
-    """
+def _quant_v_fp8_per_channel_torch(v: torch.Tensor):
     b, s, n, d = v.shape
     s_pad = (s + 127) // 128 * 128
     vt = v.permute(0, 2, 3, 1).float()                                 # [b, n, d, s]

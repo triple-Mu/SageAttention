@@ -8,33 +8,48 @@ import torch
 
 try:
     from .core import LOG2_448, quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
+    from . import core
 except ImportError:
     from core import LOG2_448, quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
+    import core
 
 LOG2E = math.log2(math.e)
 
 
 # ============ 量化函数单测 ============
+# device 参数化：cpu 走 torch 路径，cuda 走 triton 路径（dispatch 见 core._triton_ok）
 
-def test_q_scale_shape_order_and_tail():
+def _quant_devices():
+    devs = ["cpu"]
+    if torch.cuda.is_available() and core.quant_triton is not None:
+        devs.append("cuda")
+    return devs
+
+
+@pytest.fixture(params=_quant_devices())
+def device(request):
+    return request.param
+
+
+def test_q_scale_shape_order_and_tail(device):
     """分段常数张量验证段序：第 g 个 16 行段填 g+1 → scale[..., g] == (g+1)/127。"""
     b, s, n, d = 2, 337, 3, 64                       # ceil(337/64)=6 块 → 24 段，有效段 22
-    g = torch.arange(s) // 16
+    g = torch.arange(s, device=device) // 16
     q = (g + 1).to(torch.float16)[None, :, None, None].expand(b, s, n, d).contiguous()
     q_int8, q_scale = quant_q_int8_per_warp(q)
     assert q_int8.shape == (b, s, n, d) and q_int8.dtype == torch.int8 and q_int8.is_contiguous()
     assert q_scale.shape == (b, n, 24) and q_scale.dtype == torch.float32 and q_scale.is_contiguous()
     n_valid = (s + 15) // 16                         # 22，末段仅 1 有效行（amax 只看有效行）
-    expect = (torch.arange(n_valid).float() + 1) / 127.0
+    expect = (torch.arange(n_valid, device=device).float() + 1) / 127.0
     assert torch.allclose(q_scale[..., :n_valid], expect.expand(b, n, -1))
     assert (q_int8.float() == 127).all()             # 段内常数 → 全 127
     tail = q_scale[..., n_valid:]                    # 全 padding 段
     assert (tail > 0).all() and not torch.isnan(tail).any()
 
 
-def test_q_roundtrip_error():
+def test_q_roundtrip_error(device):
     torch.manual_seed(0)
-    q = torch.randn(1, 200, 2, 128, dtype=torch.float16)   # 非 64 倍数
+    q = torch.randn(1, 200, 2, 128, dtype=torch.float16, device=device)   # 非 64 倍数
     q_int8, q_scale = quant_q_int8_per_warp(q)
     scale_row = q_scale.repeat_interleave(16, dim=-1)[..., :200].permute(0, 2, 1)[..., None]
     deq = q_int8.float() * scale_row
@@ -42,10 +57,10 @@ def test_q_roundtrip_error():
     assert ((deq - q.float()).abs() <= scale_row * (0.5 + 3e-5)).all()
 
 
-def test_k_smooth_tail_and_roundtrip():
+def test_k_smooth_tail_and_roundtrip(device):
     torch.manual_seed(0)
     b, s, n, d = 1, 337, 2, 64                       # ceil(337/128)=3 块，尾块 81 有效行
-    k = torch.randn(b, s, n, d, dtype=torch.float16) * 4
+    k = torch.randn(b, s, n, d, dtype=torch.float16, device=device) * 4
     km = k.mean(dim=1, keepdim=True)
     k_int8, k_scale = quant_k_int8_per_block(k, km)
     assert k_int8.shape == (b, s, n, d) and k_scale.shape == (b, n, 3)
@@ -56,10 +71,10 @@ def test_k_smooth_tail_and_roundtrip():
     assert ((k_int8.float() * scale_row - kf).abs() <= scale_row * (0.5 + 3e-5)).all()
 
 
-def test_v_pad_zero_scale_and_roundtrip():
+def test_v_pad_zero_scale_and_roundtrip(device):
     torch.manual_seed(0)
     b, s, n, d = 1, 337, 2, 128
-    v = torch.randn(b, s, n, d, dtype=torch.bfloat16)
+    v = torch.randn(b, s, n, d, dtype=torch.bfloat16, device=device)
     v_fp8, v_scale = quant_v_fp8_per_channel(v)
     assert v_fp8.shape == (b, n, d, 384) and v_fp8.dtype == torch.float8_e4m3fn
     assert v_fp8.is_contiguous() and v_scale.shape == (b, n, d)
@@ -70,6 +85,37 @@ def test_v_pad_zero_scale_and_roundtrip():
     # e4m3 正规数相对误差 ≤ 2^-4，次正规绝对步长 ≤ v_scale·2^-9
     bound = vt.abs() * 2.0 ** -4 + v_scale[..., None] * 2.0 ** -9
     assert ((deq - vt).abs() <= bound + 1e-7).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or core.quant_triton is None,
+                    reason="需要 CUDA GPU + triton")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_triton_matches_torch(dtype):
+    """triton 量化与 torch 参考实现 bit-identical：int8/fp8 逐元素相等、scale 逐 bit 相等。
+    含非整块 s（337/200）、单块边界（64）、异质量级输入（×4^k 阶梯）。"""
+    torch.manual_seed(3)
+    shapes = [(2, 337, 3, 64), (1, 200, 2, 128), (2, 1024, 8, 128),
+              (1, 64, 4, 64), (1, 4096, 2, 128)]
+    for b, s, n, d in shapes:
+        q = torch.randn(b, s, n, d, dtype=dtype, device="cuda")
+        q = q * (4.0 ** (torch.arange(s, device="cuda") // 16 % 4))[None, :, None, None].to(dtype)
+        km = q.mean(dim=1, keepdim=True)
+        for fn, args in [
+            (core._quant_q_int8_per_warp_torch, (q,)),
+            (core._quant_k_int8_per_block_torch, (q, None)),
+            (core._quant_k_int8_per_block_torch, (q, km)),
+        ]:
+            ref_i8, ref_sc = fn(*args)
+            tri = {core._quant_q_int8_per_warp_torch: core.quant_triton.quant_q_int8_per_warp,
+                   core._quant_k_int8_per_block_torch: core.quant_triton.quant_k_int8_per_block}[fn]
+            tri_i8, tri_sc = tri(*args)
+            assert torch.equal(ref_i8, tri_i8), f"int8 mismatch: {fn.__name__} {b,s,n,d}"
+            assert torch.equal(ref_sc, tri_sc), f"scale mismatch: {fn.__name__} {b,s,n,d}"
+        ref_f8, ref_vs = core._quant_v_fp8_per_channel_torch(q)
+        tri_f8, tri_vs = core.quant_triton.quant_v_fp8_per_channel(q)
+        # fp8 无逐元素 ==，按 uint8 位模式比较（NaN-safe）
+        assert torch.equal(ref_f8.view(torch.uint8), tri_f8.view(torch.uint8)), f"fp8 mismatch {b,s,n,d}"
+        assert torch.equal(ref_vs, tri_vs), f"v_scale mismatch {b,s,n,d}"
 
 
 # ---- 阈值：2026-07-12 H200 全矩阵实测标定（kernel @ 7d027e9），规则 max_observed×3

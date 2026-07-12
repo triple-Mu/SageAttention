@@ -1,6 +1,6 @@
 # H200 性能对比：CUDA C++ sm90 kernel vs CuTe-DSL kernel vs torch SDPA。
 # kernel-only：预量化输入，不含量化开销（与 bench/ 目录惯例一致）；
-# 端到端：含 torch 量化（CuTeDSL 侧量化为 torch 临时实现，非本期优化目标）。
+# 端到端：含量化（CuTeDSL 侧默认 triton 量化 kernel，另测 torch 路径对照 + 量化/kernel 分解）。
 #
 # 口径说明：
 # - CUDA 侧用 qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf（fp32+fp32 两级累加 + fuse v_scale），
@@ -79,9 +79,14 @@ def bench_kernel_only(d, seq, causal):
 
 
 def bench_e2e(seq, causal, d=128):
-    """端到端（含量化）：返回 (ms_cuda, ms_dsl)。输入 fp16 NHD [b,s,n,d]。"""
+    """端到端（含量化）：返回 (ms_cuda, ms_dsl_torch, ms_dsl, ms_quant, ms_kernel)。
+    ms_dsl_torch 为强制 torch 量化路径（前后对比）；ms_quant/ms_kernel 为 CuTeDSL
+    triton 路径的端到端分解（量化段含 k.mean）。输入 fp16 NHD [b,s,n,d]。"""
+    import core as _core
+
     b, h = BATCH, HEADS
     dev = "cuda"
+    sm_scale = d ** -0.5
     q = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
     k = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
     v = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
@@ -97,9 +102,48 @@ def bench_e2e(seq, causal, d=128):
     torch.cuda.synchronize()
     ms_dsl = bench_ms(fn_dsl)
 
-    del q, k, v
+    _core.USE_TRITON_QUANT = False
+    fn_dsl()
+    torch.cuda.synchronize()
+    ms_dsl_torch = bench_ms(fn_dsl)
+    _core.USE_TRITON_QUANT = True
+
+    # 分解：量化段（k.mean + Q/K/V 三个量化）与 kernel 段分开计时
+    def quant_all():
+        km = k.mean(dim=1, keepdim=True)
+        return (*_core.quant_q_int8_per_warp(q), *_core.quant_k_int8_per_block(k, km),
+                *_core.quant_v_fp8_per_channel(v))
+    q_i8, q_sc, k_i8, k_sc, v_f8, v_sc = quant_all()
+    ms_quant = bench_ms(quant_all)
+    o = torch.empty(q.shape, dtype=q.dtype, device=dev)
+    kern = SageAttnSm90.from_args(d, causal, torch.float16, 1)
+    ms_kernel = bench_ms(
+        lambda: kern.run(q_i8, k_i8, v_f8, q_sc, k_sc, v_sc, o, sm_scale))
+
+    del q, k, v, q_i8, q_sc, k_i8, k_sc, v_f8, v_sc, o
     torch.cuda.empty_cache()
-    return ms_cuda, ms_dsl
+    return ms_cuda, ms_dsl_torch, ms_dsl, ms_quant, ms_kernel
+
+
+def bench_quant_pieces(seq, d=128):
+    """量化各步单独计时（km / Q / K / V），评估 k.mean 占比。"""
+    import core as _core
+
+    b, h = BATCH, HEADS
+    dev = "cuda"
+    q = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
+    k = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
+    v = torch.randn(b, seq, h, d, dtype=torch.float16, device=dev)
+    km = k.mean(dim=1, keepdim=True)
+    out = {
+        "km": bench_ms(lambda: k.mean(dim=1, keepdim=True)),
+        "quant_q": bench_ms(lambda: _core.quant_q_int8_per_warp(q)),
+        "quant_k": bench_ms(lambda: _core.quant_k_int8_per_block(k, km)),
+        "quant_v": bench_ms(lambda: _core.quant_v_fp8_per_channel(v)),
+    }
+    del q, k, v, km
+    torch.cuda.empty_cache()
+    return out
 
 
 def main():
@@ -123,13 +167,23 @@ def main():
     if quick:
         return
 
-    print("\n## 端到端（含量化，d=128；CuTeDSL 量化为 torch 临时实现，非本期优化目标）\n")
-    print("| seq | causal | CUDA e2e ms | CuTeDSL e2e ms |")
-    print("|---:|:---|---:|---:|")
+    print("\n## 端到端（含量化，d=128；CuTeDSL 默认 triton 量化，torch 列为旧路径对照）\n")
+    print("| seq | causal | CUDA e2e ms | CuTeDSL e2e ms (torch 量化) | CuTeDSL e2e ms (triton 量化) "
+          "| CUDA/CuTeDSL | 量化 ms | kernel ms |")
+    print("|---:|:---|---:|---:|---:|---:|---:|---:|")
     for causal in (False, True):
         for seq in (1024, 4096, 16384):
-            ms_cuda, ms_dsl = bench_e2e(seq, causal)
-            print(f"| {seq} | {causal} | {ms_cuda:.3f} | {ms_dsl:.3f} |", flush=True)
+            ms_cuda, ms_dsl_torch, ms_dsl, ms_quant, ms_kernel = bench_e2e(seq, causal)
+            print(f"| {seq} | {causal} | {ms_cuda:.3f} | {ms_dsl_torch:.3f} | {ms_dsl:.3f} "
+                  f"| {ms_cuda / ms_dsl:.3f} | {ms_quant:.3f} | {ms_kernel:.3f} |", flush=True)
+
+    print("\n## 量化分步（triton 路径，non-causal 同输入，ms）\n")
+    print("| seq | k.mean | quant_q | quant_k | quant_v |")
+    print("|---:|---:|---:|---:|---:|")
+    for seq in (1024, 4096, 16384):
+        p = bench_quant_pieces(seq)
+        print(f"| {seq} | {p['km']:.4f} | {p['quant_q']:.4f} | {p['quant_k']:.4f} "
+              f"| {p['quant_v']:.4f} |", flush=True)
 
 
 if __name__ == "__main__":
