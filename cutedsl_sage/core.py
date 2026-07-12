@@ -796,6 +796,7 @@ class SageAttnSm90(CutedslKernel):
         red_rank = cute.rank(reduction_target_qk)
         s_max_prev = cute.make_rmem_tensor_like(s_max, Float32)
         # dequant 折叠：acc_s 是 raw 域，exp2 系数用 c′ = c·dequant（每块每 warp 1 次 FMUL）
+        # 前提：sm_scale 为正常量级（c′ 下溢到 0 会使 0·(−inf)=NaN，需 sm_scale<~2e-27 才触发）
         scale_raw_log2 = scale_softmax_log2 * dequant
 
         for i in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[0])):
