@@ -1,0 +1,115 @@
+diff --git a/cutedsl_sage/core.py b/cutedsl_sage/core.py
+index d77525c..09ef6f7 100644
+--- a/cutedsl_sage/core.py
++++ b/cutedsl_sage/core.py
+@@ -1,6 +1,7 @@
+ # CuteDSL SageAttention (Hopper)：量化（triton kernel + torch fallback）+ CuTe-DSL kernel + 端到端 API。
+ # kernel 部分见文件下半部（Task 3 追加）。
+ import math
++import os
+ from typing import Optional, Tuple
+ 
+ import torch
+@@ -140,7 +141,9 @@ import cutlass.pipeline as pipeline
+ import cutlass.utils.hopper_helpers as sm90_utils
+ from cutlass import Float32, Int32, const_expr
+ from cutlass.cute.nvgpu import cpasync, warpgroup
++from cutlass.cutlass_dsl import T, dsl_user_op
+ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
++from cutlass._mlir.dialects import llvm
+ 
+ try:
+     from .cutedsl_sage import CutedslKernel
+@@ -156,6 +159,74 @@ _TORCH_TO_CUTLASS = {
+ }
+ 
+ 
++# ===== exp2 FMA emulation（移植 flash-attention flash_attn/cute/utils.py ex2_emulation，
++# 标量 sm90 版——f32x2 packed 指令是 sm100 专属）：MUFU.EX2 → FADD/FFMA + 位操作，
++# 把 SFU(XU pipe) 压力换到 FMA/ALU pipe。x+(2^23+2^22) 向下取整加法把 floor(x) 推进
++# 尾数低 8 位；frac∈[0,1) 用 sollya fpminimax 5 阶多项式算 2^frac（相对误差 ~1.6e-7，
++# 与 MUFU.EX2 同量级；上游默认 3 阶 ~9e-5、4 阶 ~3e-6 均会因 e4m3 边界翻转把一级
++# maxrel 顶到 2.2~2.3e-2 超 2e-2 阈值）；shl 23 + add.s32 把整数部分并进指数位。=====
++_EX2_MAGIC = float(2 ** 23 + 2 ** 22)
++# flash-attention utils.py POLY_EX2[5]：fpminimax(exp(x·log 2), 5, [|1,24...|], [0;1], relative)
++_EX2_POLY = (1.0,
++             0.693151414394378662109375,
++             0.24016360938549041748046875,
++             5.5802188813686370849609375e-2,
++             9.01452265679836273193359375e-3,
++             1.86810153536498546600341796875e-3)
++# 逐元素 exp2 的 emulation 占比 = RES/FREQ（j%FREQ 的后 RES 个走 emulation，其余 MUFU）。
++# 上游同款 freq/res 插桩；env 供扫参，最终值以 commit 为准
++_EX2_EMU_FREQ = int(os.environ.get("SAGE_EX2_EMU_FREQ", "8"))
++_EX2_EMU_RES = int(os.environ.get("SAGE_EX2_EMU_RES", "0"))
++
++
++@dsl_user_op
++def _add_round_down(x, y, *, loc=None, ip=None) -> Float32:
++    """add.rm.ftz.f32（向下取整 FADD，全速、不占 SFU）。"""
++    return cutlass.Float32(llvm.inline_asm(
++        T.f32(),
++        [Float32(x).ir_value(loc=loc, ip=ip), Float32(y).ir_value(loc=loc, ip=ip)],
++        "add.rm.ftz.f32 $0, $1, $2;",
++        "=f,f,f",
++        has_side_effects=False, is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT))
++
++
++@dsl_user_op
++def _combine_int_frac_ex2(x_rounded, frac_ex2, *, loc=None, ip=None) -> Float32:
++    """bitcast((bits(x_rounded)<<23) + bits(frac_ex2))：整数部分并进指数位。
++    add.s32 编成 LEA（ALU pipe），add.u32 会编成 IMAD 占 FMA pipe（上游注释）。"""
++    return cutlass.Float32(llvm.inline_asm(
++        T.f32(),
++        [Float32(x_rounded).ir_value(loc=loc, ip=ip),
++         Float32(frac_ex2).ir_value(loc=loc, ip=ip)],
++        "{\n\t"
++        ".reg .s32 xr, fe, xe, outi;\n\t"
++        "mov.b32 xr, $1;\n\t"
++        "mov.b32 fe, $2;\n\t"
++        "shl.b32 xe, xr, 23;\n\t"
++        "add.s32 outi, xe, fe;\n\t"
++        "mov.b32 $0, outi;\n\t"
++        "}\n",
++        "=f,f,f",
++        has_side_effects=False, is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT))
++
++
++def _exp2_emul(x):
++    """exp2(x) FMA emulation。本 kernel 中 x ≤ log2 448≈8.8；x<-127（含 mask 的 -inf）
++    钳到 -127 → 结果 ~2^-127 denormal，转 e4m3 归零、a_sum 增量 ~1e-38 可忽略。"""
++    x_c = cute.arch.fmax(x, -127.0)
++    x_r = _add_round_down(x_c, _EX2_MAGIC)   # floor(x_c) 进 x_r 尾数低 8 位
++    # 两步 FADD 精确还原 frac = x_c - floor(x_c) ∈ [0,1)（asm 结果不透明，编译器不可重结合）
++    frac = x_c - (x_r - _EX2_MAGIC)
++    p = frac * _EX2_POLY[5] + _EX2_POLY[4]   # Horner，编译成 FFMA 链
++    p = p * frac + _EX2_POLY[3]
++    p = p * frac + _EX2_POLY[2]
++    p = p * frac + _EX2_POLY[1]
++    p = p * frac + _EX2_POLY[0]
++    return _combine_int_frac_ex2(x_r, p)
++
++
+ def _tree_fmax(acc_s_mn, i, lo, hi):
+     """行内 rowmax 的树形归约（模块级纯 Python，trace 期展开成 FMNMX 二叉树）。
+     cute.arch.fmax → FMNMX（cutlass.max 会编成 NaN 语义 FSETP+FSEL）；S 在 mask 后
+@@ -860,9 +931,15 @@ class SageAttnSm90(CutedslKernel):
+             # ×448 折进 exp2（P1.2）：arg = c′·S_raw − (c·m − log2 448)，exp2 直接得
+             # P448=448·P；每元素仍是 1 条 FFMA + 1 条 MUFU.EX2（系数 c→c′ 零增量）
+             scale_max = scale_softmax_log2 * local_max - LOG2_448
++            # 逐元素 exp2 按 j%FREQ 位置混合 MUFU 与 FMA emulation（分摊 XU/FMA pipe），
++            # 上游 softmax.py apply_exp2_convert 同款插桩；scale_pv（进 rescale 链）恒走 MUFU
+             for j in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[1])):
+-                acc_s_mn[(i, j)] = cute.math.exp2(
+-                    scale_raw_log2 * acc_s_mn[(i, j)] - scale_max, fastmath=True)
++                if const_expr(j % _EX2_EMU_FREQ >= _EX2_EMU_FREQ - _EX2_EMU_RES):
++                    acc_s_mn[(i, j)] = _exp2_emul(
++                        scale_raw_log2 * acc_s_mn[(i, j)] - scale_max)
++                else:
++                    acc_s_mn[(i, j)] = cute.math.exp2(
++                        scale_raw_log2 * acc_s_mn[(i, j)] - scale_max, fastmath=True)
+ 
+             # 首迭代 s_max_prev=-inf → scale_pv=0，旧 acc（已清零）与旧 sum 均被清除；
+             # m 变化补偿项 scale_pv 不带 448 偏移（两次 448 在分子分母中相消）
