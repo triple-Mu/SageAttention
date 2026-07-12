@@ -21,6 +21,20 @@ USE_TRITON_QUANT = True          # bench/调试开关：False 强制走 torch �
 
 _AMAX_EPS = 1e-7    # 防除零下限，与 CUDA 版一致（csrc/fused/fused.cu:147）
 
+# V offline token 置换：v_fp8 的 s 维位置 i 存原 token φ(i)，φ 在 16 token 组内为
+# V_PERM_16、跨组平移不变。它抵消 kernel 侧 e4m3 wgmma A-fragment 的 k 读序
+# （见 SageAttnSm90.make_acc_into_op），实验反解记录：.superpowers/sdd/offline-permute-report.md
+V_PERM_16 = (0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15)
+
+
+def v_perm_index(s_pad: int, device, inverse: bool = False) -> torch.Tensor:
+    """φ（inverse=True 时 φ⁻¹）的整段索引向量：out[i] = (i//16)*16 + π[i%16]。"""
+    pi = torch.tensor(V_PERM_16, device=device)
+    if inverse:
+        pi = torch.argsort(pi)
+    i = torch.arange(s_pad, device=device)
+    return (i // 16) * 16 + pi[i % 16]
+
 
 def _triton_ok(t: torch.Tensor) -> bool:
     return (quant_triton is not None and USE_TRITON_QUANT
@@ -58,7 +72,9 @@ def quant_v_fp8_per_channel(v: torch.Tensor):
     """V per-channel e4m3 量化并 materialize 为 [b, n_kv, d, s_pad] contiguous。
 
     v: [b, s, n_kv, d]；s_pad = ceil(s/128)*128，尾部零补（e4m3 精确 0）。
-    v_scale = amax/448（amax 仅统计有效 seq），v_fp8 = v·448/amax。无 token permute。
+    v_scale = amax/448（amax 仅统计有效 seq），v_fp8 = v·448/amax。
+    s 维按 φ 置换（V_PERM_16）：位置 i 存原 token φ(i)，与 kernel 的 e4m3 A-fragment
+    读序配对；消费侧需先按 v_perm_index(inverse=True) 逆置换回自然 token 序。
     """
     if _triton_ok(v):
         return quant_triton.quant_v_fp8_per_channel(v)
@@ -107,6 +123,7 @@ def _quant_v_fp8_per_channel_torch(v: torch.Tensor):
     v_scaled = vt * (448.0 / amax)[..., None]                          # 幅值 ≤448，e4m3 不溢出
     if s_pad != s:
         v_scaled = F.pad(v_scaled, (0, s_pad - s))
+    v_scaled = v_scaled[..., v_perm_index(s_pad, v.device)]            # offline φ 置换
     v_fp8 = v_scaled.to(torch.float8_e4m3fn).contiguous()
     return v_fp8, v_scale
 
@@ -253,7 +270,7 @@ class SageAttnSm90(CutedslKernel):
         self,
         q: cute.Tensor,          # (b, s_q, n_q, d)  int8
         k: cute.Tensor,          # (b, s_k, n_kv, d) int8
-        v: cute.Tensor,          # (b, n_kv, d, s_pad) uint8(=e4m3)
+        v: cute.Tensor,          # (b, n_kv, d, s_pad) uint8(=e4m3)，s 维已按 φ 置换
         q_scale: cute.Tensor,    # (b, n_q, ceil(s_q/64)*4) f32
         k_scale: cute.Tensor,    # (b, n_kv, ceil(s_k/128)) f32
         v_scale: cute.Tensor,    # (b, n_kv, d) f32
@@ -819,54 +836,39 @@ class SageAttnSm90(CutedslKernel):
         )
 
     @cute.jit
-    def make_acc_into_op(self, acc, operand_layout_tv, Element):  # fmha.py:1419-1500
+    def make_acc_into_op(self, acc, operand_layout_tv, Element):  # fmha.py:1419-1500 改造
         operand = cute.make_rmem_tensor_like(
             self.convert_c_layout_to_a_layout(acc.layout, operand_layout_tv.shape[1]),
             Element,
         )
-        operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
-        acc_vec = acc.load()
-        operand_as_acc.store(acc_vec.to(Element))
-
         if cutlass.const_expr(Element.width == 8):
-            # 8-bit A fragment 的 warp 内重排（shuffle_sync + prmt），逐字照抄底本
-            tidx, _, _ = cute.arch.thread_idx()
-            tid = tidx % 4
-            values_u32 = cute.recast_tensor(operand, cutlass.Uint32)
-            for n in cutlass.range_constexpr(cute.size(values_u32, mode=[1])):
-                for k in cutlass.range_constexpr(cute.size(values_u32, mode=[2])):
-                    for ii in cutlass.range_constexpr(0, 8, 4):
-                        values_tmp_0 = values_u32[ii // 2 + 0, n, k]
-                        values_tmp_1 = values_u32[ii // 2 + 1, n, k]
-
-                        v_to_send = 1
-                        if tid == 1 or tid == 2:
-                            v_to_send = 0
-                        t_to_recv_from = (0x3021 >> (tid * 4)) & 0xF
-                        values_tmp_a = values_tmp_1
-                        if v_to_send == 0:
-                            values_tmp_a = values_tmp_0
-                        values_tmp_a = cute.arch.shuffle_sync_op(
-                            values_tmp_a, t_to_recv_from, 0xFFFFFFFF, 7199)
-
-                        v_to_send = 1 - v_to_send
-                        t_to_recv_from = (0x2130 >> (tid * 4)) & 0xF
-                        values_tmp_b = values_tmp_1
-                        if v_to_send == 0:
-                            values_tmp_b = values_tmp_0
-                        values_tmp_b = cute.arch.shuffle_sync_op(
-                            values_tmp_b, t_to_recv_from, 0xFFFFFFFF, 7199)
-
-                        order = 0x5410
-                        if v_to_send == 0:
-                            order = 0x1054
-                        values_u32[ii // 2 + 0, n, k] = cute.arch.prmt(
-                            values_tmp_a, values_tmp_b, order)
-                        order = 0x7632
-                        if v_to_send == 0:
-                            order = 0x3276
-                        values_u32[ii // 2 + 1, n, k] = cute.arch.prmt(
-                            values_tmp_a, values_tmp_b, order)
+            # 线程内字节重排 τ 取代底本的 shuffle_sync+prmt 在线重排（offline V permute 方案）。
+            # acc C-fragment 值序 (i0,i1,i2)=(列对内偏移2, 行0/+8, 8列组16) → operand 字节位
+            # i0 + 4·i1 + 2·(i2&1) + 8·(i2>>1)，即每 8 值 [v0 v1 v4 v5 | v2 v3 v6 v7] 进两个
+            # u32——与 CUDA RS_32_to_8 的交织一致（attn_utils.cuh:479）。τ 只归位行(m)；
+            # 剩余 k 错位 φ=[0,1,8,9,2,3,10,11,4,5,12,13,6,7,14,15]（16 组内）由 V 量化时
+            # offline 置换补偿（quant_v_fp8_per_channel），推导与实验反解见
+            # .superpowers/sdd/offline-permute-report.md
+            assert cute.size(acc, mode=[1]) == 1 and cute.size(acc, mode=[2]) == 1
+            s0 = acc.stride[0]
+            assert (s0[0], s0[1], s0[2]) == (1, 2, 4)   # 紧凑 fragment，τ 直接按位表达
+            n8 = cute.size(acc, mode=[0]) // 4          # 8 列组个数（CTA_K=128 → 16）
+            # τ 放在 load 侧：f32 寄存器 gather 免费（折进 F2FP 的源操作数选择），
+            # store 侧保持自然紧凑序 → 打包 codegen 与置换前相同（无额外 PRMT/SEL）
+            src_layout = cute.make_layout(
+                ((2, 2, (2, n8 // 2)), 1, 1),
+                stride=((1, 4, (2, 8)), 0, 0),
+            )
+            dst_layout = cute.make_layout(
+                ((2, 2, (2, n8 // 2)), 1, 1),
+                stride=((1, 2, (4, 8)), 0, 0),
+            )
+            acc_perm = cute.make_tensor(acc.iterator, src_layout)
+            operand_view = cute.make_tensor(operand.iterator, dst_layout)
+            operand_view.store(acc_perm.load().to(Element))
+        else:
+            operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
+            operand_as_acc.store(acc.load().to(Element))
         return operand
 
     @staticmethod

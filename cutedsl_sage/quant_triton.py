@@ -103,14 +103,18 @@ def _quant_v_fp8_transpose_kernel(V, Amax, Out, s,
                                   stride_ob, stride_on, stride_od,
                                   D_BLKS: tl.constexpr,
                                   BS: tl.constexpr, BD: tl.constexpr):
-    # pass 2：v·(448/amax) → e4m3，转置 materialize 为 [b,n,d,s_pad]；
-    # s_pad 为 BS 整数倍，pad 行由 masked load 得 0 → e4m3 精确 0
+    # pass 2：v·(448/amax) → e4m3，转置 materialize 为 [b,n,d,s_pad]，s 维按 φ 置换：
+    # 输出位置 i 存原 token φ(i)，φ 16 组内 = core.V_PERM_16（e4m3 wgmma A-fragment 的
+    # k 读序补偿，见 core.make_acc_into_op）。置换只改 load 的行选择（各行本就是离散的
+    # d 连续段），访存零额外成本；pad 行（φ(i) ≥ s）由 masked load 得 0 → e4m3 精确 0
     pid0 = tl.program_id(0)
     sblk = pid0 // D_BLKS
     dblk = pid0 % D_BLKS
     h = tl.program_id(1)
     b = tl.program_id(2)
-    rows = sblk * BS + tl.arange(0, BS)
+    pos = sblk * BS + tl.arange(0, BS)              # 输出 s 位置（存储保持连续）
+    pm = pos % 16
+    rows = pos - pm + (pm % 2) + ((pm % 4) // 2) * 8 + (pm // 4) * 2   # 原 token φ(pos)
     cols = dblk * BD + tl.arange(0, BD)
     x = tl.load(V + b * stride_vb + h * stride_vn
                 + rows[:, None] * stride_vs + cols[None, :],
@@ -119,7 +123,7 @@ def _quant_v_fp8_transpose_kernel(V, Amax, Out, s,
     r = libdevice.rcp_rn(amax) * 448.0              # = torch `448.0 / amax`
     y = (x * r[None, :]).to(tl.float8e4nv, fp_downcast_rounding="rtne")
     tl.store(Out + b * stride_ob + h * stride_on
-             + cols[:, None] * stride_od + rows[None, :],
+             + cols[:, None] * stride_od + pos[None, :],
              tl.trans(y))
 
 

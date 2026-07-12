@@ -78,10 +78,13 @@ def test_v_pad_zero_scale_and_roundtrip(device):
     v_fp8, v_scale = quant_v_fp8_per_channel(v)
     assert v_fp8.shape == (b, n, d, 384) and v_fp8.dtype == torch.float8_e4m3fn
     assert v_fp8.is_contiguous() and v_scale.shape == (b, n, d)
-    assert (v_fp8.float()[..., s:] == 0).all()       # pad 区精确零
+    # v_fp8 位置 i 存 token φ(i)：逆置换回自然序后，pad 零 / roundtrip 按 token 序断言
+    # （任何置换错位都会让下方逐元素紧 bound 大面积溃败，等效钉死 φ 契约）
+    v_nat = v_fp8.float()[..., core.v_perm_index(384, v_fp8.device, inverse=True)]
+    assert (v_nat[..., s:] == 0).all()               # pad 区精确零
     vt = v.permute(0, 2, 3, 1).float()
     assert torch.allclose(v_scale, vt.abs().amax(-1).clamp_min(1e-7) / 448.0)
-    deq = v_fp8.float()[..., :s] * v_scale[..., None]
+    deq = v_nat[..., :s] * v_scale[..., None]
     # e4m3 正规数相对误差 ≤ 2^-4，次正规绝对步长 ≤ v_scale·2^-9
     bound = vt.abs() * 2.0 ** -4 + v_scale[..., None] * 2.0 ** -9
     assert ((deq - vt).abs() <= bound + 1e-7).all()
@@ -175,7 +178,8 @@ def ref_quant_sim(q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, is_causal, s
 
     qf = q_int8.permute(0, 2, 1, 3).float()
     kf = k_int8.permute(0, 2, 1, 3).float()
-    vf = v_fp8.float()[..., :s_k]                    # pad 列在 kernel 中被 mask 压零，等价于截断
+    # v_fp8 位置 i 存 token φ(i)：先逆置换回自然 token 序，再截断（kernel 中 pad 列被 mask 压零）
+    vf = v_fp8.float()[..., core.v_perm_index(v_fp8.shape[-1], v_fp8.device, inverse=True)][..., :s_k]
     if g != 1:
         kf = kf.repeat_interleave(g, dim=1)
         vf = vf.repeat_interleave(g, dim=1)
