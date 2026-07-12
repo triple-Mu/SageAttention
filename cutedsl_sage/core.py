@@ -47,6 +47,9 @@ def quant_k_int8_per_block(k: torch.Tensor, km: Optional[torch.Tensor] = None):
     先减 km 再补零，保证 padding 行不污染尾块 amax。
     """
     if _triton_ok(k) and (km is None or km.stride(-1) == 1):
+        if km is not None:
+            # triton kernel 按 [b,1,n,d] 的 stride 索引 km，可广播的其他形状会静默越界
+            assert km.shape == (k.shape[0], 1, k.shape[2], k.shape[3]), km.shape
         return quant_triton.quant_k_int8_per_block(k, km)
     return _quant_k_int8_per_block_torch(k, km)
 
