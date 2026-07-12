@@ -200,10 +200,11 @@ class SageAttnSm90(CutedslKernel):
 
         # K/V 共用一个环形 smem 缓冲（fmha.py:601），每次 KV 迭代占 2 个 stage（K 一个 V 一个），
         # 一个 stage = 128*d 字节（K 块与 V 块字节数恒等）。
-        # P3：目标 3 CTA/SM，smem 预算 ≤75.7KB/CTA —— d=128 用 3 stage（实测 66.56KB），
-        # d=64 用 7 stage（实测 70.85KB；8 stage 78.85KB 会把 smem 占用限到 2 CTA/SM）
+        # P3：d128 目标 3 CTA/SM（smem ≤75.7KB/CTA）→ 3 stage（实测 66.56KB）；
+        # d64 目标 4 CTA/SM（smem ≤56.7KB/CTA）→ 5 stage（实测 54.27KB）。
+        # d64 5 CTA（kv_stage=3、96 reg）实测 duration 持平但 17M spill，不取
         self.q_stage = 1
-        self.kv_stage = 3 if head_dim == 128 else 7
+        self.kv_stage = 3 if head_dim == 128 else 5
         self.epi_stage = 2
 
         self.num_threads_per_warp_group = 128
@@ -408,8 +409,9 @@ class SageAttnSm90(CutedslKernel):
             cluster=self.cluster_shape_mnk,
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
-            # P3：nvvm.minctasm=3（ptxas 按 3 CTA/SM 分配 launch 期寄存器 ≤168/线程）
-            min_blocks_per_mp=3,
+            # P3：nvvm.minctasm 按形状取 3/4（launch 期寄存器预算 168/128 每线程，
+            # 实测 d128 167 reg、d64 126 reg 均 0 spill）
+            min_blocks_per_mp=3 if self.head_dim == 128 else 4,
         )
 
     # ---------------- device kernel ----------------
