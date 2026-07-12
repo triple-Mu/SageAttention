@@ -12,6 +12,7 @@ except ImportError:
     from core import quant_q_int8_per_warp, quant_k_int8_per_block, quant_v_fp8_per_channel
 
 LOG2E = math.log2(math.e)
+LOG2_448 = math.log2(448.0)   # 与 core.py 的 exp2 常量偏移一致（P1.2）
 
 
 # ============ 量化函数单测 ============
@@ -115,8 +116,10 @@ def ref_sdpa(q, k, v, is_causal, sm_scale):
 
 def ref_quant_sim(q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, is_causal, sm_scale):
     """fp32 精确模拟量化 attention，与 kernel 逐块同构：
-    per-128 列块 online softmax，P 在 running-max 域 ×448 转 e4m3 后累加，
-    row_sum 用量化前 f32 P。残差仅剩 kernel 的 FP22 累加与 exp2/rcp 舍入。
+    per-128 列块 online softmax，P448 = exp2((S−m)·c + log2 448) 直接在 448 常量域生成
+    （与 kernel 的 exp2 常量偏移同构，P1.2），转 e4m3 后累加；
+    row_sum448 用量化前 f32 P448，O = acc·v_scale/row_sum448（448 代数相消）。
+    残差仅剩 kernel 的 FP22 累加与 exp2/rcp 舍入。
     注意：P→e4m3 发生在 running-max 域，与全局 softmax 后量化不可交换（实测差 3e-4）。
     返回 [b, s_q, n_q, d] fp32。
     """
@@ -152,13 +155,13 @@ def ref_quant_sim(q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, is_causal, s
         sl = slice(it * CTA_K, min((it + 1) * CTA_K, s_k))
         sb = S[..., sl]
         m_new = torch.maximum(m_run, sb.amax(-1, keepdim=True))
-        resc = torch.exp2((m_run - m_new) * c)
-        pb = torch.exp2((sb - m_new) * c)
-        d_run = d_run * resc + pb.sum(-1, keepdim=True)       # row_sum 用量化前 P
-        pb448 = (pb * 448.0).to(torch.float8_e4m3fn).float()
-        acc = acc * resc + torch.matmul(pb448, vf[..., sl].transpose(-1, -2))
+        resc = torch.exp2((m_run - m_new) * c)                 # m 补偿项不带 448 偏移
+        pb448 = torch.exp2((sb - m_new) * c + LOG2_448)        # 448 常量域，与 kernel 同构
+        d_run = d_run * resc + pb448.sum(-1, keepdim=True)     # row_sum448 用量化前 f32 P448
+        pb448_q = pb448.to(torch.float8_e4m3fn).float()
+        acc = acc * resc + torch.matmul(pb448_q, vf[..., sl].transpose(-1, -2))
         m_run = m_new
-    o = acc * (v_scale / 448.0)[:, :, None, :] / d_run
+    o = acc * v_scale[:, :, None, :] / d_run
     return o.permute(0, 2, 1, 3)
 
 

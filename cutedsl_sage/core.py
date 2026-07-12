@@ -94,6 +94,7 @@ except ImportError:
     from cutedsl_sage import CutedslKernel
 
 LOG2_E = math.log2(math.e)
+LOG2_448 = math.log2(448.0)   # ×448 折进 exp2 的编译期常量偏移（P1.2）
 
 _TORCH_TO_CUTLASS = {
     torch.float16: cutlass.Float16,
@@ -462,10 +463,10 @@ class SageAttnSm90(CutedslKernel):
             warp_local = warp_idx - self.math_warp_group_id * self.num_warps_per_warp_group
             q_scale_val = mQScale[(b_idx, head_idx, bidx_q * 4 + warp_local)]
 
-            # v_scale/448 预折算进 smem，epilogue 按列取用
+            # v_scale 预存 smem，epilogue 按列取用；448 已在 row_sum448 分母中相消（P1.2）
             t_local = tidx - self.num_threads_per_warp_group
             if t_local < self.head_dim:
-                sVScale[t_local] = mVScale[(b_idx, kv_head, t_local)] * (1.0 / 448.0)
+                sVScale[t_local] = mVScale[(b_idx, kv_head, t_local)]
             pipeline.arrive_and_wait(                          # named barrier（fmha.py:1171）
                 barrier_id=self.math_warp_group_id,
                 num_threads=self.num_threads_per_warp_group)
@@ -519,7 +520,8 @@ class SageAttnSm90(CutedslKernel):
             cute.nvgpu.warpgroup.wait_group(0)
             q_handle.release()                                 # fmha.py:1037
 
-            # ---- tail：行和归约 + O = acc · v_scale/448 · 1/row_sum（fmha.py:1503-1561 改造）----
+            # ---- tail：行和归约 + O = acc · v_scale / row_sum448（fmha.py:1503-1561 改造）
+            # acc = Σ P448_q·V_q，row_sum448 = 448·ΣP（量化前），448 相消 ----
             reduction_target_pv = self.reduction_target_n(pv_tiled_mma)
             for r in cutlass.range_constexpr(cute.rank(reduction_target_pv)):
                 for i in cutlass.range_constexpr(cute.size(a_sum)):
@@ -664,9 +666,7 @@ class SageAttnSm90(CutedslKernel):
                 acc_s, qk_tiled_mma, s_max, a_sum, acc_pv, pv_tiled_mma,
                 scale_softmax_log2)
 
-            # P∈[0,1] 显式 ×448 后转 e4m3（契约；epilogue 用 v_scale/448 除回）
-            for i in cutlass.range_constexpr(cute.size(acc_s)):
-                acc_s[i] = acc_s[i] * 448.0
+            # acc_s 已是 P448 = 448·P ∈ [0,448]（softmax_step 内 exp2 常量偏移），直接转 e4m3
             acc_p_op = self.make_acc_into_op(
                 acc_s, pv_tiled_mma.tv_layout_A, self.v_dtype)  # fmha.py:1275
             v_handle = load_kv_consumer.wait_and_advance(tok)
@@ -715,14 +715,19 @@ class SageAttnSm90(CutedslKernel):
             local_max = s_max[i]
             if s_max[i] == -Float32.inf:      # 整行被 mask 时避免 -inf 参与运算
                 local_max = 0.0
-            scale_max = scale_softmax_log2 * local_max
+            # ×448 折进 exp2（P1.2）：arg = c·S − (c·m − log2 448)，exp2 直接得 P448=448·P，
+            # 消掉独立的 ×448 FMUL 循环；每元素仍是 1 条 FFMA + 1 条 MUFU.EX2
+            scale_max = scale_softmax_log2 * local_max - LOG2_448
             for j in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[1])):
                 acc_s_mn[(i, j)] = cute.math.exp2(
                     scale_softmax_log2 * acc_s_mn[(i, j)] - scale_max, fastmath=True)
 
-            # 首迭代 s_max_prev=-inf → scale_pv=0，旧 acc（已清零）与旧 sum 均被清除
+            # 首迭代 s_max_prev=-inf → scale_pv=0，旧 acc（已清零）与旧 sum 均被清除；
+            # m 变化补偿项 scale_pv 不带 448 偏移（两次 448 在分子分母中相消）
             scale_pv = cute.math.exp2(
                 (s_max_prev[i] - local_max) * scale_softmax_log2, fastmath=True)
+            # a_sum 从此累加 P448：row_sum448 = 448·ΣP，与 epilogue O = acc·v_scale/row_sum448
+            # 配对（acc 累加的也是 P448·V），448 代数上完全相消
             a_sum[i] = a_sum[i] * scale_pv + acc_s_mn[(i, None)].load().reduce(
                 cute.ReductionOp.ADD, Float32.zero, 0)         # fmha.py:1393
             for j in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[1])):
