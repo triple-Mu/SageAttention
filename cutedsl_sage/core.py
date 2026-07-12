@@ -705,7 +705,9 @@ class SageAttnSm90(CutedslKernel):
         for i in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[0])):
             s_max_prev[i] = s_max[i]
             for j in cutlass.range_constexpr(cute.size(acc_s_mn, mode=[1])):
-                s_max[i] = cutlass.max(s_max[i], acc_s_mn[(i, j)])
+                # cute.arch.fmax → FMNMX（cutlass.max 会编成 NaN 语义 FSETP+FSEL）；
+                # S 在 mask 后只含普通值与 -inf、无 NaN，语义安全
+                s_max[i] = cute.arch.fmax(s_max[i], acc_s_mn[(i, j)])
             for r in cutlass.range_constexpr(red_rank):        # quad reduction
                 s_max[i] = cute.arch.warp_reduction_max(
                     s_max[i], threads_in_group=reduction_target_qk.shape[r])
