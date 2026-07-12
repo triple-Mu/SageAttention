@@ -1,0 +1,492 @@
+diff --git a/cutedsl_sage/bench_pipe.py b/cutedsl_sage/bench_pipe.py
+new file mode 100644
+index 0000000..589fdfa
+--- /dev/null
++++ b/cutedsl_sage/bench_pipe.py
+@@ -0,0 +1,92 @@
++# 软件流水三模式 A/B bench（kernel-only，预量化输入，口径同 bench_compare.py）。
++# 同进程同卡交错：每形状按 round-robin 跑 ROUNDS 轮 do_bench，取各模式中值的中值，
++# 消除时段漂移。模式规格 "mode" 或 "mode:minctasm"（如 full:2）。
++#   用法：python bench_pipe.py [--full] [modes...]   默认 serial qk_hide full
++import os
++import statistics
++import sys
++
++import torch
++from triton.testing import do_bench
++
++import sageattention._qattn_sm90 as qattn_sm90
++
++from core import SageAttnSm90
++
++BATCH, HEADS = 4, 32
++ROUNDS = 3
++
++
++def bench_ms(fn):
++    return do_bench(fn, warmup=25, rep=100, return_mode="median")
++
++
++def tflops(s, d, causal, ms):
++    f = 4 * BATCH * HEADS * s * s * d / (2 if causal else 1)
++    return f / (ms * 1e-3) / 1e12
++
++
++def make_inputs(d, seq):
++    dev = "cuda"
++    q_i8 = torch.randint(-95, 95, (BATCH, seq, HEADS, d), dtype=torch.int8, device=dev)
++    k_i8 = torch.randint(-95, 95, (BATCH, seq, HEADS, d), dtype=torch.int8, device=dev)
++    q_scale = torch.randn(BATCH, HEADS, seq // 64 * 4, dtype=torch.float32, device=dev).abs()
++    k_scale = torch.randn(BATCH, HEADS, seq // 128, dtype=torch.float32, device=dev).abs()
++    v_scale = torch.randn(BATCH, HEADS, d, dtype=torch.float32, device=dev).abs()
++    v_dsl = torch.randn(BATCH, HEADS, d, seq, dtype=torch.float16, device=dev).to(torch.float8_e4m3fn)
++    v_cuda = torch.randn(BATCH, d, HEADS, seq, dtype=torch.float16, device=dev).to(torch.float8_e4m3fn)
++    o = torch.empty(BATCH, seq, HEADS, d, dtype=torch.float16, device=dev)
++    return q_i8, k_i8, q_scale, k_scale, v_scale, v_dsl, v_cuda, o
++
++
++def main():
++    args = [a for a in sys.argv[1:]]
++    full_matrix = "--full" in args
++    specs = [a for a in args if not a.startswith("--")] or ["serial", "qk_hide", "full"]
++
++    dev_name = torch.cuda.get_device_name()
++    print(f"GPU: {dev_name} | torch {torch.__version__} | b={BATCH} h={HEADS} "
++          f"rounds={ROUNDS} modes={specs}")
++    seqs = (1024, 4096, 16384, 32768) if full_matrix else (4096, 16384)
++    causals = (False, True) if full_matrix else (False,)
++
++    hdr = "| seq | d | causal | CUDA " + "".join(f"| {m} " for m in specs) + \
++          "".join(f"| {m}/serial " for m in specs if m != "serial") + "| best/CUDA |"
++    print("\n" + hdr)
++    print("|" + "---|" * (hdr.count("|") - 1))
++
++    for d in (128, 64):
++        for causal in causals:
++            for seq in seqs:
++                q_i8, k_i8, q_sc, k_sc, v_sc, v_dsl, v_cuda, o = make_inputs(d, seq)
++                sm_scale = d ** -0.5
++                ck = qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
++                _c = 1 if causal else 0
++                fns = {"cuda": lambda: ck(q_i8, k_i8, v_cuda, o, q_sc, k_sc, v_sc,
++                                          0, _c, 2, sm_scale, 0)}
++                for spec in specs:
++                    mode, _, mct = spec.partition(":")
++                    os.environ["SAGE_PIPE_MODE"] = mode
++                    os.environ["SAGE_MINCTASM"] = mct or "0"
++                    kern = SageAttnSm90.from_args(d, causal, torch.float16, 1)
++                    fns[spec] = (lambda kern=kern: kern.run(
++                        q_i8, k_i8, v_dsl, q_sc, k_sc, v_sc, o, sm_scale))
++                res = {k: [] for k in fns}
++                for _ in range(ROUNDS):                      # 交错轮换
++                    for name, fn in fns.items():
++                        fn(); torch.cuda.synchronize()
++                        res[name].append(bench_ms(fn))
++                ms = {k: statistics.median(v) for k, v in res.items()}
++                row = f"| {seq} | {d} | {causal} | {tflops(seq, d, causal, ms['cuda']):.1f} "
++                row += "".join(f"| {tflops(seq, d, causal, ms[m]):.1f} " for m in specs)
++                row += "".join(f"| {ms['serial'] / ms[m]:.3f} "
++                               for m in specs if m != "serial")
++                best = min(ms[m] for m in specs)
++                row += f"| {ms['cuda'] / best:.3f} |"
++                print(row, flush=True)
++                del q_i8, k_i8, q_sc, k_sc, v_sc, v_dsl, v_cuda, o
++                torch.cuda.empty_cache()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cutedsl_sage/core.py b/cutedsl_sage/core.py
+index d77525c..f0e21c6 100644
+--- a/cutedsl_sage/core.py
++++ b/cutedsl_sage/core.py
+@@ -1,6 +1,7 @@
+ # CuteDSL SageAttention (Hopper)：量化（triton kernel + torch fallback）+ CuTe-DSL kernel + 端到端 API。
+ # kernel 部分见文件下半部（Task 3 追加）。
+ import math
++import os
+ from typing import Optional, Tuple
+ 
+ import torch
+@@ -175,12 +176,20 @@ class SageAttnSm90(CutedslKernel):
+     CTA_Q = 64
+     CTA_K = 128
+ 
+-    def __init__(self, head_dim: int, is_causal: bool, o_dtype, gqa_ratio: int):
++    def __init__(self, head_dim: int, is_causal: bool, o_dtype, gqa_ratio: int,
++                 pipe_mode: str = "serial", minctasm: int = 0):
+         super().__init__()
+         assert head_dim in (64, 128)
++        assert pipe_mode in ("serial", "qk_hide", "full")
+         self.head_dim = head_dim
+         self.is_causal = is_causal
+         self.gqa_ratio = gqa_ratio
++        # GEMM-softmax 软件流水模式（设计与在飞组计数表：.superpowers/sdd/softpipe-design.md）
++        #   serial：基线（QK/PV 各自 commit 后立即 wait_group(0)）
++        #   qk_hide：commit 序「PV_t 先、QK_{t+1} 后」+ wait_group(1) → merge_t ∥ QK_{t+1}
++        #   full：QK_{t+1} 提前发 + merge skew → softmax_t ∥ {QK_{t+1}, PV_{t-1}}
++        self.pipe_mode = pipe_mode
++        self.minctasm = minctasm if minctasm else (3 if head_dim == 128 else 4)
+ 
+         self.q_dtype = cutlass.Int8
+         self.k_dtype = cutlass.Int8
+@@ -221,12 +230,16 @@ class SageAttnSm90(CutedslKernel):
+     @classmethod
+     def from_args(cls, head_dim: int, is_causal: bool, out_dtype: torch.dtype,
+                   gqa_ratio: int) -> "SageAttnSm90":
+-        key = (head_dim, is_causal, out_dtype, gqa_ratio)
++        # 流水模式/占用实验开关（env 每次调用重读，A/B 同进程交错切换）
++        pipe_mode = os.environ.get("SAGE_PIPE_MODE", "serial")
++        minctasm = int(os.environ.get("SAGE_MINCTASM", "0"))
++        key = (head_dim, is_causal, out_dtype, gqa_ratio, pipe_mode, minctasm)
+         cached = cls.compile_cache.get(key)
+         if cached is not None:
+             return cached
+ 
+-        kernel = cls(head_dim, is_causal, _TORCH_TO_CUTLASS[out_dtype], gqa_ratio)
++        kernel = cls(head_dim, is_causal, _TORCH_TO_CUTLASS[out_dtype], gqa_ratio,
++                     pipe_mode, minctasm)
+ 
+         # b/s/n 动态、d/dtype 静态；紧凑行主序 fake tensor（runtime.py:604），
+         # stride_order 值 0 = 最小 stride（runtime.py:642 示例），(3,2,1,0) 即 torch contiguous
+@@ -409,9 +422,9 @@ class SageAttnSm90(CutedslKernel):
+             cluster=self.cluster_shape_mnk,
+             smem=self.shared_storage.size_in_bytes(),
+             stream=stream,
+-            # P3：nvvm.minctasm 按形状取 3/4（launch 期寄存器预算 168/128 每线程，
+-            # 实测 d128 167 reg、d64 126 reg 均 0 spill）
+-            min_blocks_per_mp=3 if self.head_dim == 128 else 4,
++            # P3：nvvm.minctasm 默认按形状取 3/4（launch 期寄存器预算 168/128 每线程，
++            # 实测 serial d128 167 reg、d64 126 reg 均 0 spill）；SAGE_MINCTASM 可覆盖
++            min_blocks_per_mp=self.minctasm,
+         )
+ 
+     # ---------------- device kernel ----------------
+@@ -572,28 +585,71 @@ class SageAttnSm90(CutedslKernel):
+ 
+         # 前 trip_count-1 块不 mask，最后 1 块做 residual(+causal) mask
+         kv_iter = Int32(0)
+-        (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
+-         s_max, a_sum) = self.compute(
+-            False, trip_count - 1, kv_iter,
+-            qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
+-            q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+-            s_max, a_sum, o_scale,
+-            ptScP, bidx_q, qk_acc_shape,
+-            q_scale_val, mKScale, b_idx, kv_head,
+-            scale_softmax_log2, seqlen_k,
+-            warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
+-            tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
+-        (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
+-         s_max, a_sum) = self.compute(
+-            True, Int32(1), kv_iter,
+-            qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
+-            q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
+-            s_max, a_sum, o_scale,
+-            ptScP, bidx_q, qk_acc_shape,
+-            q_scale_val, mKScale, b_idx, kv_head,
+-            scale_softmax_log2, seqlen_k,
+-            warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
+-            tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++        if const_expr(self.pipe_mode == "serial"):
++            (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
++             s_max, a_sum) = self.compute(
++                False, trip_count - 1, kv_iter,
++                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
++                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
++                s_max, a_sum, o_scale,
++                ptScP, bidx_q, qk_acc_shape,
++                q_scale_val, mKScale, b_idx, kv_head,
++                scale_softmax_log2, seqlen_k,
++                warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
++                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++            (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
++             s_max, a_sum) = self.compute(
++                True, Int32(1), kv_iter,
++                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
++                q_handle, tSrQ, tSrK, tOrV, acc_pv, acc_pv_temp,
++                s_max, a_sum, o_scale,
++                ptScP, bidx_q, qk_acc_shape,
++                q_scale_val, mKScale, b_idx, kv_head,
++                scale_softmax_log2, seqlen_k,
++                warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
++                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++        else:
++            # ---- 软件流水 prologue：QK_0 提前发（acc_qk 跨迭代携带，单缓冲即可：
++            # 每迭代先 convert 腾空再发下一块）----
++            is_full = self.pipe_mode == "full"
++            acc_qk = qk_thr_mma.make_fragment_C(qk_acc_shape)
++            o_scale_prev = cute.make_rmem_tensor_like(s_max, Float32)
++            k_handle = load_kv_consumer.wait_and_advance()
++            cute.nvgpu.warpgroup.fence()
++            self.gemm_zero_acc(
++                qk_tiled_mma,
++                tSrQ[(None, None, None, q_handle.index)],
++                tSrK[(None, None, None, k_handle.index)], acc_qk)
++            cute.nvgpu.warpgroup.commit_group()
++            if const_expr(is_full):
++                # full 的迭代顶用 W(1)，t=0 无 PV_{-1} 垫位会漏等 QK_0 → prologue 就地
++                # 等掉（一次性裸奔）。merge_{-1} 恒等化：temp=0、prev=1（acc_pv 全 +0，
++                # FFMA 逐位不变），免首迭代动态 guard
++                cute.nvgpu.warpgroup.wait_group(0)
++                acc_pv_temp.fill(0.0)
++                o_scale_prev.fill(1.0)
++            (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
++             s_max, a_sum, k_handle) = self.compute_pipelined(
++                False, is_full, trip_count - 1, kv_iter,
++                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
++                q_handle, k_handle, acc_qk, tSrQ, tSrK, tOrV,
++                acc_pv, acc_pv_temp, s_max, a_sum, o_scale, o_scale_prev,
++                ptScP, bidx_q,
++                q_scale_val, mKScale, b_idx, kv_head,
++                scale_softmax_log2, seqlen_k,
++                warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
++                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++            (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
++             s_max, a_sum, k_handle) = self.compute_pipelined(
++                True, is_full, Int32(1), kv_iter,
++                qk_thr_mma, qk_tiled_mma, pv_tiled_mma, load_kv_consumer,
++                q_handle, k_handle, acc_qk, tSrQ, tSrK, tOrV,
++                acc_pv, acc_pv_temp, s_max, a_sum, o_scale, o_scale_prev,
++                ptScP, bidx_q,
++                q_scale_val, mKScale, b_idx, kv_head,
++                scale_softmax_log2, seqlen_k,
++                warp_idx, load_kv_producer, kv_issue, kv_issue_limit,
++                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
+ 
+         cute.nvgpu.warpgroup.wait_group(0)
+         q_handle.release()                                 # fmha.py:1037
+@@ -821,6 +877,170 @@ class SageAttnSm90(CutedslKernel):
+                         acc_pv_mn[(i, j)] * o_scale[i] + acc_temp_mn[(i, j)])
+         return load_kv_consumer, load_kv_producer, kv_iter, kv_issue, s_max, a_sum
+ 
++    # ---------------- 两级累加第 2 级（跨块 CUDA core FFMA 合并；与 serial 内联版逐字同构）----
++    @cute.jit
++    def merge_pv(self, pv_tiled_mma, acc_pv, acc_pv_temp, o_scale):
++        acc_pv_mn = cute.make_tensor(
++            acc_pv.iterator, self.layout_acc_mn(pv_tiled_mma, acc_pv.layout))
++        acc_temp_mn = cute.make_tensor(
++            acc_pv_temp.iterator,
++            self.layout_acc_mn(pv_tiled_mma, acc_pv_temp.layout))
++        for i in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[0])):
++            for j in cutlass.range_constexpr(cute.size(acc_pv_mn, mode=[1])):
++                acc_pv_mn[(i, j)] = (
++                    acc_pv_mn[(i, j)] * o_scale[i] + acc_temp_mn[(i, j)])
++
++    # ---------------- mainloop 软件流水版（qk_hide / full；在飞组计数表见
++    # .superpowers/sdd/softpipe-design.md）。数值语义与 serial 逐位一致：
++    # softmax/pack/merge 的操作数与执行序不变，仅 wgmma commit/wait 编排不同 ----
++    @cute.jit
++    def compute_pipelined(
++        self,
++        masked: cutlass.Constexpr,
++        is_full: cutlass.Constexpr,
++        k_tile_count: Int32,
++        kv_iter: Int32,
++        qk_thr_mma: cute.ThrMma,
++        qk_tiled_mma: cute.TiledMma,
++        pv_tiled_mma: cute.TiledMma,
++        load_kv_consumer: pipeline.PipelineConsumer,
++        q_handle,
++        k_handle,                # 在飞 QK 块的 K stage handle（prologue/上迭代 acquire）
++        acc_qk: cute.Tensor,     # 跨迭代携带的 QK 累加器（单缓冲）
++        tSrQ: cute.Tensor,
++        tSrK: cute.Tensor,
++        tOrV: cute.Tensor,
++        acc_pv: cute.Tensor,
++        acc_pv_temp: cute.Tensor,
++        s_max: cute.Tensor,
++        a_sum: cute.Tensor,
++        o_scale: cute.Tensor,
++        o_scale_prev: cute.Tensor,   # full：merge skew 用的上一块 scale_pv
++        ptScP: cute.Tensor,
++        bidx_q: Int32,
++        q_scale_val: Float32,
++        mKScale: cute.Tensor,
++        b_idx: Int32,
++        kv_head: Int32,
++        scale_softmax_log2: Float32,
++        seqlen_k: Int32,
++        warp_idx: Int32,
++        load_kv_producer: pipeline.PipelineProducer,
++        kv_issue: Int32,
++        kv_issue_limit: Int32,
++        tma_atom_k: cute.CopyAtom,
++        tKgK: cute.Tensor,
++        tKsK: cute.Tensor,
++        tma_atom_v: cute.CopyAtom,
++        tVgV: cute.Tensor,
++        tVsV: cute.Tensor,
++    ):
++        while k_tile_count > 0:
++            k_tile_count -= 1
++            tScP = cute.slice_(ptScP, (None, None, None, bidx_q, kv_iter))
++            k_scale_val = mKScale[(b_idx, kv_head, kv_iter)]
++            kv_iter += 1
++
++            # 等 QK_t。full：pending=[QK_t, PV_{t-1}]，W(1) 按 FIFO 只退 QK_t、
++            # PV_{t-1} 保留在飞（t=0 无 pending，QK_0 已在 prologue 等过）；
++            # qk_hide：pending=[QK_t]，W(0)
++            if const_expr(is_full):
++                cute.nvgpu.warpgroup.wait_group(1)
++            else:
++                cute.nvgpu.warpgroup.wait_group(0)
++            k_handle.release()
++            kv_issue, load_kv_producer = self.issue_kv(
++                warp_idx, kv_issue, kv_issue_limit, load_kv_producer,
++                tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++            v_tok = load_kv_consumer.try_wait()
++
++            # convert 腾空 acc_qk → 可作 QK_{t+1} 的目标（dequant 折叠语义同 serial）
++            acc_s = cute.make_rmem_tensor_like(acc_qk, Float32)
++            acc_s.store(acc_qk.load().to(Float32))
++            dequant = q_scale_val * k_scale_val
++
++            if const_expr(masked):
++                for i in cutlass.range_constexpr(cute.size(acc_s)):
++                    q_pos = tScP[i][0]
++                    k_pos = tScP[i][1]
++                    keep = k_pos < seqlen_k
++                    if const_expr(self.is_causal):
++                        keep = keep & (k_pos <= q_pos)
++                    acc_s[i] = cutlass.select_(keep, acc_s[i], -Float32.inf)
++
++            if const_expr(is_full and not masked):
++                # ring 序约束：wait K_{t+1} 必须先 acquire V_t（handle 持住晚 release）；
++                # 随即发 QK_{t+1} → softmax_t 与 {QK_{t+1}, PV_{t-1}} 重叠
++                v_handle = load_kv_consumer.wait_and_advance(v_tok)
++                k_handle = load_kv_consumer.wait_and_advance()
++                cute.nvgpu.warpgroup.fence()
++                self.gemm_zero_acc(
++                    qk_tiled_mma,
++                    tSrQ[(None, None, None, q_handle.index)],
++                    tSrK[(None, None, None, k_handle.index)], acc_qk)
++                cute.nvgpu.warpgroup.commit_group()
++
++            s_max, a_sum = self.softmax_step(
++                acc_s, qk_tiled_mma, s_max, a_sum, o_scale, scale_softmax_log2,
++                dequant)
++
++            if const_expr(is_full):
++                # 等 PV_{t-1} 做 merge_{t-1}（skew）。unmasked：pending=
++                # [PV_{t-1}, QK_{t+1}]，W(1) 退 PV_{t-1} 留 QK_{t+1}（t=0 只有
++                # [QK_1]，W(1) no-op，恰无 PV_{-1} 可等）；masked（排水）：W(0)。
++                # t=0 的 merge_{-1} 为恒等式（temp=0、prev=1，prologue 初始化）
++                if const_expr(masked):
++                    cute.nvgpu.warpgroup.wait_group(0)
++                else:
++                    cute.nvgpu.warpgroup.wait_group(1)
++                self.merge_pv(pv_tiled_mma, acc_pv, acc_pv_temp, o_scale_prev)
++                for i in cutlass.range_constexpr(cute.size(o_scale)):
++                    o_scale_prev[i] = o_scale[i]
++
++            # pack P_t：此时 PV_{t-1} 已退休（RS wgmma 的 A 寄存器 WAR 安全）
++            acc_p_op = self.make_acc_into_op(
++                acc_s, pv_tiled_mma.tv_layout_A, self.v_dtype)
++            if const_expr(not (is_full and not masked)):
++                v_handle = load_kv_consumer.wait_and_advance(v_tok)
++
++            cute.nvgpu.warpgroup.fence()
++            self.gemm_zero_acc(
++                pv_tiled_mma, acc_p_op,
++                tOrV[(None, None, None, v_handle.index)], acc_pv_temp)
++            cute.nvgpu.warpgroup.commit_group()
++
++            if const_expr(is_full):
++                # PV_t 挂着跨迭代（下迭代 softmax 后才等）；排水迭代就地收尾
++                v_handle.release()
++                kv_issue, load_kv_producer = self.issue_kv(
++                    warp_idx, kv_issue, kv_issue_limit, load_kv_producer,
++                    tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++                if const_expr(masked):
++                    cute.nvgpu.warpgroup.wait_group(0)
++                    self.merge_pv(pv_tiled_mma, acc_pv, acc_pv_temp, o_scale)
++            else:
++                # qk_hide：commit 序「PV_t 先、QK_{t+1} 后」→ W(1) 恰等 PV_t、
++                # 保 QK_{t+1} 在飞 → merge_t ∥ QK_{t+1}；尾块无 QK_{t+1}，W(0)
++                if const_expr(not masked):
++                    k_tok = load_kv_consumer.try_wait()
++                    k_handle = load_kv_consumer.wait_and_advance(k_tok)
++                    cute.nvgpu.warpgroup.fence()
++                    self.gemm_zero_acc(
++                        qk_tiled_mma,
++                        tSrQ[(None, None, None, q_handle.index)],
++                        tSrK[(None, None, None, k_handle.index)], acc_qk)
++                    cute.nvgpu.warpgroup.commit_group()
++                    cute.nvgpu.warpgroup.wait_group(1)
++                else:
++                    cute.nvgpu.warpgroup.wait_group(0)
++                v_handle.release()
++                kv_issue, load_kv_producer = self.issue_kv(
++                    warp_idx, kv_issue, kv_issue_limit, load_kv_producer,
++                    tma_atom_k, tKgK, tKsK, tma_atom_v, tVgV, tVsV)
++                self.merge_pv(pv_tiled_mma, acc_pv, acc_pv_temp, o_scale)
++        return (load_kv_consumer, load_kv_producer, kv_iter, kv_issue,
++                s_max, a_sum, k_handle)
++
+     # ---------------- online softmax（fmha.py:1301-1397 改造：m 统一初值 -inf）----------------
+     @cute.jit
+     def softmax_step(
+diff --git a/cutedsl_sage/smoke_pipe.py b/cutedsl_sage/smoke_pipe.py
+new file mode 100644
+index 0000000..5a08ec8
+--- /dev/null
++++ b/cutedsl_sage/smoke_pipe.py
+@@ -0,0 +1,57 @@
++# 软件流水三模式 bit-identical 冒烟：serial/qk_hide/full 逐位一致（设计保证：
++# softmax/pack/merge 操作数与执行序不变，仅 wgmma commit/wait 编排不同）。
++# 覆盖：单块(trip_count=1)/尾块/causal/GQA/长序列。远程：./hyper01.sh run 'python smoke_pipe.py'
++import os
++
++import torch
++
++import core
++from core import SageAttnSm90
++
++SHAPES = [
++    # (b, n_q, n_kv, s_q, s_k, d, causal)
++    (1, 8, 8, 128, 128, 64, False),      # 单 KV 块（trip_count=1）
++    (1, 8, 8, 128, 128, 128, False),
++    (1, 8, 8, 100, 100, 128, False),     # 单块 + 尾 mask
++    (1, 8, 8, 1000, 1000, 128, False),   # 多块 + 尾块
++    (1, 8, 8, 1024, 1024, 64, True),     # causal
++    (1, 8, 8, 337, 337, 128, True),      # causal + 尾块
++    (2, 8, 4, 1024, 1024, 128, False),   # GQA
++    (2, 8, 8, 4096, 4096, 128, False),   # 长序列
++    (2, 8, 8, 4096, 4096, 64, True),
++]
++MODES = ["serial", "qk_hide", "full"]
++
++
++def main():
++    dev = "cuda"
++    torch.manual_seed(0)
++    for b, n_q, n_kv, s_q, s_k, d, causal in SHAPES:
++        q = torch.randn(b, s_q, n_q, d, dtype=torch.float16, device=dev)
++        k = torch.randn(b, s_k, n_kv, d, dtype=torch.float16, device=dev)
++        v = torch.randn(b, s_k, n_kv, d, dtype=torch.float16, device=dev)
++        km = k.mean(dim=1, keepdim=True)
++        q_i8, q_sc = core.quant_q_int8_per_warp(q)
++        k_i8, k_sc = core.quant_k_int8_per_block(k, km)
++        v_f8, v_sc = core.quant_v_fp8_per_channel(v)
++        sm_scale = d ** -0.5
++        outs = {}
++        for mode in MODES:
++            os.environ["SAGE_PIPE_MODE"] = mode
++            kern = SageAttnSm90.from_args(d, causal, torch.float16, n_q // n_kv)
++            o = torch.empty(q.shape, dtype=q.dtype, device=dev)
++            kern.run(q_i8, k_i8, v_f8, q_sc, k_sc, v_sc, o, sm_scale)
++            torch.cuda.synchronize()
++            outs[mode] = o
++        for mode in MODES[1:]:
++            same = torch.equal(outs["serial"].view(torch.int16),
++                               outs[mode].view(torch.int16))
++            tag = "OK " if same else "FAIL"
++            print(f"[{tag}] {mode:8s} b{b} nq{n_q} nkv{n_kv} sq{s_q} sk{s_k} "
++                  f"d{d} causal={causal}")
++            assert same, f"{mode} not bit-identical"
++    print("ALL BIT-IDENTICAL")
++
++
++if __name__ == "__main__":
++    main()

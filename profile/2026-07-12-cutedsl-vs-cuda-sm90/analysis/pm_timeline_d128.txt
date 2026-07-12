@@ -1,0 +1,34 @@
+==== full_dsl_d128 ====
+pmsampling:sm__inst_executed_realtime.avg.pct_of_peak_sustained_elapsed
+  max=42.61 avg=38.67 n=61
+  [___@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#__]
+pmsampling:sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+  max=22.32 avg=20.13 n=61
+  [___@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*__]
+pmsampling:smsp__warps_issue_stalled_barrier.avg
+  max=430.91 avg=389.32 n=61
+  [___@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*__]
+pmsampling:smsp__warps_issue_stalled_long_scoreboard.avg
+  max=487.82 avg=436.28 n=61
+  [___%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*__]
+pmsampling:sm__ctas_launched.sum
+  max=5.05 avg=3.28 n=61
+  [___@@******#%%#****#%#%****##*##**###**##*###***###*#****#:__]
+
+==== full_cuda_d128 ====
+pmsampling:sm__inst_executed_realtime.avg.pct_of_peak_sustained_elapsed
+  max=53.96 avg=44.21 n=62
+  [_____:@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%:___]
+pmsampling:sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+  max=48.70 avg=38.68 n=62
+  [_____:@@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%:___]
+pmsampling:smsp__warps_issue_stalled_barrier.avg
+  max=974.54 avg=783.97 n=62
+  [______#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*___]
+pmsampling:smsp__warps_issue_stalled_long_scoreboard.avg
+  max=423.47 avg=235.05 n=62
+  [______@-@=*%**+*%****##**+*#*+**##****#****#**********#**+=___]
+pmsampling:sm__ctas_launched.sum
+  max=18.86 avg=6.29 n=62
+  [_____@_-*_*--+-=---==----+----+=---==----+=---==---==----_____]
+
