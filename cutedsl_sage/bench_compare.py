@@ -6,6 +6,8 @@
 # - CUDA 侧用 qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf（fp32+fp32 两级累加 + fuse v_scale），
 #   与 Python API 实际使用的变体一致；CuTeDSL 为单级 FP32（FP22）累加 + fuse v_scale。
 # - 计时统一 triton.testing.do_bench(warmup=25, rep=100) 取中值。
+import sys
+
 import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
@@ -101,6 +103,8 @@ def bench_e2e(seq, causal, d=128):
 
 
 def main():
+    # --quick：只跑主 4 点 kernel-only（s∈{4096,16384} × d∈{64,128}，non-causal），迭代用
+    quick = "--quick" in sys.argv
     torch.manual_seed(0)
     dev_name = torch.cuda.get_device_name()
     print(f"GPU: {dev_name} | torch {torch.__version__} | batch={BATCH} heads={HEADS}")
@@ -110,12 +114,14 @@ def main():
     print("| seq | d | causal | CUDA TFLOPS | CuTeDSL TFLOPS | SDPA TFLOPS | CuTeDSL/CUDA |")
     print("|---:|---:|:---|---:|---:|---:|---:|")
     for d in (64, 128):
-        for causal in (False, True):
-            for seq in (1024, 2048, 4096, 8192, 16384, 32768):
+        for causal in ((False,) if quick else (False, True)):
+            for seq in ((4096, 16384) if quick else (1024, 2048, 4096, 8192, 16384, 32768)):
                 ms_cuda, ms_dsl, ms_sdpa = bench_kernel_only(d, seq, causal)
                 tf = lambda ms: tflops(BATCH, HEADS, seq, d, causal, ms)
                 print(f"| {seq} | {d} | {causal} | {tf(ms_cuda):.1f} | {tf(ms_dsl):.1f} "
                       f"| {tf(ms_sdpa):.1f} | {ms_cuda / ms_dsl:.3f} |", flush=True)
+    if quick:
+        return
 
     print("\n## 端到端（含量化，d=128；CuTeDSL 量化为 torch 临时实现，非本期优化目标）\n")
     print("| seq | causal | CUDA e2e ms | CuTeDSL e2e ms |")
