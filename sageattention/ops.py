@@ -1,0 +1,176 @@
+"""
+Copyright (c) 2024 by SageAttention team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+FakeTensor kernels for the torch.ops.sageattention attention ops (needed for
+torch.compile). The mutating quantization ops return () and need no fake; the
+qattn ops return the lse tensor, whose shape depends only on op arguments.
+
+Every qattn op shares the trailing flag signature
+    (..., str tensor_layout, bool is_causal, str qk_quant_gran,
+     float sm_scale, bool return_lse)
+so one fake body serves all of them, reading the flags from the tail.
+"""
+
+from typing import Tuple
+
+import torch
+
+_QATTN_OPS = [
+    "qattn_sm80_qk_int8_sv_f16_accum_f32_attn",
+    "qattn_sm80_qk_int8_sv_f16_accum_f16_attn",
+    "qattn_sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf",
+    "qattn_sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn",
+    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
+    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
+    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
+    "qattn_sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
+    "qattn_sm90_qk_int8_sv_f8_accum_f32_attn_inst_buf",
+    "qattn_sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
+    "qattn_sm100_qk_int8_sv_f8_accum_f32_attn",
+    "qattn_sm100_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
+    "qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
+    "qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
+    "qattn_sm120_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
+]
+
+
+def _seq_nh_dims(tensor_layout: str) -> Tuple[int, int]:
+    """(seq_dim, num_heads_dim) for a 4D q/k/v tensor in `tensor_layout`."""
+    return (1, 2) if tensor_layout == "NHD" else (2, 1)
+
+
+def _qattn_fake(*args):
+    query = args[0]
+    tensor_layout = args[-5]
+    return_lse = args[-1]
+    seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
+    qo_len, num_qo_heads = query.size(seq_dim), query.size(nh_dim)
+    if return_lse:
+        return torch.empty(
+            (query.size(0), num_qo_heads, qo_len), dtype=torch.float32, device=query.device
+        )
+    # matches the C++ side: an empty CPU float placeholder when lse is off
+    return torch.empty((0,))
+
+
+def _fwd_fake(
+    query,
+    key,
+    value,
+    query_scale,
+    key_scale,
+    value_scale=None,
+    value_mean=None,
+    *,
+    tensor_layout="HND",
+    qk_quant_gran="per_thread",
+    pv_accum_dtype="fp32",
+    v_layout="mma_k16",
+    is_causal=False,
+    sm_scale=1.0,
+    return_lse=False,
+    out_dtype=torch.float16,
+):
+    out = torch.empty(query.shape, dtype=out_dtype, device=query.device)
+    if not return_lse:
+        return out, None
+    seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
+    qo_len, num_qo_heads = query.size(seq_dim), query.size(nh_dim)
+    lse = torch.empty(
+        (query.size(0), num_qo_heads, qo_len), dtype=torch.float32, device=query.device
+    )
+    return out, lse
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b  # SymInt-friendly (no float round trip)
+
+
+def _quant_qk_fake(
+    query,
+    key,
+    key_mean=None,
+    *,
+    tensor_layout="HND",
+    qk_quant_gran="per_thread",
+    blk_q=128,
+    warp_q=32,
+    blk_k=64,
+    warp_k=64,
+):
+    seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
+    qo_len, kv_len = query.size(seq_dim), key.size(seq_dim)
+    if qk_quant_gran == "per_warp":
+        qs = _ceil_div(qo_len, blk_q) * (blk_q // warp_q)
+        ks = _ceil_div(kv_len, blk_k)
+    else:
+        qs = _ceil_div(qo_len, blk_q) * (blk_q // warp_q) * 8
+        ks = _ceil_div(kv_len, blk_k) * (blk_k // warp_k) * 4
+    dev = query.device
+    return (
+        torch.empty(query.shape, dtype=torch.int8, device=dev),
+        torch.empty((query.size(0), query.size(nh_dim), qs), dtype=torch.float32, device=dev),
+        torch.empty(key.shape, dtype=torch.int8, device=dev),
+        torch.empty((key.size(0), key.size(nh_dim), ks), dtype=torch.float32, device=dev),
+    )
+
+
+def _quant_v_fp8_fake(
+    value,
+    *,
+    tensor_layout="HND",
+    v_layout="mma_k16",
+    scale_max=448.0,
+    smooth_v=False,
+    pad_multiple=64,
+):
+    seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
+    b, kv_len, h, d = (value.size(0), value.size(seq_dim), value.size(nh_dim), value.size(-1))
+    padded = _ceil_div(kv_len, pad_multiple) * pad_multiple
+    shape = (b, h, d, padded) if tensor_layout == "HND" else (b, d, h, padded)
+    dev = value.device
+    v_fp8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=dev)
+    v_scale = torch.empty((b, h, d), dtype=torch.float32, device=dev)
+    vm = torch.empty((b, h, d), dtype=torch.float32, device=dev) if smooth_v else None
+    return v_fp8, v_scale, vm
+
+
+def _sub_mean_v_fake(value, *, tensor_layout="HND"):
+    seq_dim, _ = _seq_nh_dims(tensor_layout)
+    vm_shape = list(value.shape)
+    del vm_shape[seq_dim]
+    return (
+        torch.empty(value.shape, dtype=torch.float16, device=value.device),
+        torch.empty(vm_shape, dtype=value.dtype, device=value.device),
+    )
+
+
+def _register() -> None:
+    for name in _QATTN_OPS:
+        # ops of arch families not compiled into this build have no schema
+        try:
+            getattr(torch.ops.sageattention, name)
+        except AttributeError:
+            continue
+        torch.library.register_fake(f"sageattention::{name}")(_qattn_fake)
+    torch.library.register_fake("sageattention::fwd")(_fwd_fake)
+    torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)
+    torch.library.register_fake("sageattention::quant_v_fp8")(_quant_v_fp8_fake)
+    torch.library.register_fake("sageattention::sub_mean_v")(_sub_mean_v_fake)
+
+
+_register()
