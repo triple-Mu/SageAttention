@@ -1,7 +1,9 @@
-include README.md
-include LICENSE
-recursive-include sageattention *.py
+include README.md LICENSE pyproject.toml CMakeLists.txt
+recursive-include cmake *.cmake *.py *.in
 recursive-include csrc *.h *.hpp *.cuh *.cu *.cpp
-recursive-include sageattention/triton *.py
-global-exclude __pycache__
-global-exclude *.py[cod]
+recursive-include sageattention *.py
+recursive-include test *.py
+prune refs
+prune sageattention-patches
+prune build
+global-exclude __pycache__ *.py[cod] *.so

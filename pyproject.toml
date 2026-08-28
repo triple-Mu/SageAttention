@@ -1,7 +1,61 @@
 [build-system]
 requires = [
-  "setuptools>=62,<75",
-  "wheel>=0.38,<0.44",
-  "packaging>=21,<24",
+    "setuptools>=77",
+    "cmake>=3.31,<5",
+    "ninja>=1.11",
+    "packaging>=23",
+    # torch is needed at build time (headers + libtorch). Isolated builds get
+    # the PyPI default; the produced wheel pins torch==<built major.minor>.*
+    # so an ABI mismatch fails at install time, not with runtime undefined
+    # symbols. For a torch already in your environment, prefer:
+    #   pip install -e . --no-build-isolation
+    "torch",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "sageattention"
+description = "Accurate and efficient plug-and-play low-bit attention."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "SageAttention team" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dynamic = ["version", "dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/thu-ml/SageAttention"
+
+[tool.setuptools.packages.find]
+# "sageattention*" would also match the sageattention3_blackwell tree, which
+# ships separately; list the shipped package (and its future subpackages) only.
+include = ["sageattention", "sageattention.*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "sageattention._version.__version__" }
+
+[tool.pytest.ini_options]
+# test/ has no __init__.py, so pytest prepends it to sys.path and the tests can
+# do `from conftest import ...`. Pinning testpaths keeps that working when
+# pytest is invoked with no arguments.
+testpaths = ["test"]
+
+[tool.ruff]
+# 100 matches what the tree already does: p99 of the pre-format line widths is
+# 91 and only five lines exceeded 100.
+line-length = 100
+
+[tool.ruff.lint]
+# Deliberately minimal: pycodestyle errors, pyflakes, import sorting. No
+# opinionated rule families -- this repo is formatted, not re-styled.
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+# conftest is the local test helper module (test/ is on sys.path via pytest),
+# not a third-party package; without this it sorts up next to pytest/torch.
+known-first-party = ["conftest"]

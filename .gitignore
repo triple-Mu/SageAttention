@@ -1,14 +1,16 @@
-/test
 /build
 /sageattention.egg-info
 *.mp4
 /dist
-/test
 __pycache__
 *.so
 evaluate/
 *.pkl
 *.vscode/
 bench_qk_int8_pv_fp8_cuda_head96.py
-*test.py
 *unmask.py
+
+# tools/compare_reference.py default golden dump location
+sage-golden/
+
+# test/ is the real pytest suite (do not ignore)

@@ -1,0 +1,145 @@
+# Arch policy for the single-target build: which source group serves which
+# compute capability, per-source --generate-code flags, and the nvcc version
+# gates. Byte-compatible with the historical setup.py EXT_SERVES /
+# gencode_flags_for logic.
+#
+# Inputs:  SAGE_CUDA_ARCHS (may be empty -> env/auto-detect inside the resolver)
+# Outputs: SAGE_ARCHS_SM80/SM89/SM90/SM100/SM120/FUSED (lists of "M.m")
+#          SAGE_PTX_ARCHS (subset of plain archs that also emit PTX)
+#          sage_group_enable() to attach gencode flags to a source group
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/resolve_arch_list.py"
+          --archs "${SAGE_CUDA_ARCHS}"
+  OUTPUT_VARIABLE _sage_arch_spec
+  ERROR_VARIABLE _sage_arch_err
+  RESULT_VARIABLE _sage_arch_rc
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT _sage_arch_rc EQUAL 0)
+  message(FATAL_ERROR "arch resolution failed:\n${_sage_arch_err}")
+endif()
+if(_sage_arch_err)
+  message(WARNING "${_sage_arch_err}")
+endif()
+
+set(SAGE_REQUESTED_ARCHS "")
+set(SAGE_PTX_ARCHS "")
+foreach(entry IN LISTS _sage_arch_spec)
+  if(entry MATCHES "^([0-9]+\\.[0-9]+)\\+PTX$")
+    list(APPEND SAGE_REQUESTED_ARCHS "${CMAKE_MATCH_1}")
+    list(APPEND SAGE_PTX_ARCHS "${CMAKE_MATCH_1}")
+  else()
+    list(APPEND SAGE_REQUESTED_ARCHS "${entry}")
+  endif()
+endforeach()
+message(STATUS "[sageattention] target compute capabilities: ${SAGE_REQUESTED_ARCHS} (PTX: ${SAGE_PTX_ARCHS})")
+
+# ---- group membership (EXT_SERVES equivalents) ------------------------------
+set(SAGE_ARCHS_SM80  "")   # cc >= 8.0 (all)          plain
+set(SAGE_ARCHS_FUSED "")   # cc >= 8.0 (all)          plain
+set(SAGE_ARCHS_SM89  "")   # cc == 8.9 or major >= 10 plain (12.x fallback on purpose)
+set(SAGE_ARCHS_SM90  "")   # cc == 9.0                accel (90a only, never PTX)
+set(SAGE_ARCHS_SM100 "")   # cc in {10.0, 11.0}       accel (never PTX)
+set(SAGE_ARCHS_SM120 "")   # major == 12              plain
+
+foreach(cc IN LISTS SAGE_REQUESTED_ARCHS)
+  string(REPLACE "." ";" _parts "${cc}")
+  list(GET _parts 0 _major)
+  list(GET _parts 1 _minor)
+  list(APPEND SAGE_ARCHS_SM80 "${cc}")
+  list(APPEND SAGE_ARCHS_FUSED "${cc}")
+  if(cc STREQUAL "8.9" OR _major GREATER_EQUAL 10)
+    list(APPEND SAGE_ARCHS_SM89 "${cc}")
+  endif()
+  if(cc STREQUAL "9.0")
+    list(APPEND SAGE_ARCHS_SM90 "${cc}")
+  endif()
+  if(cc STREQUAL "10.0" OR cc STREQUAL "11.0")
+    list(APPEND SAGE_ARCHS_SM100 "${cc}")
+  endif()
+  if(_major EQUAL 12)
+    list(APPEND SAGE_ARCHS_SM120 "${cc}")
+  endif()
+endforeach()
+
+set(SAGE_KIND_SM80  plain)
+set(SAGE_KIND_FUSED plain)
+set(SAGE_KIND_SM89  plain)
+set(SAGE_KIND_SM90  accel)
+set(SAGE_KIND_SM100 accel)
+set(SAGE_KIND_SM120 plain)
+
+# ---- toolkit gating ----------------------------------------------------------
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.0)
+  message(FATAL_ERROR "CUDA 12.0 or higher is required (found ${CMAKE_CUDA_COMPILER_VERSION}).")
+endif()
+if(SAGE_ARCHS_SM89)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.4)
+    message(FATAL_ERROR "CUDA 12.4 or higher is required to build the FP8 (sm89-class) "
+                        "kernels for compute capabilities ${SAGE_ARCHS_SM89}.")
+  endif()
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+    message(WARNING "CUDA < 12.8: the fp16-accumulator FP8 kernels "
+                    "(qk_int8_sv_f8_accum_f16_*) compile to runtime traps on this "
+                    "toolkit; upgrade to CUDA 12.8+ for the full sm89 kernel set.")
+  endif()
+endif()
+if("9.0" IN_LIST SAGE_REQUESTED_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.3)
+  message(FATAL_ERROR "CUDA 12.3 or higher is required for compute capability 9.0.")
+endif()
+if("11.0" IN_LIST SAGE_REQUESTED_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+  message(FATAL_ERROR "CUDA 13.0 or higher is required to build the tcgen05 (sm110) kernels.")
+endif()
+
+# nvcc --list-gpu-code probe: does this toolkit emit SASS for every requested cc?
+execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
+                OUTPUT_VARIABLE _sage_gpu_codes OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(REPLACE "\n" ";" _sage_gpu_codes "${_sage_gpu_codes}")
+set(_hint_sm_100 "12.8")
+set(_hint_sm_120 "12.8")
+set(_hint_sm_103 "12.9")
+set(_hint_sm_121 "12.9")
+set(_hint_sm_110 "13.0")
+foreach(cc IN LISTS SAGE_REQUESTED_ARCHS)
+  string(REPLACE "." "" _num "${cc}")
+  if(NOT "sm_${_num}" IN_LIST _sage_gpu_codes)
+    set(_msg "nvcc ${CMAKE_CUDA_COMPILER_VERSION} cannot emit sm_${_num} (not in nvcc --list-gpu-code).")
+    if(DEFINED _hint_sm_${_num})
+      string(APPEND _msg " CUDA ${_hint_sm_${_num}} or higher is required.")
+    endif()
+    message(FATAL_ERROR "${_msg}")
+  endif()
+endforeach()
+
+# ---- gencode helpers ---------------------------------------------------------
+# Single-token --generate-code= form so source-property lists never split.
+function(sage_gencode_flags out kind archs)
+  set(_f "")
+  foreach(cc IN LISTS archs)
+    string(REPLACE "." "" n "${cc}")
+    if(kind STREQUAL "accel")
+      list(APPEND _f "--generate-code=arch=compute_${n}a,code=sm_${n}a")
+    else()
+      list(APPEND _f "--generate-code=arch=compute_${n},code=sm_${n}")
+      if("${cc}" IN_LIST SAGE_PTX_ARCHS)
+        list(APPEND _f "--generate-code=arch=compute_${n},code=compute_${n}")
+      endif()
+    endif()
+  endforeach()
+  set(${out} "${_f}" PARENT_SCOPE)
+endfunction()
+
+# Attach gencode flags to a source group and append it to SAGE_SOURCES.
+# NOTE: per-source CUDA_ARCHITECTURES is silently ignored by CMake — only
+# COMPILE_OPTIONS works at source granularity. Do not "simplify" this.
+function(sage_group_enable name srcs)
+  if(NOT SAGE_ARCHS_${name})
+    message(STATUS "[sageattention] skip ${name}: no requested compute capability is served by it")
+    return()
+  endif()
+  sage_gencode_flags(_flags "${SAGE_KIND_${name}}" "${SAGE_ARCHS_${name}}")
+  set_source_files_properties(${srcs} PROPERTIES COMPILE_OPTIONS "${_flags}")
+  set(SAGE_SOURCES ${SAGE_SOURCES} ${srcs} PARENT_SCOPE)
+  set(SAGEATTN_BUILD_${name} 1 PARENT_SCOPE)
+  message(STATUS "[sageattention] ${name}: ${_flags}")
+endfunction()
