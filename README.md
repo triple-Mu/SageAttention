@@ -27,7 +27,7 @@ Paper: https://arxiv.org/abs/2505.11594
 + INT8 quantization and smoothing for $QK^\top$ with support for varying granularities.
 + FP8 quantization for $PV$, and FP16 accumulator for FP8/FP16 $PV$.
 + Two-level accumulation strategy for $PV$ to improve accuracy in FP8 MMA and WGMMA.
-+ Support `torch.compile` with non-cudagraphs mode and distributed inference.
++ Support `torch.compile` (fullgraph, zero graph breaks) including CUDA graphs / `mode="reduce-overhead"`, and distributed inference.
 
 
 ## Project Updates
@@ -61,14 +61,15 @@ Paper: https://arxiv.org/abs/2505.11594
 
 - [2024-12-20]: 🔥Release SageAttention 2.0.1 Beta! In this version, we introduce a new feature: per-thread quantization, which offers finer granularity while maintaining hardware efficiency.
 - [2024-11-21]: 🔥SageAttention 2.0.0 beta is released! Now SageAttention has measured speedup on L20, L40, A100, A800, and A6000, RTX3090 and RTX4090.
-- [2024-11-12]: Support for `sageattn_varlen` is available now.
 - [2024-11-11]: Support for different sequence lengths between `q` and `k,v`,  `(batch_size, head_num, seq_len, head_dim)` or `(batch_size, seq_len, head_num, head_dim)` input shapes, and `group-query attention` is available now.
 
 
 ## Installation
 ### Base environment
-+ `python>=3.9`   , `torch>=2.3.0`
++ `python>=3.9`, `torch>=2.6.0` (the wheel is `cp39-abi3`: one build covers every Python >= 3.9, but stays tied to the torch major.minor it was built against)
++ `cmake>=3.26` and `ninja` in the build environment (`pip install "cmake>=3.31" ninja`; pulled in automatically under build isolation)
 - `CUDA`:
+  + `>=13.0` for sm110 (tcgen05)
   + `>=12.8` for Blackwell or SageAttention2++
   + `>=12.4` for fp8 support on Ada
   + `>=12.3` for fp8 support on Hopper
@@ -79,18 +80,25 @@ Paper: https://arxiv.org/abs/2505.11594
 
 For SageAttention V1 in Triton (slower than SageAttention V2/V2++/V3), refer to [SageAttention-1](https://github.com/thu-ml/SageAttention/tree/sageattention-1) branch and install using pip: `pip install sageattention==1.0.6`
 
-To use SageAttention 2.2.0 (containing SageAttention2++), you can install using pip:
-```
-pip install sageattention==2.2.0 --no-build-isolation
-```
-
-**Or** you can compile from source:
+Compile from source (CMake drives the CUDA build; setup.py stays the entry
+point, so `pip install -e .`, `pip install .`, `python setup.py install` and
+`python setup.py bdist_wheel` all work):
 ```
 git clone https://github.com/thu-ml/SageAttention.git
-cd SageAttention 
-export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32 # Optional
-python setup.py install
+cd SageAttention
+# arch list: defaults to the local GPUs; set explicitly for cross-compilation
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;12.0"   # Optional
+pip install -e . --no-build-isolation
 ```
+Useful knobs: `MAX_JOBS` (cmake build parallelism), `NVCC_THREADS` (per-TU nvcc
+parallelism; note `MAX_JOBS x NVCC_THREADS` is the real process count),
+`SAGEATTN_PTXAS_VERBOSE=1`, `SAGEATTN_LINEINFO=1`, `DEBUG=1`,
+`SAGEATTN_CMAKE_ARGS` (extra cmake args).
+
+All kernels land in a single `sageattention/_C.abi3.so`; the operators are
+exposed as `torch.ops.sageattention.*` (TORCH_LIBRARY, no pybind11) and the
+right kernel is dispatched automatically from the GPU's compute capability,
+like `torch.ops.aten._scaled_dot_product_cudnn_attention`.
 
 To benchmark the speed against FlashAttention3, please compile FlashAttention3 from source:
 ```
@@ -109,11 +117,20 @@ attn_output = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
 + `is_causal` determines the use of a causal mask.
 
 ### Available APIs:
-+ `sageattn`: Automatically selects the optimal kernel based on the GPU to achieve a good performance-accuracy trade-off.
-+ `sageattn_qk_int8_pv_fp16_cuda`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using CUDA backend.
-+ `sageattn_qk_int8_pv_fp8_cuda`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend. (Note that setting `pv_accum_dtype=fp32+fp16` corresponds to SageAttention2++.)
-+ `sageattn_qk_int8_pv_fp8_cuda_sm90`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend, specifically optimized for Hopper GPUs.
-+ `sageattn_varlen`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using Triton backend. Support for varying sequence lengths within the same batch.
++ `sageattn` is the single public entry point: it picks the kernel from the
+  GPU's compute capability (sm80/sm86 -> INT8+FP16PV, sm89/sm12x -> INT8+FP8PV,
+  sm90 -> Hopper wgmma path, sm100/sm110 -> tcgen05 opt-in). The per-arch
+  wrapper functions of v2.x (`sageattn_qk_int8_pv_fp16_cuda`,
+  `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp8_cuda_sm90`, ...)
+  and the Triton-based `sageattn_varlen` were removed.
++ Advanced knobs are explicit keyword arguments of `sageattn`
+  (`qk_quant_gran`, `pv_accum_dtype` — `"fp32+fp16"` is SageAttention2++ —,
+  `smooth_k`, `smooth_v`); `None` keeps the per-device default. Unknown kwargs
+  now raise instead of being silently ignored.
++ The quantization building blocks are available as
+  `torch.ops.sageattention.*` (`quant_qk`, `quant_v_fp8`, `fwd`, ...), all
+  registered with fake kernels so `torch.compile(fullgraph=True)` and CUDA
+  graphs work end to end.
 
 For optimal speed and accuracy performance on custom devices and models, we strongly recommend referring to the [this file](./sageattention/core.py) for detailed guidance.
 
