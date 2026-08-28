@@ -14,56 +14,62 @@
  * limitations under the License.
  */
 
-#include <torch/extension.h>
+#include <torch/types.h>
+
+namespace sage {
+namespace sm89 {
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
+                                                        torch::Tensor key,
+                                                        torch::Tensor value,
+                                                        torch::Tensor output,
+                                                        torch::Tensor query_scale,
+                                                        torch::Tensor key_scale,
+                                                        torch::Tensor value_scale,
+                                                        int           tensor_layout,
+                                                        int           is_causal,
+                                                        int           qk_quant_gran,
+                                                        float         sm_scale,
+                                                        int           return_lse);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    torch::Tensor value_mean,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
+                                                                    torch::Tensor key,
+                                                                    torch::Tensor value,
+                                                                    torch::Tensor output,
+                                                                    torch::Tensor query_scale,
+                                                                    torch::Tensor key_scale,
+                                                                    torch::Tensor value_scale,
+                                                                    torch::Tensor value_mean,
+                                                                    int           tensor_layout,
+                                                                    int           is_causal,
+                                                                    int           qk_quant_gran,
+                                                                    float         sm_scale,
+                                                                    int           return_lse);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
+                                                                 torch::Tensor key,
+                                                                 torch::Tensor value,
+                                                                 torch::Tensor output,
+                                                                 torch::Tensor query_scale,
+                                                                 torch::Tensor key_scale,
+                                                                 torch::Tensor value_scale,
+                                                                 int           tensor_layout,
+                                                                 int           is_causal,
+                                                                 int           qk_quant_gran,
+                                                                 float         sm_scale,
+                                                                 int           return_lse);
 torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
+                                                                 torch::Tensor key,
+                                                                 torch::Tensor value,
+                                                                 torch::Tensor output,
+                                                                 torch::Tensor query_scale,
+                                                                 torch::Tensor key_scale,
+                                                                 torch::Tensor value_scale,
+                                                                 int           tensor_layout,
+                                                                 int           is_causal,
+                                                                 int           qk_quant_gran,
+                                                                 float         sm_scale,
+                                                                 int           return_lse);
+
+}  // namespace sm89
+}  // namespace sage
