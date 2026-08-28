@@ -14,12 +14,21 @@
  * limitations under the License.
  */
 
-#include <pybind11/pybind11.h>
-#include <torch/extension.h>
-#include "attn_cuda_sm90.h"
+#pragma once
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+#include <ATen/cuda/CUDAContext.h>
+
+#include "plan.h"
+
+namespace sage {
+
+// Compute capability of a device. at::cuda::getDeviceProperties caches the
+// cudaDeviceProp per device process-wide, so this is a hashmap lookup, not a
+// driver call. (The SAGEATTN_SM100_TCGEN05 env gate lives in plan.cpp.)
+inline CC device_cc(c10::DeviceIndex device)
 {
-  m.def("qk_int8_sv_f8_accum_f32_attn_inst_buf", &qk_int8_sv_f8_accum_f32_attn_inst_buf);
-  m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf);
+    const cudaDeviceProp* prop = at::cuda::getDeviceProperties(device);
+    return CC{prop->major, prop->minor};
 }
+
+}  // namespace sage
