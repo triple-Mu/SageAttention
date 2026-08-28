@@ -1,4 +1,4 @@
-#include "attn_cuda_sm89.h"
+#include "attn_cuda_sm120.h"
 #include "qk_int_sv_f8_launcher_sm89.cuh"
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,

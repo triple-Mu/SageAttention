@@ -53,7 +53,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       float sm_scale)
 {
   // compile time check
-  static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
+  static_assert(DTypeQK == DataType::kInt8, "DTypeQK must be int8");
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
@@ -67,10 +67,10 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
   constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
-  constexpr uint32_t num_tiles_qk_inner = (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
+  constexpr uint32_t num_tiles_qk_inner = head_dim / MMA_QK_K;
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
 
-  constexpr uint32_t QK_SMEM_STRIDE = (DTypeQK == DataType::kInt8) ? (head_dim) : (head_dim / 2);
+  constexpr uint32_t QK_SMEM_STRIDE = head_dim;
   constexpr uint32_t O_SMEM_STRIDE = head_dim;
   //                       for fp16: head_dim
   constexpr uint32_t V_SMEM_STRIDE = CTA_K;
@@ -232,18 +232,6 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   cp_async::wait_group<0>();
   __syncthreads();
 
-  // for num_tiles_qk_inner = 1, we load all Qs in register
-  uint32_t RQ[num_tiles_q][4];
-  if constexpr (num_tiles_qk_inner == 1)
-  {
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-      smem_Q.ldmatrix_m8n8x4(Q_smem_offset_mma, RQ[fq]);
-      Q_smem_offset_mma = smem_Q.advance_offset_by_row<16>(Q_smem_offset_mma);
-    }
-  }
-
   // load K with predicate
   load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
@@ -274,16 +262,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     __syncthreads();
 
     // compute QK^T
-    if constexpr (num_tiles_qk_inner == 1)
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_K, RS, RQ, K_smem_offset_mma);
-    }
-    else
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
-    }
+    compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
 #pragma unroll
@@ -376,16 +356,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     __syncthreads();
 
     // compute QK^T
-    if constexpr (num_tiles_qk_inner == 1)
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_K, RS, RQ, K_smem_offset_mma);
-    }
-    else
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
-    }
+    compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
 
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
@@ -483,16 +455,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     __syncthreads();
 
     // compute QK^T
-    if constexpr (num_tiles_qk_inner == 1)
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_K, RS, RQ, K_smem_offset_mma);
-    }
-    else
-    {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-        smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
-    }
+    compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
 
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
@@ -702,9 +666,3 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     }
   }
 }
-
-
-
-
-
-

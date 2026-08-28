@@ -208,10 +208,6 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
         {
           mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
         }
-        else if constexpr (DTypeQK == DataType::kInt4)
-        {
-          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
-        }
       }
     }
     offset_K = smem_K.advance_offset_by_column<2>(offset_K - (num_tiles_k * 16 * stride), iter);
@@ -244,10 +240,6 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
         if constexpr (DTypeQK == DataType::kInt8)
         {
           mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInplaceUpdate>(RS[fq][fk], RQ[fq], RK);
-        }
-        else if constexpr (DTypeQK == DataType::kInt4)
-        {
-          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInplaceUpdate>(RS[fq][fk], RQ[fq], RK);
         }
       }
     }
@@ -284,10 +276,6 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
       if constexpr (DTypeQK == DataType::kInt8)
       {
         mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
-      }
-      else if constexpr (DTypeQK == DataType::kInt4)
-      {
-        mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
       }
     }
   }
@@ -972,21 +960,4 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accu(const smem_t<s
       }
     }
   }
-
-// #pragma unroll
-//   for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-//   {
-// #pragma unroll
-//     for (uint32_t fv = 0; fv < num_tiles_v; fv++)
-//     {
-//       RO[fq][fv][0] += RO_inst_buf[fq][fv][0];
-//       RO[fq][fv][1] += RO_inst_buf[fq][fv][1];
-//       RO[fq][fv][2] += RO_inst_buf[fq][fv][2];
-//       RO[fq][fv][3] += RO_inst_buf[fq][fv][3];
-//       RO[fq][fv][4] += RO_inst_buf[fq][fv][4];
-//       RO[fq][fv][5] += RO_inst_buf[fq][fv][5];
-//       RO[fq][fv][6] += RO_inst_buf[fq][fv][6];
-//       RO[fq][fv][7] += RO_inst_buf[fq][fv][7];
-//     }
-//   }
 }

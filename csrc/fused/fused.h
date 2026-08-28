@@ -58,6 +58,11 @@ void transpose_pad_permute_cuda(
                 torch::Tensor output,
                 int tensor_layout);
 
+void transpose_pad_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                int tensor_layout);
+
 void scale_fuse_quant_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
@@ -73,4 +78,29 @@ void mean_scale_fuse_quant_cuda(
                 torch::Tensor scale,
                 int num_tokens,
                 float scale_max,
+                int tensor_layout);
+
+void quant_per_thread_int8_q_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor scale,
+                int block_size,
+                int warp_block_size,
+                int tensor_layout);
+
+void quant_per_thread_int8_k_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor scale,
+                int block_size,
+                int warp_block_size,
+                int tensor_layout);
+
+void quant_per_thread_int8_k_fuse_sub_mean_cuda(
+                torch::Tensor input,
+                torch::Tensor mean,
+                torch::Tensor output,
+                torch::Tensor scale,
+                int block_size,
+                int warp_block_size,
                 int tensor_layout);

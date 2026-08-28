@@ -26,6 +26,7 @@
 #include "../dispatch_utils.h"
 
 #include "attn_utils.cuh"
+#include "launch_utils.cuh"
 
 #define PACK_SIZE_QK 16 // as if it is int8
 #define PACK_SIZE_V 8   // fp16
@@ -683,101 +684,10 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
                     float sm_scale,
                     int return_lse)
 {
-  CHECK_CUDA(query);
-  CHECK_CUDA(key);
-  CHECK_CUDA(value);
-  CHECK_CUDA(output);
-  CHECK_CUDA(query_scale);
-  CHECK_CUDA(key_scale);
-
-  CHECK_CONTIGUOUS(query);
-  CHECK_CONTIGUOUS(key);
-  CHECK_LASTDIM_CONTIGUOUS(value);
-  CHECK_LASTDIM_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(query_scale);
-  CHECK_CONTIGUOUS(key_scale);
-
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, torch::kHalf);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
-
-  CHECK_DIMS(query, 4);
-  CHECK_DIMS(key, 4);
-  CHECK_DIMS(value, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(query_scale, 3);
-  CHECK_DIMS(key_scale, 3);
-
-  const int head_dim = query.size(3);
-  const int batch_size = query.size(0);
-
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
-
-  int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
-
-  if (tensor_layout == 0)
-  {
-    qo_len = query.size(1);
-    kv_len = key.size(1);
-    num_qo_heads = query.size(2);
-    num_kv_heads = key.size(2);
-    CHECK_SHAPE(key, batch_size, kv_len, num_kv_heads, head_dim);
-    CHECK_SHAPE(value, batch_size, kv_len, num_kv_heads, head_dim);
-
-    stride_seq_q = query.stride(1);
-    stride_seq_k = key.stride(1);
-    stride_seq_v = value.stride(1);
-    stride_seq_o = output.stride(1);
-
-    stride_h_q = query.stride(2);
-    stride_h_k = key.stride(2);
-    stride_h_v = value.stride(2);
-    stride_h_o = output.stride(2);
-  }
-  else if (tensor_layout == 1)
-  {
-    qo_len = query.size(2);
-    kv_len = key.size(2);
-    num_qo_heads = query.size(1);
-    num_kv_heads = key.size(1);
-    CHECK_SHAPE(key, batch_size, num_kv_heads, kv_len, head_dim);
-    CHECK_SHAPE(value, batch_size, num_kv_heads, kv_len, head_dim);
-
-    stride_seq_q = query.stride(2);
-    stride_seq_k = key.stride(2);
-    stride_seq_v = value.stride(2);
-    stride_seq_o = output.stride(2);
-
-    stride_h_q = query.stride(1);
-    stride_h_k = key.stride(1);
-    stride_h_v = value.stride(1);
-    stride_h_o = output.stride(1);
-  }
-  else
-  {
-    throw std::invalid_argument("tensor_layout must be 0 or 1");
-  }
-
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
-  }
-
-  const int num_kv_groups = num_qo_heads / num_kv_heads;
-
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
+  QKVLayout qkv = qkv_layout_parse<QKVFamily::kSVF16>(
+      query, key, value, output, query_scale, key_scale, /*value_scale_opt=*/nullptr,
+      /*value_mean_opt=*/nullptr, tensor_layout, return_lse);
+  SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
   auto output_dtype = output.scalar_type();
 
@@ -857,101 +767,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
                     float sm_scale,
                     int return_lse)
 {
-  CHECK_CUDA(query);
-  CHECK_CUDA(key);
-  CHECK_CUDA(value);
-  CHECK_CUDA(output);
-  CHECK_CUDA(query_scale);
-  CHECK_CUDA(key_scale);
-
-  CHECK_CONTIGUOUS(query);
-  CHECK_CONTIGUOUS(key);
-  CHECK_LASTDIM_CONTIGUOUS(value);
-  CHECK_LASTDIM_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(query_scale);
-  CHECK_CONTIGUOUS(key_scale);
-
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, torch::kHalf);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
-
-  CHECK_DIMS(query, 4);
-  CHECK_DIMS(key, 4);
-  CHECK_DIMS(value, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(query_scale, 3);
-  CHECK_DIMS(key_scale, 3);
-
-  const int head_dim = query.size(3);
-  const int batch_size = query.size(0);
-
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
-
-  int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
-
-  if (tensor_layout == 0)
-  {
-    qo_len = query.size(1);
-    kv_len = key.size(1);
-    num_qo_heads = query.size(2);
-    num_kv_heads = key.size(2);
-    CHECK_SHAPE(key, batch_size, kv_len, num_kv_heads, head_dim);
-    CHECK_SHAPE(value, batch_size, kv_len, num_kv_heads, head_dim);
-
-    stride_seq_q = query.stride(1);
-    stride_seq_k = key.stride(1);
-    stride_seq_v = value.stride(1);
-    stride_seq_o = output.stride(1);
-
-    stride_h_q = query.stride(2);
-    stride_h_k = key.stride(2);
-    stride_h_v = value.stride(2);
-    stride_h_o = output.stride(2);
-  }
-  else if (tensor_layout == 1)
-  {
-    qo_len = query.size(2);
-    kv_len = key.size(2);
-    num_qo_heads = query.size(1);
-    num_kv_heads = key.size(1);
-    CHECK_SHAPE(key, batch_size, num_kv_heads, kv_len, head_dim);
-    CHECK_SHAPE(value, batch_size, num_kv_heads, kv_len, head_dim);
-
-    stride_seq_q = query.stride(2);
-    stride_seq_k = key.stride(2);
-    stride_seq_v = value.stride(2);
-    stride_seq_o = output.stride(2);
-
-    stride_h_q = query.stride(1);
-    stride_h_k = key.stride(1);
-    stride_h_v = value.stride(1);
-    stride_h_o = output.stride(1);
-  }
-  else
-  {
-    throw std::invalid_argument("tensor_layout must be 0 or 1");
-  }
-
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
-  }
-
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
-
-  const int num_kv_groups = num_qo_heads / num_kv_heads;
+  QKVLayout qkv = qkv_layout_parse<QKVFamily::kSVF16>(
+      query, key, value, output, query_scale, key_scale, /*value_scale_opt=*/nullptr,
+      /*value_mean_opt=*/nullptr, tensor_layout, return_lse);
+  SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
   auto output_dtype = output.scalar_type();
 
@@ -1032,101 +851,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
                     float sm_scale,
                     int return_lse)
 {
-  CHECK_CUDA(query);
-  CHECK_CUDA(key);
-  CHECK_CUDA(value);
-  CHECK_CUDA(output);
-  CHECK_CUDA(query_scale);
-  CHECK_CUDA(key_scale);
-
-  CHECK_CONTIGUOUS(query);
-  CHECK_CONTIGUOUS(key);
-  CHECK_LASTDIM_CONTIGUOUS(value);
-  CHECK_LASTDIM_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(query_scale);
-  CHECK_CONTIGUOUS(key_scale);
-
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, torch::kHalf);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
-
-  CHECK_DIMS(query, 4);
-  CHECK_DIMS(key, 4);
-  CHECK_DIMS(value, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(query_scale, 3);
-  CHECK_DIMS(key_scale, 3);
-
-  const int head_dim = query.size(3);
-  const int batch_size = query.size(0);
-
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
-
-  int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
-
-  if (tensor_layout == 0)
-  {
-    qo_len = query.size(1);
-    kv_len = key.size(1);
-    num_qo_heads = query.size(2);
-    num_kv_heads = key.size(2);
-    CHECK_SHAPE(key, batch_size, kv_len, num_kv_heads, head_dim);
-    CHECK_SHAPE(value, batch_size, kv_len, num_kv_heads, head_dim);
-
-    stride_seq_q = query.stride(1);
-    stride_seq_k = key.stride(1);
-    stride_seq_v = value.stride(1);
-    stride_seq_o = output.stride(1);
-
-    stride_h_q = query.stride(2);
-    stride_h_k = key.stride(2);
-    stride_h_v = value.stride(2);
-    stride_h_o = output.stride(2);
-  }
-  else if (tensor_layout == 1)
-  {
-    qo_len = query.size(2);
-    kv_len = key.size(2);
-    num_qo_heads = query.size(1);
-    num_kv_heads = key.size(1);
-    CHECK_SHAPE(key, batch_size, num_kv_heads, kv_len, head_dim);
-    CHECK_SHAPE(value, batch_size, num_kv_heads, kv_len, head_dim);
-
-    stride_seq_q = query.stride(2);
-    stride_seq_k = key.stride(2);
-    stride_seq_v = value.stride(2);
-    stride_seq_o = output.stride(2);
-
-    stride_h_q = query.stride(1);
-    stride_h_k = key.stride(1);
-    stride_h_v = value.stride(1);
-    stride_h_o = output.stride(1);
-  }
-  else
-  {
-    throw std::invalid_argument("tensor_layout must be 0 or 1");
-  }
-
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
-  }
-
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
-
-  const int num_kv_groups = num_qo_heads / num_kv_heads;
+  QKVLayout qkv = qkv_layout_parse<QKVFamily::kSVF16>(
+      query, key, value, output, query_scale, key_scale, /*value_scale_opt=*/nullptr,
+      /*value_mean_opt=*/nullptr, tensor_layout, return_lse);
+  SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
   auto output_dtype = output.scalar_type();
 
@@ -1208,104 +936,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
                     float sm_scale,
                     int return_lse)
 {
-  CHECK_CUDA(query);
-  CHECK_CUDA(key);
-  CHECK_CUDA(value);
-  CHECK_CUDA(output);
-  CHECK_CUDA(query_scale);
-  CHECK_CUDA(key_scale);
-  CHECK_CUDA(value_mean);
-
-  CHECK_CONTIGUOUS(query);
-  CHECK_CONTIGUOUS(key);
-  CHECK_LASTDIM_CONTIGUOUS(value);
-  CHECK_LASTDIM_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(query_scale);
-  CHECK_CONTIGUOUS(key_scale);
-  CHECK_CONTIGUOUS(value_mean);
-
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, torch::kHalf);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
-
-  CHECK_DIMS(query, 4);
-  CHECK_DIMS(key, 4);
-  CHECK_DIMS(value, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(query_scale, 3);
-  CHECK_DIMS(key_scale, 3);
-  CHECK_DIMS(value_mean, 3);
-
-  const int head_dim = query.size(3);
-  const int batch_size = query.size(0);
-
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
-
-  int qo_len, kv_len, num_qo_heads, num_kv_heads;
-  int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
-  int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
-
-  if (tensor_layout == 0)
-  {
-    qo_len = query.size(1);
-    kv_len = key.size(1);
-    num_qo_heads = query.size(2);
-    num_kv_heads = key.size(2);
-    CHECK_SHAPE(key, batch_size, kv_len, num_kv_heads, head_dim);
-    CHECK_SHAPE(value, batch_size, kv_len, num_kv_heads, head_dim);
-
-    stride_seq_q = query.stride(1);
-    stride_seq_k = key.stride(1);
-    stride_seq_v = value.stride(1);
-    stride_seq_o = output.stride(1);
-
-    stride_h_q = query.stride(2);
-    stride_h_k = key.stride(2);
-    stride_h_v = value.stride(2);
-    stride_h_o = output.stride(2);
-  }
-  else if (tensor_layout == 1)
-  {
-    qo_len = query.size(2);
-    kv_len = key.size(2);
-    num_qo_heads = query.size(1);
-    num_kv_heads = key.size(1);
-    CHECK_SHAPE(key, batch_size, num_kv_heads, kv_len, head_dim);
-    CHECK_SHAPE(value, batch_size, num_kv_heads, kv_len, head_dim);
-
-    stride_seq_q = query.stride(2);
-    stride_seq_k = key.stride(2);
-    stride_seq_v = value.stride(2);
-    stride_seq_o = output.stride(2);
-
-    stride_h_q = query.stride(1);
-    stride_h_k = key.stride(1);
-    stride_h_v = value.stride(1);
-    stride_h_o = output.stride(1);
-  }
-  else
-  {
-    throw std::invalid_argument("tensor_layout must be 0 or 1");
-  }
-
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
-  }
-
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
-
-  const int num_kv_groups = num_qo_heads / num_kv_heads;
+  QKVLayout qkv = qkv_layout_parse<QKVFamily::kSVF16>(
+      query, key, value, output, query_scale, key_scale, /*value_scale_opt=*/nullptr,
+      &value_mean, tensor_layout, return_lse);
+  SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
   auto output_dtype = output.scalar_type();
   auto value_mean_dtype = value_mean.scalar_type();

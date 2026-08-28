@@ -16,6 +16,12 @@
 
 #include <torch/extension.h>
 
+// sm12x (consumer Blackwell) instantiations of the qk_int8 / sv_f8 kernels.
+// The fp8 mma fp32 accumulator is exact on these parts, so plain fp32
+// accumulation ("fp32") is the default path and the fp32+fp32 inst_buf
+// variants are not built; the f16 inst_buf variant is kept as an opt-in
+// speed mode until the block-scaled PV path lands.
+
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,
@@ -43,18 +49,6 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tenso
                     float sm_scale,
                     int return_lse);
 
-torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
 torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,

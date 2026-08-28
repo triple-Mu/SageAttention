@@ -1,20 +1,21 @@
-#include "attn_cuda_sm89.h"
+#include "attn_cuda_sm120.h"
 #include "qk_int_sv_f8_launcher_sm89.cuh"
 
-torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
+torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,
                     torch::Tensor output,
                     torch::Tensor query_scale,
                     torch::Tensor key_scale,
                     torch::Tensor value_scale,
+                    torch::Tensor value_mean,
                     int tensor_layout,
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
                     int return_lse)
 {
-  return qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89<false, false, false>(
-      query, key, value, output, query_scale, key_scale, value_scale, nullptr,
+  return qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89<false, true, false>(
+      query, key, value, output, query_scale, key_scale, value_scale, &value_mean,
       tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse);
 }

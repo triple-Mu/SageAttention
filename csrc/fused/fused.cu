@@ -19,6 +19,7 @@
 
 #include "../dispatch_utils.h"
 #include "../utils.cuh"
+#include "quant_utils.cuh"
 #include "../reduction_utils.cuh"
 #include "../numeric_conversion.cuh"
 #include "../cp_async.cuh"
@@ -259,7 +260,7 @@ __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half 
   }
 }
 
-template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero=false, typename T>
+template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero=false, bool permute=true, typename T>
 __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__ output, const uint32_t num_tokens,
                             const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
                             const uint32_t stride_bz_output, const uint32_t stride_d_output, const uint32_t stride_h_output)
@@ -284,11 +285,22 @@ __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__
   __shared__ T shared_load[CTA_SIZE][head_dim];
   __shared__ T shared_store[head_dim][CTA_SIZE];
 
-  // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15
-  // permute on the seq dimension for fp8 mma
-  uint32_t smem_load_row_base = ((thread_id / num_threads_per_token) / 16) * 16;
-  uint32_t smem_load_row_mod = (thread_id / num_threads_per_token) % 16;
-  uint32_t smem_load_row = smem_load_row_base + (smem_load_row_mod  / 8) * 2 + ((smem_load_row_mod / 2) % 4) * 4 + (smem_load_row_mod % 2);
+  // permute == true: reorder the seq dimension within 16-token groups as
+  // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15 to match the
+  // register A-fragment k-order of the fp8 mma.sync / wgmma kernels
+  // (sm89/sm90/sm12x). permute == false: keep linear seq order — required by
+  // the sm100 tcgen05 kernel, whose P operand is packed in linear k-order.
+  uint32_t smem_load_row;
+  if constexpr (permute)
+  {
+    uint32_t smem_load_row_base = ((thread_id / num_threads_per_token) / 16) * 16;
+    uint32_t smem_load_row_mod = (thread_id / num_threads_per_token) % 16;
+    smem_load_row = smem_load_row_base + (smem_load_row_mod  / 8) * 2 + ((smem_load_row_mod / 2) % 4) * 4 + (smem_load_row_mod % 2);
+  }
+  else
+  {
+    smem_load_row = thread_id / num_threads_per_token;
+  }
 
   constexpr cp_async::SharedMemFillMode fill_mode = pad_zero ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
   cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(shared_load[smem_load_row] + thread_id % num_threads_per_token * pack_size, input_ptr_base, thread_base_token < num_tokens);
@@ -434,48 +446,8 @@ void quant_per_block_int8_cuda(
                 int block_size,
                 int tensor_layout)
 {
-  CHECK_CUDA(input);
-  CHECK_CUDA(output);
-  CHECK_CUDA(scale);
-  
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
-
-  CHECK_LASTDIM_CONTIGUOUS(input);
-  CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(scale);
-
-  CHECK_DIMS(input, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(scale, 3);
-
-  const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
-
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
-
-  int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
-
-  if (tensor_layout == 0)
-  {
-    num_tokens = input.size(1);
-    num_heads = input.size(2);
-    stride_seq_input = input.stride(1);
-    stride_h_input = input.stride(2);
-    stride_seq_output = output.stride(1);
-    stride_h_output = output.stride(2);
-  }
-  else
-  {
-    num_tokens = input.size(2);
-    num_heads = input.size(1);
-    stride_seq_input = input.stride(2);
-    stride_h_input = input.stride(1);
-    stride_seq_output = output.stride(2);
-    stride_h_output = output.stride(1);
-  }
+  QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
+  SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
 
   auto input_dtype = input.scalar_type();
 
@@ -516,48 +488,8 @@ void quant_per_block_int8_cuda(
                 int block_size,
                 int tensor_layout)
 {
-  CHECK_CUDA(input);
-  CHECK_CUDA(output);
-  CHECK_CUDA(scale);
-  
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
-
-  CHECK_LASTDIM_CONTIGUOUS(input);
-  CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(scale);
-
-  CHECK_DIMS(input, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(scale, 3);
-
-  const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
-
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
-
-  int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
-
-  if (tensor_layout == 0)
-  {
-    num_tokens = input.size(1);
-    num_heads = input.size(2);
-    stride_seq_input = input.stride(1);
-    stride_h_input = input.stride(2);
-    stride_seq_output = output.stride(1);
-    stride_h_output = output.stride(2);
-  }
-  else
-  {
-    num_tokens = input.size(2);
-    num_heads = input.size(1);
-    stride_seq_input = input.stride(2);
-    stride_h_input = input.stride(1);
-    stride_seq_output = output.stride(2);
-    stride_h_output = output.stride(1);
-  }
+  QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
+  SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
 
   auto input_dtype = input.scalar_type();
 
@@ -599,51 +531,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
                 int block_size,
                 int tensor_layout)
 {
-  CHECK_CUDA(input);
-  CHECK_CUDA(mean);
-  CHECK_CUDA(output);
-  CHECK_CUDA(scale);
-  
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
-
-  CHECK_LASTDIM_CONTIGUOUS(input);
-  CHECK_CONTIGUOUS(mean);
-  CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(scale);
-
-  CHECK_DIMS(input, 4);
-  CHECK_DIMS(mean, 3);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(scale, 3);
-
-  const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
-
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
-
-  int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
-
-  if (tensor_layout == 0)
-  {
-    num_tokens = input.size(1);
-    num_heads = input.size(2);
-    stride_seq_input = input.stride(1);
-    stride_h_input = input.stride(2);
-    stride_seq_output = output.stride(1);
-    stride_h_output = output.stride(2);
-  }
-  else
-  {
-    num_tokens = input.size(2);
-    num_heads = input.size(1);
-    stride_seq_input = input.stride(2);
-    stride_h_input = input.stride(1);
-    stride_seq_output = output.stride(2);
-    stride_h_output = output.stride(1);
-  }
+  QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout, &mean);
+  SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
 
   auto input_dtype = input.scalar_type();
   auto mean_dtype = mean.scalar_type();
@@ -690,48 +579,8 @@ void quant_per_warp_int8_cuda(
                 int warp_block_size,
                 int tensor_layout)
 {
-  CHECK_CUDA(input);
-  CHECK_CUDA(output);
-  CHECK_CUDA(scale);
-  
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
-
-  CHECK_LASTDIM_CONTIGUOUS(input);
-  CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(scale);
-
-  CHECK_DIMS(input, 4);
-  CHECK_DIMS(output, 4);
-  CHECK_DIMS(scale, 3);
-
-  const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
-
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
-
-  int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
-
-  if (tensor_layout == 0)
-  {
-    num_tokens = input.size(1);
-    num_heads = input.size(2);
-    stride_seq_input = input.stride(1);
-    stride_h_input = input.stride(2);
-    stride_seq_output = output.stride(1);
-    stride_h_output = output.stride(2);
-  }
-  else
-  {
-    num_tokens = input.size(2);
-    num_heads = input.size(1);
-    stride_seq_input = input.stride(2);
-    stride_h_input = input.stride(1);
-    stride_seq_output = output.stride(2);
-    stride_h_output = output.stride(1);
-  }
+  QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
+  SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
 
   auto input_dtype = input.scalar_type();
 
@@ -847,10 +696,11 @@ void sub_mean_cuda(
   });
 }
 
-void transpose_pad_permute_cuda(
+static void transpose_pad_impl(
                 torch::Tensor input,
                 torch::Tensor output,
-                int tensor_layout)
+                int tensor_layout,
+                bool permute)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -911,15 +761,44 @@ void transpose_pad_permute_cuda(
 
       dim3 block(CTA_SIZE * (HEAD_DIM / 8));
 
-      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
-        reinterpret_cast<c_type*>(input.data_ptr()),
-        reinterpret_cast<c_type*>(output.data_ptr()),
-        num_tokens,
-        stride_bz_input, stride_seq_input, stride_h_input,
-        stride_bz_output, stride_d_output, stride_h_output
-      );
+      if (permute)
+      {
+        TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, true, c_type><<<grid, block>>>(
+          reinterpret_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(output.data_ptr()),
+          num_tokens,
+          stride_bz_input, stride_seq_input, stride_h_input,
+          stride_bz_output, stride_d_output, stride_h_output
+        );
+      }
+      else
+      {
+        TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, false, c_type><<<grid, block>>>(
+          reinterpret_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(output.data_ptr()),
+          num_tokens,
+          stride_bz_input, stride_seq_input, stride_h_input,
+          stride_bz_output, stride_d_output, stride_h_output
+        );
+      }
     });
   });
+}
+
+void transpose_pad_permute_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                int tensor_layout)
+{
+  transpose_pad_impl(input, output, tensor_layout, /*permute=*/true);
+}
+
+void transpose_pad_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                int tensor_layout)
+{
+  transpose_pad_impl(input, output, tensor_layout, /*permute=*/false);
 }
 
 void scale_fuse_quant_cuda(

@@ -30,7 +30,6 @@ namespace mma{
 #define MMA_F16F16F32_M16N8K16_ENABLED
 #define MMA_F16F16F16_M16N8K16_ENABLED
 #define MMA_S8S8S32_M16N8K32_ENABLED
-#define MMA_S4S4S32_M16N8K64_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
 #define MMA_F16F16F32_M16N8K8_ENABLED
@@ -404,106 +403,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
           "r"(0), "r"(0));
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[4]), "=r"(C[5]), "=r"(C[6]), "=r"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "r"(0), "r"(0),
-          "r"(0), "r"(0));
-  }
-#else
-  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
-#endif
-}
-
-/*!
- * \brief Wrapper of the mma m16n8k32 instruction for row major and column major int4 matrix
- *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
- */
-template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
-__device__ __forceinline__ void mma_sync_m16n8k64_row_col_s4s4s32(int32_t* C, uint32_t* A,
-                                                                   uint32_t* B) {
-#ifdef MMA_S4S4S32_M16N8K64_ENABLED
-  if constexpr (mma_mode == MMAMode::kInplaceUpdate)
-  {
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(C[0]), "r"(C[1]),
-          "r"(C[2]), "r"(C[3]));
-  }
-  else if constexpr (mma_mode == MMAMode::kInit)
-  {
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(0), "r"(0),
-          "r"(0), "r"(0));
-  }
-#else
-  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
-#endif
-}
-
-/*!
- * \brief Wrapper of the mma m16n16k64 instruction for row major and column major int4 matrix
- *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
- */
-template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
-__device__ __forceinline__ void mma_sync_m16n16k64_row_col_s4s4s32(int32_t* C, uint32_t* A,
-                                                                   uint32_t* B) {
-#ifdef MMA_S4S4S32_M16N8K64_ENABLED
-  if constexpr (mma_mode == MMAMode::kInplaceUpdate)
-  {
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(C[0]), "r"(C[1]),
-          "r"(C[2]), "r"(C[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[4]), "=r"(C[5]), "=r"(C[6]), "=r"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "r"(C[4]), "r"(C[5]),
-          "r"(C[6]), "r"(C[7]));
-  }
-  else if constexpr (mma_mode == MMAMode::kInit)
-  {
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(0), "r"(0),
-          "r"(0), "r"(0));
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
         "{%0,  %1,  %2,  %3},"
         "{%4,  %5,  %6,  %7},"
         "{%8,  %9},"

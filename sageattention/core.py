@@ -15,16 +15,6 @@ limitations under the License.
 """
 
 import torch
-import torch.nn.functional as F
-
-from .triton.quant_per_block import per_block_int8 as per_block_int8_triton
-from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
-from .triton.attn_qk_int8_per_block import forward as attn_false
-from .triton.attn_qk_int8_per_block_causal import forward as attn_true
-from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
-from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
-
-from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
 
 try:
     from . import sm80_compile
@@ -44,28 +34,34 @@ try:
 except:
     SM90_ENABLED = False
 
+try:
+    from . import sm100_compile
+    SM100_ENABLED = True
+except:
+    SM100_ENABLED = False
+
+try:
+    from . import sm120_compile
+    SM120_ENABLED = True
+except:
+    SM120_ENABLED = False
+
 from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
+from .quant import per_thread_int8_cuda
 from .quant import sub_mean
 from .quant import per_channel_fp8
 
+from ._pipeline import (
+    ArchSpec,
+    make_qk_quant,
+    pad_qkv_head_dim,
+    qattn_pipeline,
+    smooth_k_mean_lse_correction,
+)
+
 from typing import Any, List, Literal, Optional, Tuple, Union
-import warnings
-
-import subprocess
-import re
-
-
-def get_cuda_version():
-    try:
-        output = subprocess.check_output(['nvcc', '--version']).decode()
-        match = re.search(r'release (\d+)\.(\d+)', output)
-        if match:
-            major, minor = int(match.group(1)), int(match.group(2))
-            return major, minor
-    except Exception as e:
-        print("Failed to get CUDA version:", e)
-    return None, None
+import os
 
 
 def get_cuda_arch_versions():
@@ -139,318 +135,176 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
+
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
-        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+        # The Triton backend was removed; sm86 runs the generic sm80 CUDA kernels
+        # (the sm80 extension always carries a native sm_86 cubin).
+        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm89":
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
-    elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
-    elif arch == "sm121":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
+    elif int(arch[2:]) in (120, 121):
+        # sm12x (consumer Blackwell): exact fp32 accumulator for fp8 mma -> plain fp32
+        # accumulation, per-thread quantization via CUDA (no Triton dependency).
+        if SM120_ENABLED:
+            return sageattn_qk_int8_pv_fp8_cuda_sm120(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+        # Fallback when the wheel was built without the sm120 extension: sm89 kernels
+        # (their fatbin carries sm_12x cubins) with the Ada-workaround accumulator mode.
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
+    elif arch in ("sm100", "sm110") and SM100_ENABLED \
+            and os.getenv("SAGEATTN_SM100_TCGEN05", "0").upper() in {"1", "TRUE", "YES"}:
+        # tcgen05 (5th-gen tensor core) kernels: int8 QK + fp8 PV with a true
+        # fp32 accumulator. Opt-in via SAGEATTN_SM100_TCGEN05=1 until
+        # hardware-validated; dispatch keys on exact (major, minor) — sm103
+        # and family variants stay on the sm89 fallback below (GB300 dropped
+        # INT8 tensor cores, so the kind::i8 kernel cannot exist there).
+        return sageattn_qk_int8_pv_fp8_cuda_sm100(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+    elif int(arch[2:]) >= 100:
+        # Other Blackwell-class archs (sm100/sm103/sm110/...) run the sm89 fp8 kernels: they have an accurate fp32 accumulator for fp8 mma and the triton kernel is currently not usable on them.
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
 
 def sageattn_qk_int8_pv_fp16_triton(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
-    v: torch.Tensor, 
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     tensor_layout: str = "HND",
     quantization_backend: str = "triton",
-    is_causal: bool =False, 
+    is_causal: bool =False,
     attn_mask: Optional[torch.Tensor] = None,
-    sm_scale: Optional[float] = None, 
+    sm_scale: Optional[float] = None,
     smooth_k: bool = True,
     return_lse: bool = False,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Removed: the Triton backend was dropped in favor of the CUDA kernels.
+
+    Use :func:`sageattn_qk_int8_pv_fp16_cuda` (or the auto-dispatching
+    :func:`sageattn`) instead.
     """
-    SageAttention with per-block INT8 quantization for Q and K, FP16 PV with FP16 accumulation, implemented using Triton.
-    The FP16 accumulator is added to a FP32 buffer immediately after each iteration.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor. Shape:
-        - If `tensor_layout` is "HND": ``[batch_size, num_qo_heads, qo_len, head_dim]``.
-        - If `tensor_layout` is "NHD": ``[batch_size, qo_len, num_qo_heads, head_dim]``.
-
-    k : torch.Tensor
-        The key tensor. Shape:
-        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
-        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
-
-    v : torch.Tensor
-        The value tensor. Shape:
-        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
-        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
-
-    tensor_layout : str
-        The tensor layout, either "HND" or "NHD".
-        Default: "HND".
-
-    quantization_backend : str
-        The quantization backend, either "triton" or "cuda".
-        "cuda" backend offers better performance due to kernel fusion.
-
-    is_causal : bool
-        Whether to apply causal mask to the attention matrix. Only applicable when qo_len == kv_len.
-        Default: False.
-
-    attn_mask : Optional[torch.Tensor]
-        The attention mask tensor, of dtype bool or float32.
-        Should be able to broadcast to the shape of the matrix qk^T.
-        Default: None.
-
-    sm_scale : Optional[float]
-        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
-
-    smooth_k : bool
-        Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
-        Default: True.
-
-    return_lse : bool
-        Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
-        Default: False.
-
-    Returns
-    -------
-    torch.Tensor
-        The output tensor. Shape:
-        - If `tensor_layout` is "HND": ``[batch_size, num_qo_heads, qo_len, head_dim]``.
-        - If `tensor_layout` is "NHD": ``[batch_size, qo_len, num_qo_heads, head_dim]``.
-
-    torch.Tensor
-        The logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax normalization factor).
-        Shape: ``[batch_size, num_qo_heads, qo_len]``.
-        Only returned if `return_lse` is True.
-
-    Note
-    ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
-    - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16``, ``torch.bfloat16`` or ``torch.float32``.
-    - All tensors must be on the same cuda device.
-    - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
-    """
-
-    dtype = q.dtype
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    if attn_mask is not None:
-        assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be of dtype bool or the same dtype as q."
-        assert attn_mask.device == q.device, "All tensors must be on the same device."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
-
-    # assert last dim is contiguous
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
-
-    seq_dim = 1 if tensor_layout == "NHD" else 2
-    nh_dim = 2 if tensor_layout == "NHD" else 1
-
-    if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
-    else:
-        km = None
-
-    if dtype == torch.bfloat16 or dtype == torch.float32:
-        v = v.to(torch.float16)
-
-    if sm_scale is None:
-        sm_scale = 1.0 / (head_dim_og ** 0.5)
-
-    if quantization_backend == "triton":
-        q_int8, q_scale, k_int8, k_scale = per_block_int8_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
-    elif quantization_backend == "cuda":
-        q_int8, q_scale, k_int8, k_scale = per_block_int8_cuda(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
-    else:
-        raise ValueError(f"Unsupported quantization backend: {quantization_backend}")
-    if is_causal:
-        assert attn_mask is None, "Mask should be None for causal attention."
-        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
-    else:
-        if attn_mask is not None:
-            if tensor_layout == "HND":
-                target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-            elif tensor_layout == "NHD":
-                target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-            else:
-                raise ValueError(f"tensor_layout {tensor_layout} not supported")
-            try:
-                attn_mask = attn_mask.expand(target_shape)
-            except Exception:
-                raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
-        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
-
-    o = o[..., :head_dim_og]
-
-    if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
-    else:
-        return o
+    raise RuntimeError(
+        "sageattn_qk_int8_pv_fp16_triton has been removed together with the Triton backend; "
+        "use sageattn_qk_int8_pv_fp16_cuda (or sageattn) instead.")
 
 
 def sageattn_varlen(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
-    v: torch.Tensor, 
-    cu_seqlens_q: torch.Tensor, 
-    cu_seqlens_k: torch.Tensor, 
-    max_seqlen_q: int, 
-    max_seqlen_k: int, 
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     is_causal: bool = False,
-    sm_scale: Optional[float] = None, 
+    sm_scale: Optional[float] = None,
     smooth_k: bool = True,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Removed: varlen was implemented on the dropped Triton backend.
+
+    A CUDA varlen implementation is planned; until then this raises.
     """
+    raise NotImplementedError(
+        "sageattn_varlen was Triton-only and has been removed with the Triton backend; "
+        "a CUDA varlen implementation is planned.")
 
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor, shape: ``[cu_seqlens_q[-1], num_qo_heads, head_dim]``.
 
-    k : torch.Tensor
-        The key tensor, shape: ``[cu_seqlens_k[-1], num_kv_heads, head_dim]``.
+def _sm80_qk_quant(q, k, km, tensor_layout, qk_quant_gran, pv_accum_dtype):
+    if qk_quant_gran == "per_warp":
+        return per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64)
+    elif qk_quant_gran == "per_thread":
+        return per_thread_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64, WARPK=64)
 
-    v : torch.Tensor
-        The value tensor, shape: ``[cu_seqlens_k[-1], num_kv_heads, head_dim]``.
 
-    cu_seqlens_q : torch.Tensor
-        The cumulative sequence lengths for the query sequences in the batch, used to index into `q`. 
-        Shape: ``[batch_size + 1]``, where each entry represents the cumulative length of sequences up to that batch index.
+if SM80_ENABLED:
+    _SM80_SPEC = ArchSpec(
+        quant=_sm80_qk_quant,
+        pv_fp8=False,
+        kernels={
+            ("fp32", False): ("v_fp16", sm80_compile.qk_int8_sv_f16_accum_f32_attn),
+            ("fp16", True): ("v_smooth_fp16", sm80_compile.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn),
+            ("fp16", False): ("v_fp16", sm80_compile.qk_int8_sv_f16_accum_f16_attn),
+            ("fp16+fp32", False): ("v_fp16", sm80_compile.qk_int8_sv_f16_accum_f16_attn_inst_buf),
+        },
+        smooth_v_ignore=((("fp32", "fp16+fp32"), None),),
+        unsupported_pv_accum_error=True,
+    )
 
-    cu_seqlens_k : torch.Tensor
-        The cumulative sequence lengths for the key and value sequences in the batch, used to index into `k` and `v`. 
-        Shape: ``[batch_size + 1]``, where each entry represents the cumulative length of sequences up to that batch index.
+if SM89_ENABLED:
+    _SM89_SPEC = ArchSpec(
+        quant=make_qk_quant(per_warp_int8_cuda, per_thread_int8_cuda, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64),
+        pv_fp8=True,
+        kernels={
+            ("fp32", True): ("vscale_vmean", sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn),
+            ("fp32", False): ("vscale", sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn),
+            ("fp32+fp32", False): ("vscale", sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf),
+            ("fp32+fp16", False): ("vscale", sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf),
+        },
+        smooth_v_ignore=(
+            (("fp32+fp32",), "pv_accum_dtype is 'fp32+fp32', smooth_v will be ignored."),
+            (("fp32+fp16",), "pv_accum_dtype is 'fp32+fp16', smooth_v will be ignored."),
+        ),
+        v_scale_max_by_accum=True,
+    )
 
-    max_seqlen_q : int
-        The maximum sequence length for the query tensor in the batch.
-    
-    max_seqlen_k : int
-        The maximum sequence length for the key and value tensors in the batch.
+if SM90_ENABLED:
+    _SM90_SPEC = ArchSpec(
+        quant=make_qk_quant(per_warp_int8_cuda, per_thread_int8_cuda, BLKQ=64, WARPQ=16, BLKK=128, WARPK=128),
+        pv_fp8=True,
+        kernels={
+            ("fp32", False): ("error", "Please use pv_accum_dtype='fp32+fp32' for sm90."),
+            ("fp32+fp32", False): ("vscale", sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf),
+        },
+        v_pad_to_128=True,
+    )
 
-    is_causal : bool
-        Whether to apply causal mask to the attention matrix. Only applicable when qo_len == kv_len for each sequence.
-        Default: False.
-    
-    sm_scale : Optional[float]
-        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
+if SM100_ENABLED:
+    def _sm100_assert_pv_accum(pv_accum_dtype):
+        assert pv_accum_dtype == "fp32", "The tcgen05 kernels only support pv_accum_dtype='fp32'."
 
-    smooth_k : bool
-        Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
-        Default: True.
+    _SM100_SPEC = ArchSpec(
+        # tcgen05 kernel tile: CTA_Q = 128 (4 warp-scale groups of 32 rows), CTA_K = 128.
+        quant=make_qk_quant(per_warp_int8_cuda, per_thread_int8_cuda, BLKQ=128, WARPQ=32, BLKK=128, WARPK=128),
+        pv_fp8=True,
+        kernels={
+            # full 448 e4m3 range: the tcgen05 fp32 accumulator is exact, no headroom clamp needed.
+            ("fp32", False): ("vscale", sm100_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn),
+        },
+        v_pad_to_128=True,
+        # linear kv order (no mma-fragment permutation): the tcgen05 kernel's
+        # P operand is packed in linear k-order, so V must be linear too.
+        v_permute=False,
+        assert_pv_accum_after_gran=_sm100_assert_pv_accum,
+    )
 
-    Returns
-    -------
-    torch.Tensor
-        The output tensor, shape: ``[cu_seqlens_q[-1], num_qo_heads, head_dim]``.
+if SM120_ENABLED:
+    def _sm120_assert_pv_accum(pv_accum_dtype):
+        assert pv_accum_dtype in ["fp32", "fp32+fp16"], \
+            "pv_accum_dtype must be 'fp32' or 'fp32+fp16' on sm12x ('fp32+fp32' is pointless here: the plain fp32 accumulator is already exact)."
 
-    Note
-    ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
-    - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16``, ``torch.bfloat16`` or ``torch.float32``.
-    - The tensors `cu_seqlens_q` and `cu_seqlens_k` must have the dtype ``torch.int32`` or ``torch.int64``.
-    - All tensors must be on the same cuda device.
-    - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
-    """
-    
-    dtype = q.dtype
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
-
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
-    assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
-
-    if dtype == torch.bfloat16 or dtype == torch.float32:
-        v = v.to(torch.float16)
-
-    if smooth_k:
-        km = k.mean(dim=0, keepdim=True) # ! km is calculated on the all the batches. Calculate over each individual sequence requires dedicated kernel.
-        k = k - km
-
-    if sm_scale is None:
-        sm_scale = 1.0 / (head_dim_og ** 0.5)
-
-    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale)
-
-    if is_causal:
-        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
-    else:
-        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
-
-    o = o[..., :head_dim_og]
-
-    return o
+    _SM120_SPEC = ArchSpec(
+        quant=make_qk_quant(per_warp_int8_cuda, per_thread_int8_cuda, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64),
+        pv_fp8=True,
+        kernels={
+            ("fp32", True): ("vscale_vmean", sm120_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn),
+            ("fp32", False): ("vscale", sm120_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn),
+            ("fp32+fp16", False): ("vscale", sm120_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf),
+        },
+        smooth_v_ignore=((("fp32+fp16",), "pv_accum_dtype is 'fp32+fp16', smooth_v will be ignored."),),
+        v_scale_max_by_accum=True,
+        assert_pv_accum_after_dtype=_sm120_assert_pv_accum,
+    )
 
 
 def sageattn_qk_int8_pv_fp16_cuda(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
@@ -507,7 +361,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     smooth_k : bool
         Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
         Default: True.
-    
+
     smooth_v : bool
         Whether to smooth the value tensor by subtracting the mean along the sequence dimension.
         smooth_v will be ignored if pv_accum_dtype is "fp32" or "fp16+fp32".
@@ -531,111 +385,24 @@ def sageattn_qk_int8_pv_fp16_cuda(
 
     Note
     ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
+    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
     """
 
-    dtype = q.dtype
     assert SM80_ENABLED, "SM80 kernel is not available. make sure you GPUs with compute capability 8.0 or higher."
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
-    assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
-    _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
-    _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
-    _return_lse = 1 if return_lse else 0
-
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
-
-    # assert last dim is contiguous
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
-
-    if sm_scale is None:
-        sm_scale = head_dim_og**-0.5
-
-    seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1
-
-    if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
-    else:
-        km = None
-
-    if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64)
-    elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64, WARPK=64)
-
-    o = torch.empty(q.size(), dtype=dtype, device=q.device)
-
-    if pv_accum_dtype in ["fp32", "fp16+fp32"] and smooth_v:
-        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
-        smooth_v = False
-
-    if pv_accum_dtype == 'fp32':
-        v = v.to(torch.float16)
-        lse = sm80_compile.qk_int8_sv_f16_accum_f32_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp16":
-        if smooth_v:
-            smoothed_v, vm = sub_mean(v, tensor_layout=tensor_layout)
-            lse = sm80_compile.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(q_int8, k_int8, smoothed_v, o, q_scale, k_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-        else:
-            v = v.to(torch.float16)
-            lse = sm80_compile.qk_int8_sv_f16_accum_f16_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp16+fp32":
-        v = v.to(torch.float16)
-        lse = sm80_compile.qk_int8_sv_f16_accum_f16_attn_inst_buf(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    else:
-        raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
-
-    o = o[..., :head_dim_og]
-
-    if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
-    else:
-        return o
+    return qattn_pipeline(
+        q, k, v, _SM80_SPEC,
+        tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale, pv_accum_dtype=pv_accum_dtype, smooth_k=smooth_k,
+        smooth_v=smooth_v, return_lse=return_lse,
+    )
 
 
 def sageattn_qk_int8_pv_fp8_cuda(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
@@ -687,11 +454,11 @@ def sageattn_qk_int8_pv_fp8_cuda(
         - "fp32": PV accumulation is done in fully in FP32. However, due to the hardware issue, there are only 22 valid bits in the FP32 accumulator.
         - "fp32+fp32": PV accumulation is done in FP32 (actually FP22), but added to a FP32 buffer every few iterations. This offers a balance between speed and accuracy.
         Default: "fp32+fp32".
-        
+
     smooth_k : bool
         Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
         Default: True.
-    
+
     smooth_v : bool
         Whether to smooth the value tensor by subtracting the mean along the sequence dimension.
         smooth_v will be ignored if pv_accum_dtype is "fp32+fp32".
@@ -715,120 +482,62 @@ def sageattn_qk_int8_pv_fp8_cuda(
 
     Note
     ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
+    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
     """
 
-    dtype = q.dtype
     assert SM89_ENABLED, "SM89 kernel is not available. Make sure you GPUs with compute capability 8.9."
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
-    assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    return qattn_pipeline(
+        q, k, v, _SM89_SPEC,
+        tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale, pv_accum_dtype=pv_accum_dtype, smooth_k=smooth_k,
+        smooth_v=smooth_v, return_lse=return_lse,
+    )
 
-    # cuda_major_version, cuda_minor_version = get_cuda_version()
-    # if(cuda_major_version, cuda_minor_version) < (12, 8) and pv_accum_dtype == 'fp32+fp16':
-    #     warnings.warn("cuda version < 12.8, change pv_accum_dtype to 'fp32+fp32'")
-    #     pv_accum_dtype = 'fp32+fp32'
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
+def sageattn_qk_int8_pv_fp8_cuda_sm120(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32",
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    SageAttention with INT8 quantization for Q and K, FP8 PV, specialized for
+    sm12x (consumer Blackwell). Unlike Ada, the fp8 mma fp32 accumulator is
+    exact on these parts, so the default path accumulates plainly in FP32
+    (no inst_buf two-level machinery) with the full 448 V quantization range,
+    and per-thread quantization runs through CUDA kernels (no Triton
+    dependency).
 
-    _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
-    _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
-    _return_lse = 1 if return_lse else 0
+    Parameters mirror :func:`sageattn_qk_int8_pv_fp8_cuda`, except:
 
-    head_dim_og = q.size(-1)
+    pv_accum_dtype : str
+        - "fp32" (default): plain FP32 PV accumulation (exact on sm12x); allows `smooth_v`.
+        - "fp32+fp16": opt-in speed mode (f8f8f16 mma at double rate, V range clamped to 2.25).
+    """
 
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
-
-    # assert last dim is contiguous
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
-
-    if sm_scale is None:
-        sm_scale = head_dim_og**-0.5
-
-    seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1    
-
-    if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
-    else:
-        km = None
-
-    if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
-    elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
-
-    o = torch.empty(q.size(), dtype=dtype, device=q.device)
-
-    if pv_accum_dtype == 'fp32+fp32' and smooth_v:
-        warnings.warn("pv_accum_dtype is 'fp32+fp32', smooth_v will be ignored.")
-        smooth_v = False
-
-    if pv_accum_dtype == 'fp32+fp16' and smooth_v:
-        warnings.warn("pv_accum_dtype is 'fp32+fp16', smooth_v will be ignored.")
-        smooth_v = False
-
-    quant_v_scale_max = 448.0
-    if pv_accum_dtype == 'fp32+fp16':
-        quant_v_scale_max = 2.25
-
-    v_fp8, v_scale, vm = per_channel_fp8(v, tensor_layout=tensor_layout, scale_max=quant_v_scale_max, smooth_v=smooth_v)
-
-    if pv_accum_dtype == "fp32":
-        if smooth_v:
-            lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-        else:
-            lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp32+fp32":
-        lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp32+fp16":
-        lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-
-    o = o[..., :head_dim_og]
-
-    if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
-    else:
-        return o
+    assert SM120_ENABLED, "SM120 kernel is not available. Make sure you have GPUs with compute capability 12.x and the package was built for them."
+    return qattn_pipeline(
+        q, k, v, _SM120_SPEC,
+        tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale, pv_accum_dtype=pv_accum_dtype, smooth_k=smooth_k,
+        smooth_v=smooth_v, return_lse=return_lse,
+    )
 
 
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
@@ -879,7 +588,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         - "fp32": PV accumulation is done in fully in FP32. However, due to the hardware issue, there are only 22 valid bits in the FP32 accumulator.
         - "fp32+fp32": PV accumulation is done in FP32 (actually FP22), but added to a FP32 buffer every few iterations. This offers a balance between speed and accuracy.
         Default: "fp32+fp32".
-        
+
     smooth_k : bool
         Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
         Default: True.
@@ -902,95 +611,106 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
 
     Note
     ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
+    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
     """
 
-    dtype = q.dtype
     assert SM90_ENABLED, "SM90 kernel is not available. Make sure you GPUs with compute capability 9.0."
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
-    assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    return qattn_pipeline(
+        q, k, v, _SM90_SPEC,
+        tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale, pv_accum_dtype=pv_accum_dtype, smooth_k=smooth_k,
+        smooth_v=False, return_lse=return_lse,
+    )
 
-    torch.cuda.set_device(v.device)
 
-    _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
-    _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
-    _return_lse = 1 if return_lse else 0
+def sageattn_qk_int8_pv_fp8_cuda_sm100(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_warp",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32",
+    smooth_k: bool = True,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    SageAttention with INT8 quantization for Q and K, FP8 PV with FP32 accumulation,
+    implemented with tcgen05 (5th-gen tensor core) instructions for sm100/sm110.
 
-    head_dim_og = q.size(-1)
+    Parameters
+    ----------
+    q : torch.Tensor
+        The query tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_qo_heads, qo_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, qo_len, num_qo_heads, head_dim]``.
 
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    k : torch.Tensor
+        The key tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
 
-    # assert last dim is contiguous
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
+    v : torch.Tensor
+        The value tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
 
-    if sm_scale is None:
-        sm_scale = head_dim_og**-0.5
+    tensor_layout : str
+        The tensor layout, either "HND" or "NHD".
+        Default: "HND".
 
-    seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1
+    is_causal : bool
+        Whether to apply causal mask to the attention matrix. Only applicable when qo_len == kv_len.
+        Default: False.
 
-    if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
-    else:
-        km = None
+    qk_quant_gran : str
+        The granularity of quantization for Q and K, either "per_warp" or "per_thread".
+        Default: "per_warp".
 
-    if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=64, WARPQ=16, BLKK=128)
-    elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=64, WARPQ=16, BLKK=128, WARPK=128)
+    sm_scale : Optional[float]
+        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
 
-    o = torch.empty(q.size(), dtype=dtype, device=q.device)
+    pv_accum_dtype : str
+        Must be "fp32": the tcgen05 fp8 mma accumulator is a true FP32 (unlike
+        sm90's FP22), so the inst_buf/fp32+fp32 machinery does not exist here.
 
-    # pad v to multiple of 128
-    # TODO: modify per_channel_fp8 kernel to handle this
-    kv_len = k.size(seq_dim)
-    v_pad_len = 128 - (kv_len % 128) if kv_len % 128 != 0 else 0
-    if v_pad_len > 0:
-        if tensor_layout == "HND":
-            v = torch.cat([v, torch.zeros(v.size(0), v.size(1), v_pad_len, v.size(3), dtype=v.dtype, device=v.device)], dim=2)
-        else:
-            v = torch.cat([v, torch.zeros(v.size(0), v_pad_len, v.size(2), v.size(3), dtype=v.dtype, device=v.device)], dim=1)
+    smooth_k : bool
+        Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
+        Default: True.
 
-    v_fp8, v_scale, _ = per_channel_fp8(v, tensor_layout=tensor_layout, smooth_v=False)
+    return_lse : bool
+        Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
+        Default: False.
 
-    if pv_accum_dtype == "fp32":
-        raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
-        lse = sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp32+fp32":
-        lse = sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+    Returns
+    -------
+    torch.Tensor
+        The output tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_qo_heads, qo_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, qo_len, num_qo_heads, head_dim]``.
 
-    o = o[..., :head_dim_og]
+    torch.Tensor
+        The logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax normalization factor).
+        Shape: ``[batch_size, num_qo_heads, qo_len]``.
+        Only returned if `return_lse` is True.
 
-    if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
-    else:
-        return o
+    Note
+    ----
+    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
+    - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
+    - All tensors must be on the same cuda device.
+    - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
+    """
+
+    assert SM100_ENABLED, "SM100 tcgen05 kernel is not available. Make sure you have GPUs with compute capability 10.0 or 11.0 and the package was built for them."
+    return qattn_pipeline(
+        q, k, v, _SM100_SPEC,
+        tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale, pv_accum_dtype=pv_accum_dtype, smooth_k=smooth_k,
+        smooth_v=False, return_lse=return_lse,
+    )

@@ -67,7 +67,7 @@ Paper: https://arxiv.org/abs/2505.11594
 
 ## Installation
 ### Base environment
-+ `python>=3.9`   , `torch>=2.3.0`  , `triton>=3.0.0` 
++ `python>=3.9`   , `torch>=2.3.0`
 - `CUDA`:
   + `>=12.8` for Blackwell or SageAttention2++
   + `>=12.4` for fp8 support on Ada
@@ -110,7 +110,6 @@ attn_output = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
 
 ### Available APIs:
 + `sageattn`: Automatically selects the optimal kernel based on the GPU to achieve a good performance-accuracy trade-off.
-+ `sageattn_qk_int8_pv_fp16_triton`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using Triton backend.
 + `sageattn_qk_int8_pv_fp16_cuda`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using CUDA backend.
 + `sageattn_qk_int8_pv_fp8_cuda`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend. (Note that setting `pv_accum_dtype=fp32+fp16` corresponds to SageAttention2++.)
 + `sageattn_qk_int8_pv_fp8_cuda_sm90`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend, specifically optimized for Hopper GPUs.
