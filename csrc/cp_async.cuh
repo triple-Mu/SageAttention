@@ -1,10 +1,10 @@
 /*
  * Copyright (c) 2024 by SageAttention team.
- * 
- * This file is based on code from Flashinfer, https://github.com/flashinfer-ai/flashinfer/blob/v0.1.5/include/flashinfer/cp_async.cuh
- * Copyright (c) 2023 by FlashInfer team.
- * Small modifications made by SageAttention team, 2024 (e.g., renamed namespace).
- * 
+ *
+ * This file is based on code from Flashinfer,
+ * https://github.com/flashinfer-ai/flashinfer/blob/v0.1.5/include/flashinfer/cp_async.cuh Copyright (c) 2023 by
+ * FlashInfer team. Small modifications made by SageAttention team, 2024 (e.g., renamed namespace).
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -19,18 +19,19 @@
  */
 
 #pragma once
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 
 namespace cp_async {
 
 enum class SharedMemFillMode {
-  kFillZero,  // Fill zero to shared memory when predicate is false
-  kNoFill     // Do not fill zero to shared memory when predicate is false
+    kFillZero,  // Fill zero to shared memory when predicate is false
+    kNoFill     // Do not fill zero to shared memory when predicate is false
 };
 
 enum class PrefetchMode {
-  kNoPrefetch,  // Do not fetch additional data from global memory to L2
-  kPrefetch     // Fetch additional data from global memory to L2
+    kNoPrefetch,  // Do not fetch additional data from global memory to L2
+    kPrefetch     // Fetch additional data from global memory to L2
 };
 
 #if (__CUDACC_VER_MAJOR__ >= 11)
@@ -40,53 +41,66 @@ enum class PrefetchMode {
 #endif
 
 /*!
- * \brief Wrapper of PTX cp.async.commit_group instruction, commit all prior uncommitted
- *   cp.async instructions to a group
+ * \brief Commit all prior uncommitted cp.async instructions to a group.
  */
-__device__ __forceinline__ void commit_group() {
-#ifdef CP_ASYNC_ENABLED
-  asm volatile("cp.async.commit_group;\n" ::);
-#endif
+__device__ __forceinline__ void commit_group()
+{
+    __pipeline_commit();
 }
 
 /*!
- * \brief Wrapper of PTX cp.async.wait_group instruction
+ * \brief Wait until at most n cp.async groups are still in flight.
  * \tparam n Wait till most recent n groups are committed
+ *
+ * __pipeline_wait_prior takes a runtime argument and switches over it; with a
+ * compile-time n the switch folds away to the same single cp.async.wait_group.
  */
-template <size_t n>
-__device__ __forceinline__ void wait_group() {
-#ifdef CP_ASYNC_ENABLED
-  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
-#endif
+template<size_t n>
+__device__ __forceinline__ void wait_group()
+{
+    __pipeline_wait_prior(n);
 }
 
 /*!
  * \brief Wrapper of PTX cp.async.cg.shared.global instruction, asynchronously copy data from
  *   global memory to shared memory
+ *
+ * Kept hand-written: the official __pipeline_memcpy_async has no .L2::128B
+ * prefetch hint, which the sm80/sm89 attention pipelines rely on.
+ *
  * \tparam prefetch_mode Whether to fetch additional data from global memory to L2
  * \tparam T Data type
  * \param smem_ptr Pointer to shared memory
  * \param gmem_ptr Pointer to global memory
  */
-template <PrefetchMode prefetch_mode, typename T>
-__device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
+template<PrefetchMode prefetch_mode, typename T>
+__device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr)
+{
 #ifdef CP_ASYNC_ENABLED
-  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
-                 "l"(gmem_ptr), "n"(16), "r"(16));
-  } else {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
-                 "l"(gmem_ptr), "n"(16), "r"(16));
-  }
+    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                     "l"(gmem_ptr),
+                     "n"(16),
+                     "r"(16));
+    }
+    else {
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr), "n"(16), "r"(16));
+    }
 #else
-  *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+    *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
 #endif
 }
 
 /*!
  * \brief Wrapper of PTX cp.async.cg.shared.global instruction, asynchronously copy data from
  *   global memory to shared memory with predicate.
+ *
+ * Kept hand-written: besides the .L2::128B hint, the kNoFill form skips the
+ * copy entirely under a predicate, which __pipeline_memcpy_async's zfill
+ * argument cannot express.
+ *
  * \tparam prefetch_mode Whether to fetch additional data from global memory to L2
  * \tparam fill_mode Whether to fill zero to shared memory when predicate is false
  * \tparam T Data type
@@ -95,47 +109,58 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
  * \param predicate Predicate value
  * \note fill zero is slower than not fill zero
  */
-template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
-__device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
+template<PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
+__device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate)
+{
 #ifdef CP_ASYNC_ENABLED
-  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
-    int src_in_bytes = predicate ? 16 : 0;
-    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-      asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
-                   "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
-    } else {
-      asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
-                   "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
-    }
-  } else {
-    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-      asm volatile(
-          "{\n"
-          " .reg .pred p;\n"
-          " setp.ne.b32 p, %0, 0;\n"
-          " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
-          "}\n" ::"r"((int)predicate),
-          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
-    } else {
-      asm volatile(
-          "{\n"
-          " .reg .pred p;\n"
-          " setp.ne.b32 p, %0, 0;\n"
-          " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-          "}\n" ::"r"((int)predicate),
-          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
-    }
-  }
-#else
-  if (predicate) {
-    *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
-  } else {
+    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
-      *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
+        int src_in_bytes = predicate ? 16 : 0;
+        if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                         "l"(gmem_ptr),
+                         "n"(16),
+                         "r"(src_in_bytes));
+        }
+        else {
+            asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                         "l"(gmem_ptr),
+                         "n"(16),
+                         "r"(src_in_bytes));
+        }
     }
-  }
+    else {
+        if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+            asm volatile("{\n"
+                         " .reg .pred p;\n"
+                         " setp.ne.b32 p, %0, 0;\n"
+                         " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
+                         "}\n" ::"r"((int)predicate),
+                         "r"(smem_int_ptr),
+                         "l"(gmem_ptr),
+                         "n"(16));
+        }
+        else {
+            asm volatile("{\n"
+                         " .reg .pred p;\n"
+                         " setp.ne.b32 p, %0, 0;\n"
+                         " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+                         "}\n" ::"r"((int)predicate),
+                         "r"(smem_int_ptr),
+                         "l"(gmem_ptr),
+                         "n"(16));
+        }
+    }
+#else
+    if (predicate) {
+        *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+    }
+    else {
+        if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+            *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
+        }
+    }
 #endif
 }
 
-} // namespace cp_async
+}  // namespace cp_async
