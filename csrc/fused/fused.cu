@@ -42,8 +42,14 @@
 // here. The other archs get no annotation at all and keep byte-identical SASS.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000)
 #define SAGE_QUANT_BOUNDS(threads) __launch_bounds__(1024, (threads) == 1024 ? 2 : 1)
+// Under the 32-register pin the fp32 mean image is 8 registers of spill;
+// re-converting per use is a handful of free HADD2s instead. The other archs
+// keep the precomputed image (and their exact SASS): with registers to spare,
+// letting them re-convert is a wash at best.
+#define SAGE_QUANT_MEAN_REMAT 1
 #else
 #define SAGE_QUANT_BOUNDS(threads)
+#define SAGE_QUANT_MEAN_REMAT 0
 #endif
 
 template<uint32_t head_dim,
@@ -129,10 +135,12 @@ __global__ void SAGE_QUANT_BOUNDS(CTA_TOKENS*(head_dim / 8) / num_pack_per_threa
 
     if constexpr (sub_mean) {
         *(float4*)(&mean_val[0]) = *(float4*)(mean_ptr_base);
+#if !SAGE_QUANT_MEAN_REMAT
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) {
             mean_val_float[j] = fp_traits<T>::to_fp32(mean_val[j]);
         }
+#endif
     }
 
     constexpr uint32_t iter_stride = CTA_TOKENS / num_pack_per_thread;
@@ -150,7 +158,11 @@ __global__ void SAGE_QUANT_BOUNDS(CTA_TOKENS*(head_dim / 8) / num_pack_per_threa
             if constexpr (sub_mean) {
 #pragma unroll
                 for (uint32_t j = 0; j < 8; j++) {
+#if SAGE_QUANT_MEAN_REMAT
+                    x_val_float[i][j] -= fp_traits<T>::to_fp32(mean_val[j]);
+#else
                     x_val_float[i][j] -= mean_val_float[j];
+#endif
                 }
             }
 
