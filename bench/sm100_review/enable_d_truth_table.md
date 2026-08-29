@@ -18,7 +18,7 @@ accumulate only across the head_dim K-steps within one tile.
 SASS witness: first `UTCIMMA … !UPT` then `UTCIMMA … UPT` (constant-false /
 constant-true uniform predicates).
 
-## O accumulator (PV, `kind::f8f6f4`, TMEM cols [160,160+HD))
+## O accumulator (PV, `kind::f8f6f4`, TMEM cols [128,128+HD))
 
 O is **persistent across the whole sequence** — zero-initialized exactly
 once (first tile, first K-step) and accumulated everywhere else. The

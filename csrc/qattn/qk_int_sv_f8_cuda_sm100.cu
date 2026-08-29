@@ -28,15 +28,17 @@
 // parity waits (barrier_S_done / barrier_O_done).
 //
 // TMEM column plan (128 lanes x 512 cols x 32b per SM; one alloc of the
-// power-of-two round-up of what the plan below needs - 256 cols at head_dim=64,
-// 512 at head_dim=128 - so that two CTAs can hold TMEM at once when it fits):
+// power-of-two round-up of what the plan below needs - 256 cols at both head
+// dims - so that two CTAs can hold TMEM at once):
 //   S [0,128)          128x128 s32 QK accumulator (1 col = 1 s32 per lane)
-//   P [128,160)        128x128 e4m3, packed 4-per-word (K elems 4c..4c+3 in
+//   P [32,64)          128x128 e4m3, packed 4-per-word (K elems 4c..4c+3 in
 //                      word col c, byte b = K elem 4c+b) - the kind::f8f6f4
 //                      TS A-operand layout (PTX ISA 9.7.17.10.4.3 packing +
-//                      Layout D 9.7.17.10.5.4: lane = M row)
-//   O [160,160+HD)     128xHD f32 PV accumulator
-//   [160+HD,512)       spare (future S0/S1 ping-pong stage)
+//                      Layout D 9.7.17.10.5.4: lane = M row). P overlays the
+//                      S region (same placement as the CUTLASS/cutedsl sm100
+//                      FMHA kernel); see the safety argument at TMEM_COL_P.
+//   O [128,128+HD)     128xHD f32 PV accumulator
+//   [128+HD,256)       spare (future S0/S1 ping-pong stage)
 //
 // V layout contract: value must come from per_channel_fp8(..., permute=False)
 // — transposed (head_dim x padded_kv) and padded, but with LINEAR kv order.
@@ -150,26 +152,40 @@ __global__ void __launch_bounds__(NUM_THREADS)
     static_assert(head_dim == 64 || head_dim == 128, "dispatched head dims");
     static_assert(head_dim % 32 == 0, "QK MMA is chained in K=32 steps");
 
-    // --- TMEM column plan; regions disjoint by construction ---
+    // --- TMEM column plan; P overlays S, O is disjoint from both ---
     constexpr uint32_t TMEM_COL_S  = 0;
     constexpr uint32_t TMEM_COLS_S = CTA_K;  // s32: one column per element
-    constexpr uint32_t TMEM_COL_P  = TMEM_COL_S + TMEM_COLS_S;
+    // P lives inside the S region (column 32, matching the CUTLASS/cutedsl
+    // sm100 FMHA layout). Three facts make the aliasing safe:
+    //   * TMEM lane == thread == attention row, and tcgen05.ld/st only touch
+    //     the issuing warp's lane quadrant, so no thread ever reads another
+    //     thread's S columns - the hazard is purely thread-local;
+    //   * within a KV tile the whole S row is drained into RS_f32 (one
+    //     tmem_ld + tmem_ld_wait per 32-column chunk) before P is packed and
+    //     stored, so the store lands on columns this thread is done with;
+    //   * across KV tiles the next QK MMA rewrites S[0,128) - the columns P
+    //     lived in included - and it is only issued after every thread passed
+    //     wait(barrier_O_done), i.e. after the PV MMA that consumed P retired.
+    // The 32 columns this frees take head_dim=128 from 288 needed columns to
+    // 256, which is what lets two CTAs hold TMEM at once (section 5f).
+    constexpr uint32_t TMEM_COL_P  = TMEM_COL_S + 32;
     constexpr uint32_t TMEM_COLS_P = CTA_K / 4;  // e4m3 packed 4 per 32b word
-    constexpr uint32_t TMEM_COL_O  = TMEM_COL_P + TMEM_COLS_P;
+    constexpr uint32_t TMEM_COL_O  = TMEM_COL_S + TMEM_COLS_S;
     constexpr uint32_t TMEM_COLS_O = head_dim;  // f32: one column per element
 
     // Right-sized allocation: an SM owns 512 TMEM columns total, so asking for
     // all 512 lets only one CTA hold TMEM at a time and the second resident CTA
     // stalls inside tcgen05.alloc. tcgen05.alloc takes a power of two in
-    // [32, 512]; the plan needs 224 columns at head_dim=64 (-> 256, so two CTAs
-    // fit: 1.19-1.64x on B200) and 288 at head_dim=128 (-> 512, unchanged).
+    // [32, 512]; with P folded into S the plan needs 192 columns at head_dim=64
+    // and 256 at head_dim=128, so both round up to 256 and both fit two CTAs.
     // Numbers and method in test/HARDWARE_CHECKLIST.md section 5f.
     constexpr uint32_t TMEM_COLS_NEEDED = TMEM_COL_O + TMEM_COLS_O;
     static_assert(TMEM_COLS_NEEDED > 128 && TMEM_COLS_NEEDED <= 512,
                   "TMEM budget exceeded, or small enough that the round-up below is too coarse");
     constexpr uint32_t TMEM_COLS_TOTAL = (TMEM_COLS_NEEDED <= 256) ? 256 : 512;
-    static_assert(TMEM_COL_P >= TMEM_COL_S + TMEM_COLS_S && TMEM_COL_O >= TMEM_COL_P + TMEM_COLS_P,
-                  "TMEM regions must not overlap");
+    static_assert(TMEM_COL_P >= TMEM_COL_S && TMEM_COL_P + TMEM_COLS_P <= TMEM_COL_S + TMEM_COLS_S,
+                  "P must stay inside the S region it aliases");
+    static_assert(TMEM_COL_O >= TMEM_COL_S + TMEM_COLS_S, "O must not overlap S (nor P inside it)");
 
     // --- derived tile counts ---
     constexpr uint32_t num_tiles_qk_inner = head_dim / 32;  // K=32 elems per kind::i8 step
@@ -460,7 +476,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
         // ---- feed P to the PV MMA ----
         if constexpr (!PV_FROM_SMEM) {
-            // TS path: store P into TMEM (32 cols, one warp-collective st)
+            // TS path: store P into TMEM (32 cols, one warp-collective st).
+            // These columns alias S[32,64), already drained into RS_f32 above.
             tcgen05::tmem_st_32x32b_x32(tmem_row_base + TMEM_COL_P, RP_u32);
             tcgen05::tmem_st_wait();
         }

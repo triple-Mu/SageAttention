@@ -31,8 +31,8 @@ CTA_K = 128
 NUM_THREADS = 128
 
 TMEM_COL_S = 0
-TMEM_COL_P = CTA_K            # 128
-TMEM_COL_O = CTA_K + CTA_K // 4  # 160
+TMEM_COL_P = 32               # P aliases S columns [32, 64)
+TMEM_COL_O = CTA_K            # 128
 
 
 def tmem_addr(lane, col):
