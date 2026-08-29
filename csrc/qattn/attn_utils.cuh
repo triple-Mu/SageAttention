@@ -119,8 +119,8 @@ __device__ __forceinline__ void load_global_to_shared(T**                       
 // keeps whatever was there, which is safe wherever the value is masked out of
 // an *integer* product (the QK path) and dangerous where it reaches an fp16
 // multiply: the masked probability is exactly 0, and 0 * NaN is NaN, so one
-// stale half in the V tile poisons a whole output row. The varlen kernels
-// zero-fill V for that reason.
+// stale half in the V tile poisons a whole output row. V loads must therefore
+// pass kFillZero.
 template<uint32_t                    global_to_shared_line_lanes,
          uint32_t                    global_to_shared_copy_lines_per_warp_per_iter,
          uint32_t                    smem_iters_row,
