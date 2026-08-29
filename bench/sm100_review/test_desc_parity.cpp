@@ -23,7 +23,7 @@
 //
 // Build (container, CUTLASS from the vendored pytorch third_party checkout):
 //   g++ -std=c++17 -O2 -I<cutlass>/include -I/usr/local/cuda/include \
-//       tests/test_desc_parity.cpp -o test_desc_parity     (or nvcc -x cu)
+//       bench/sm100_review/test_desc_parity.cpp -o test_desc_parity     (or nvcc -x cu)
 //
 // Note: cute::UMMA::make_umma_desc calls cast_smem_ptr_to_uint, whose host
 // fallback prints "ERROR: cast_smem_ptr_to_uint not supported but used." and

@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                   "smem budget exceeded (sm100 CTA limit)");
 
     // --- smem descriptor parameters (K-major canonical layouts; parity-tested
-    //     against cute::UMMA::make_umma_desc in tests/test_desc_parity.cpp) ---
+    //     against cute::UMMA::make_umma_desc in bench/sm100_review/test_desc_parity.cpp) ---
     constexpr tcgen05::SmemSwizzleMode QK_SWIZZLE =
         (head_dim == 128) ? tcgen05::SmemSwizzleMode::kSwizzle128B : tcgen05::SmemSwizzleMode::kSwizzle64B;
     constexpr uint32_t                 QK_SBO    = 8 * head_dim;  // 8-row swizzle-atom pitch (bytes)
@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint32_t q_idx = cta_idx_q * CTA_Q + row_id;
 
     // mbarrier phase bits (all barriers complete exactly once per KV tile;
-    // see docs/barrier_ledger.md)
+    // see bench/sm100_review/barrier_ledger.md)
     int k_phase = 0, v_phase = 0, s_phase = 0, o_phase = 0;
 
     // -------------------------------------------------------------------------

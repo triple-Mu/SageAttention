@@ -23,7 +23,7 @@
 #   4. PV_FROM_SMEM twin: the kernel's swizzled smem write of P vs the
 #      canonical CU_TENSOR_MAP_SWIZZLE_128B layout that sK/sV are stored in
 #      (whose K-major descriptor parameters are bit-for-bit parity-tested in
-#      tests/test_desc_parity.cpp) -> the SS twin consumes P through the same
+#      bench/sm100_review/test_desc_parity.cpp) -> the SS twin consumes P through the same
 #      proven layout/descriptor pair.
 
 CTA_Q = 128
