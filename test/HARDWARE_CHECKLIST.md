@@ -823,6 +823,7 @@ operand**,写完都要过一条 `fence.proxy.async.shared::cta`;TMA 填的 buffe
 |---|---|---|---|
 | C-8 QMMA.SF go/no-go | sm120 | `bash bench/microbench/run_microbench.sh`,看 QMMA.SF(fp32 accum)相对 f8f8f32 的比率;同时记录 f8f8f16:f8f8f32 | full-rate → 立项 sm120 v2(block-scaled mma);f8f8f16 与 f8f8f32 同速 → 退役 fp32+fp16 路径。**已采数,见下表** |
 | H1/H4 sm90 wgmma 异步化 | H100/H200 | `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier` | **按实验证据关闭,见下节**。重叠四件套已在 `cutedsl-sage-sm90` 上全部实测判负;提高 occupancy 的替代方向也判负 |
+| sm90 行和交给 tensor core | H200 | `bench/sm90_rowsum/bench_rowsum.py` 双向 A/B | **判负,见下节**。d64 慢 7.3~7.8%、d128 慢 17%,三个变体零个点变快 |
 
 C-8 实测(RTX PRO 6000 Blackwell,110 SM,nvcc 13.3,2026-08-29):
 
@@ -906,6 +907,75 @@ sm120 上的同款教训的 sm90 版本——d128 想要 occupancy 就得付 spi
 `sm__pipe_tensor_op_imma_cycles_active` = **22.68%**(仅 imma 子管线),
 比值正好 2.000——int8 QK 走 imma、fp8 PV 走另一半,各占一半 tensor cycles。
 判断「tensor pipe 是否饱和」该看 45.35% 这个数,结论仍是**未过半**。
+
+### sm90 行和交给 tensor core —— 判负(2026-08-30,H200 GPU 5)
+
+`cutedsl-sage-sm90` 的 `c78c486` 在 DSL 侧把 online softmax 的行和从 CUDA core 的
+FADD 归约换成 e4m3 wgmma(B 是全 1 的 tile),d64 实测 −2.1%、96/96 全快。同一想法
+搬到本仓的 CUDA kernel 上,**三个变体全部变慢**,不落地。
+
+**前验(通过)**:`bench/sm90_rowsum/probe_mma_layout.cu` 把同一份 `RS_f32_to_f8`
+输出同时喂给 wgmma 的 RS 型 A 操作数和 `mma.sync.m16n8k32` 的 A 操作数。mma 的行和
+与 host 端 e4m3 量化行和**逐位相同**(maxrel 0);wgmma(B 全 1)与 mma 差 1.66e-4,
+那是 Hopper wgmma fp8 累加器尾数比 mma.sync 短,不是布局错位。所以「wgmma RS 型 A
+布局 == mma.m16n8k32 A 布局」成立,方案不必改走 smem 全 1 tile。
+
+顺带挖出一个潜伏 bug:`mma::rowsum_f8f8f32` 用 `_` 丢弃 D 的第 1、3 列,**ptxas 在
+sm_90a 上拒收**(`Result discard mode is not allowed for instruction 'add'`),
+sm_89 上接受。这个函数此前从没被任何 arch 实例化过(sm89 launcher 只用 kCudaCore
+分母),所以没人撞到。已改成两个局部 `.reg .f32` 承接——这是本轮唯一留下的代码改动。
+
+**A/B**:同卡独占、CUDA event min-of-20、A→B 与 B→A 各一轮、全表几何均值;
+kernel-only 打 `qattn_sm90_..._fuse_v_scale_attn_inst_buf`;每档 28 点
+= seq{1k,2k,4k,8k,16k,32k,64k} × gran{per_warp,per_thread} × causal{0,1},
+batch/heads 随 seq 缩(64k 用 1×8)。
+
+| 变体 | 档 | r1 | r2 | 变快/变慢 |
+|---|---|---|---|---|
+| 分母上 tensor core(mma 发在 V barrier 之前)+ rowmax 树 | d64 | 1.0775 | 1.0725 | 0/28、0/28 |
+| 同上,mma 改发在 `commit_batch` 与 `wait<0>` 之间 + `__launch_bounds__(128,4)` | d64 | 1.0813 | 1.0809 | 0/28、0/28 |
+| 只做 rowmax 树形化,分母仍在 CUDA core | d64 | 1.0113 | 1.0063 | 3/25、4/24 |
+| 分母上 tensor core | d128 | 1.1694 | 1.1728 | 0/28、0/28 |
+| 对照:d128 kernel 逐字未改 | d128 | 1.0012 | 1.0009 | 13/15、10/18 |
+
+比值 = 新 / 基线,大于 1 是变慢。最后一行是噪声标定:同一份 d128 机器码两轮几何
+均值 1.0012 / 1.0009,单点落在 0.977~1.020。d64 最好的那个点是 1.034,**比对照组
+最差的单点还差**,所以这个量级不用讨论显著性。
+
+**归因**:rowmax 树形化自己就要 0.6~1.1%(它把 num_tiles_k 个 tile max 同时留活,
+d128 上多占 1 个寄存器);剩下的 6.5% 是那 4 条 `mma.sync.m16n8k32` 本身。两个发射
+位置都试过,**发在 wgmma 的 commit/wait 空档里反而更差 0.9pp**——DSL 那条「同组提交
+省 2.8%」的教训不能照搬,因为它的行和是 wgmma、和 PV 同组,而这里是 warp 级 HMMA
+插进在飞的 wgmma 中间,两类指令在同一条 tensor pipe 上要排空重灌。**要复现 DSL 的
+收益,行和也得是 wgmma(B = 1 KB 全 1 smem tile),不是 mma.sync**——另立项。
+
+**寄存器**(`cuobjdump -res-usage`;d64 的生产实例是 `fuse_v_scale=true`):
+
+| 变体 | d64 | d128 |
+|---|---|---|
+| 基线 | 128 × 48 | 167 × 12、168 × 36 |
+| mma 发在 V barrier 之前 | 128 × 44、129 × 2、168 × 2(后 4 个都是 varlen per_thread causal) | 与基线相同 |
+| mma 发在 commit/wait 空档 | dense 138~162 × 16、其余 128 | 与基线相同 |
+| 空档 + `__launch_bounds__(128, 4)` | 128 × 48,但 12 个实例 4~16 B spill | 6 个 167→168 |
+| d128 也开 | — | 173~209,3 CTA/SM 掉到 2 |
+
+d64 基线正好卡在 128 = 4 CTA/SM 的线上,加 mma 就漂过去。把寄存器按回 128 之后
+那一版仍然是最慢的,所以 occupancy 不是主因。
+
+**精度**(顺带证实 DSL 的说法):分母从量化前 fp32 P 换成量化后 e4m3 P 之后,d64
+对 fp32 SDPA 的指标全线略好——10 个形状 cos_sim 无一下降,平均 0.999343 → 0.999347,
+rel_l1 平均 0.03687 → 0.03679;d128 逐位不变。`return_lse` 漂移(d64,单位 nat):
+中位 ~1e-3,p99 3~9e-3,最大 2.4e-2,集中在 causal 的前几行(rows[0,32) 1.9e-2 vs
+rows[512,1024) 6.0e-3)——短行的分母只由少数几个 e4m3 值相加,单值 3% 级的量化误差
+没被平均掉。ring attention 这类跨 chunk 比 lse 的消费方要知道这个量级;本轮判负,
+这条漂移没有进仓。
+
+**作用面核对**:改动版对 `/workspace/sage-golden-sm90`(1488 case)的 diff 精确落在
+sm90 head_dim=64 一档——attn 198 个、e2e 20 个,共 218 个;d96/d128、sm80 段、quant
+段、equiv 段逐位不变,pytest 429 passed / 213 skipped。
+
+原始数据 `bench/sm90_rowsum/data/*.jsonl`,采集脚本 `bench/sm90_rowsum/bench_rowsum.py`
+与 `bench/sm90_rowsum/acc_rowsum.py`,前验 kernel `bench/sm90_rowsum/probe_mma_layout.cu`。
 
 ## 7. 完成后的收尾
 

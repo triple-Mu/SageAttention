@@ -640,11 +640,20 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s)
 __device__ __forceinline__ void rowsum_f8f8f32(float* d, uint32_t* s)
 {
 #ifdef MMA_F8F8F32_M16N8K32_ENABLED
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                 "{%0,  _,  %1,  _},"
+    // Columns 1 and 3 of the n8 tile carry the same row sum as 0 and 2 and are
+    // thrown away. They go to two locally declared registers rather than to the
+    // `_` discard sink the f16 rowsum above uses: ptxas accepts `_` here for
+    // sm_89 but rejects it for sm_90a ("Result discard mode is not allowed for
+    // instruction 'add'"), and this function had never been compiled for sm_90a
+    // before - the sm89 kernel only instantiates its kCudaCore denominator path.
+    asm volatile("{\n"
+                 ".reg .f32 rowsum_dis1, rowsum_dis3;\n"
+                 "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,  rowsum_dis1,  %1,  rowsum_dis3},"
                  "{%2,  %3,  %4,  %5},"
                  "{%6,  %7},"
                  "{%8,  0.,  %9,  0.};\n"
+                 "}\n"
                  : "=f"(d[0]), "=f"(d[1])
                  : "r"(s[0]),
                    "r"(s[1]),
