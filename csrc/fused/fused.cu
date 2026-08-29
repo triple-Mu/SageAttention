@@ -29,13 +29,30 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// sm90/sm100 schedule 2048 threads per SM, so the 1024-thread quant blocks
+// only co-schedule two CTAs up to 32 registers; the varlen/int64 address math
+// pushed the sub_mean instance to 38-40 registers, halving occupancy (1.8x on
+// B200 quant_k). Pin those blocks back to two CTAs: the baseline ran the same
+// loop body in 32 registers, so the cap only re-serializes the one-off pointer
+// setup. The other archs top out at 1536 threads per SM, where a 1024-thread
+// block can never co-schedule anyway - they keep an unannotated kernel.
+// The (1024, 1) arm also lowers the register cap of the sub-1024-thread
+// instances to 64; that is acceptable collateral because fill_tiles pins the
+// 128-token tiles on these two archs, so those instances have no launch path
+// here. The other archs get no annotation at all and keep byte-identical SASS.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000)
+#define SAGE_QUANT_BOUNDS(threads) __launch_bounds__(1024, (threads) == 1024 ? 2 : 1)
+#else
+#define SAGE_QUANT_BOUNDS(threads)
+#endif
+
 template<uint32_t head_dim,
          uint32_t CTA_TOKENS,
          uint32_t num_pack_per_thread = 1,
          bool     has_sm_scale        = false,
          bool     sub_mean            = false,
          typename T>
-__global__ void QuantInt8Kernel(T* __restrict__ input,
+__global__ void SAGE_QUANT_BOUNDS(CTA_TOKENS*(head_dim / 8) / num_pack_per_thread) QuantInt8Kernel(T* __restrict__ input,
                                 T* __restrict__ mean,
                                 int8_t* __restrict__ output,
                                 float* __restrict__ scale,

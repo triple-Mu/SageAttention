@@ -77,6 +77,23 @@ struct PerThreadVec {
 constexpr uint32_t kQuantCacheBytes = 128;
 constexpr uint32_t kQuantCacheRows  = 16;
 
+// sm90/sm100 schedule 2048 threads per SM, so the 128-thread K warp tiles only
+// stay at full occupancy up to 32 registers; the varlen/int64 address math
+// pushed the warp_k=128 instance (the one these archs dispatch) to 39-40 and
+// cost 21% (H200) on quant_k. Pin it back: the baseline ran the same loop body
+// in 32 registers, so the cap only re-serializes the one-off pointer setup.
+// The other archs top out at 1536 threads per SM, putting their cliff at 42
+// registers - no instance is near it, so they keep an unannotated kernel.
+// The (1024, 1) arm also lowers the register cap of the warp_k=64 instances
+// to 64; that is acceptable collateral because fill_tiles pins warp_k=128 on
+// these two archs, so the 64-token instances have no launch path here. The
+// other archs get no annotation at all and keep byte-identical SASS.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000)
+#define SAGE_QUANT_K_BOUNDS(WARP_TOKENS) __launch_bounds__(1024, (WARP_TOKENS) == 128 ? 2 : 1)
+#else
+#define SAGE_QUANT_K_BOUNDS(WARP_TOKENS)
+#endif
+
 // Query: warp warp_id of a WARP_TOKENS-token warp tile owns the rows
 // {tile*WARP_TOKENS + r*8 + warp_id}, r in [0, WARP_TOKENS/8); one scale over
 // all of them, stored at [tile*8 + warp_id].
@@ -195,7 +212,7 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 // key - key_mean smoothing subtraction (done in the input dtype, matching the
 // torch sub the Triton path performs beforehand).
 template<uint32_t head_dim, uint32_t WARP_TOKENS, bool sub_mean, typename T>
-__global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
+__global__ void SAGE_QUANT_K_BOUNDS(WARP_TOKENS) QuantPerThreadKInt8Kernel(T* __restrict__ input,
                                           T* __restrict__ mean,
                                           int8_t* __restrict__ output,
                                           float* __restrict__ scale,
