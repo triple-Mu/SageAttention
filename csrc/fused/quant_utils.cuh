@@ -33,8 +33,8 @@ struct QuantLayout {
     int64_t head_dim;
     int64_t num_tokens;
     int64_t num_heads;
-    int64_t stride_bz_input, stride_seq_input, stride_h_input;
-    int64_t stride_bz_output, stride_seq_output, stride_h_output;
+    int64_t stride_batch_input, stride_seq_input, stride_h_input;
+    int64_t stride_batch_output, stride_seq_output, stride_h_output;
 };
 
 // The CHECK_* sequence and tensor_layout-dependent sizes/strides common to
@@ -76,10 +76,10 @@ inline QuantLayout parse_quant_layout(const torch::Tensor& input,
     CHECK_DIMS(scale, 3);
 
     QuantLayout l;
-    l.batch_size       = input.size(0);
-    l.head_dim         = input.size(3);
-    l.stride_bz_input  = input.stride(0);
-    l.stride_bz_output = output.stride(0);
+    l.batch_size          = input.size(0);
+    l.head_dim            = input.size(3);
+    l.stride_batch_input  = input.stride(0);
+    l.stride_batch_output = output.stride(0);
 
     if (tensor_layout == 0) {
         l.num_tokens        = input.size(1);
@@ -115,7 +115,7 @@ struct VTLayout {
     int64_t head_dim;
     int64_t num_heads;
     int64_t padded_num_tokens;
-    int64_t stride_bz, stride_d, stride_h;
+    int64_t stride_batch, stride_d, stride_h;
 };
 
 inline VTLayout parse_vt_layout(const torch::Tensor& t, int tensor_layout)
@@ -123,7 +123,7 @@ inline VTLayout parse_vt_layout(const torch::Tensor& t, int tensor_layout)
     VTLayout l;
     l.batch_size        = t.size(0);
     l.padded_num_tokens = t.size(3);
-    l.stride_bz         = t.stride(0);
+    l.stride_batch      = t.stride(0);
     if (tensor_layout == 0) {
         l.head_dim  = t.size(1);
         l.num_heads = t.size(2);
@@ -159,13 +159,13 @@ inline QuantLayout check_quant_layout(const torch::Tensor& input,
 // written against (CHECK_SHAPE stringifies these spellings into its error
 // messages).
 #define SAGEATTN_QUANT_LAYOUT_LOCALS(L)                                                                                \
-    const int64_t  batch_size        = (L).batch_size;                                                                 \
-    const int64_t  head_dim          = (L).head_dim;                                                                   \
-    const int64_t  num_tokens        = (L).num_tokens;                                                                 \
-    const int64_t  num_heads         = (L).num_heads;                                                                  \
-    const int64_t  stride_bz_input   = (L).stride_bz_input;                                                            \
-    const uint32_t stride_seq_input  = static_cast<uint32_t>((L).stride_seq_input);                                    \
-    const int64_t  stride_h_input    = (L).stride_h_input;                                                             \
-    const int64_t  stride_bz_output  = (L).stride_bz_output;                                                           \
-    const uint32_t stride_seq_output = static_cast<uint32_t>((L).stride_seq_output);                                   \
-    const int64_t  stride_h_output   = (L).stride_h_output
+    const int64_t  batch_size          = (L).batch_size;                                                               \
+    const int64_t  head_dim            = (L).head_dim;                                                                 \
+    const int64_t  num_tokens          = (L).num_tokens;                                                               \
+    const int64_t  num_heads           = (L).num_heads;                                                                \
+    const int64_t  stride_batch_input  = (L).stride_batch_input;                                                       \
+    const uint32_t stride_seq_input    = static_cast<uint32_t>((L).stride_seq_input);                                  \
+    const int64_t  stride_h_input      = (L).stride_h_input;                                                           \
+    const int64_t  stride_batch_output = (L).stride_batch_output;                                                      \
+    const uint32_t stride_seq_output   = static_cast<uint32_t>((L).stride_seq_output);                                 \
+    const int64_t  stride_h_output     = (L).stride_h_output

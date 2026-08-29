@@ -50,12 +50,12 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
                                           const float* __restrict__ V_scale,
                                           DTypeOut* O,
                                           float* __restrict__ Lse,
-                                          const int64_t  stride_bz_o,
+                                          const int64_t  stride_batch_o,
                                           const int64_t  stride_h_o,
                                           uint32_t       stride_seq_o,
                                           const uint32_t qo_len,
                                           const uint32_t kv_len,
-                                          const uint32_t num_kv_groups,
+                                          const uint32_t qo_per_kv_head,
                                           float          sm_scale)
 {
     static_assert(NUM_THREADS == 128);
@@ -71,10 +71,10 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     constexpr uint32_t num_tiles_pv_inner = CTA_K / 32;
 
     const uint32_t batch_id     = blockIdx.z;
-    const uint32_t bx           = blockIdx.x;
+    const uint32_t cta_idx_q    = blockIdx.x;
     const uint32_t head_id      = blockIdx.y;
     const uint32_t num_qo_heads = gridDim.y;
-    const uint32_t kv_head_id   = head_id / num_kv_groups;
+    const uint32_t kv_head_id   = head_id / qo_per_kv_head;
 
     sm_scale *= math::log2e;
 
@@ -87,57 +87,57 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
     int32_t RS[num_tiles_q][num_tiles_k][8];
     float   RO[num_tiles_q][num_tiles_v][8];
-    float   m[num_tiles_q][2];
-    float   d[num_tiles_q][2];
+    float   row_max[num_tiles_q][2];
+    float   denom[num_tiles_q][2];
 
     // Q scale is read once: the whole index may live in 64-bit. K scale is read
     // once per KV tile, so it is split into a 64-bit base pointer plus a 32-bit
     // running offset that the main loop advances.
     int64_t      q_scale_idx;
-    const float* K_scale_base;
+    const float* K_scale_base_ptr;
     uint32_t     k_scale_off;
 
     if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_block_q = gridDim.x;
-        q_scale_idx                = static_cast<int64_t>(batch_id) * num_qo_heads * num_block_q
-                      + static_cast<int64_t>(head_id) * num_block_q + bx;
+        const uint32_t num_ctas_q = gridDim.x;
+        q_scale_idx               = static_cast<int64_t>(batch_id) * num_qo_heads * num_ctas_q
+                      + static_cast<int64_t>(head_id) * num_ctas_q + cta_idx_q;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
-        const uint32_t num_warp_block_q = gridDim.x * 4;
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_block_q
-                      + static_cast<int64_t>(head_id) * num_warp_block_q + bx * 4 + warp_idx;
+        const uint32_t num_warp_tiles_q = gridDim.x * 4;
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
+                      + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * 4 + warp_idx;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
-        const uint32_t num_warp_block_q = gridDim.x * 4;
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_block_q * 8)
-                      + static_cast<int64_t>(head_id) * (num_warp_block_q * 8) + bx * (4 * 8) + warp_idx * 8
+        const uint32_t num_warp_tiles_q = gridDim.x * 4;
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
+                      + static_cast<int64_t>(head_id) * (num_warp_tiles_q * 8) + cta_idx_q * (4 * 8) + warp_idx * 8
                       + lane_id / 4;
     }
 
     if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
-        const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * num_block_k
-                       + static_cast<int64_t>(head_id / num_kv_groups) * num_block_k;
+        const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
         k_scale_off = 0;
     }
     else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-        const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * (num_block_k * 4)
-                       + static_cast<int64_t>(head_id / num_kv_groups) * (num_block_k * 4);
+        const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
         k_scale_off = lane_id % 4;
     }
 
     constexpr uint32_t k_scale_advance_offset =
         (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
-    uint32_t Q_idx_lane_base = bx * CTA_Q + warp_idx * 16 + lane_id / 4;
+    uint32_t Q_idx_lane_base = cta_idx_q * CTA_Q + warp_idx * 16 + lane_id / 4;
 
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-        m[fq][0] = -5000000.0f;
-        m[fq][1] = -5000000.0f;
-        d[fq][0] = 1.0f;
-        d[fq][1] = 1.0f;
+        row_max[fq][0] = -5000000.0f;
+        row_max[fq][1] = -5000000.0f;
+        denom[fq][0]   = 1.0f;
+        denom[fq][1]   = 1.0f;
     }
 
 #pragma unroll
@@ -145,8 +145,8 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-                RO[fq][fv][k] = 0.0f;
+            for (uint32_t e = 0; e < 8; e++) {
+                RO[fq][fv][e] = 0.0f;
             }
         }
     }
@@ -168,7 +168,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         expect_bytes<(CTA_Q * head_dim) * sizeof(int8_t)>(&barrier_Q);
         expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
         expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
-        load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, bx * CTA_Q, head_id, batch_id);
+        load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, cta_idx_q * CTA_Q, head_id, batch_id);
         load_async_4D(sK, &tensorMapK, &barrier_K, 0, 0, kv_head_id, batch_id);
         load_async_4D(sV, &tensorMapV, &barrier_V, 0, 0, kv_head_id, batch_id);
     }
@@ -180,13 +180,13 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     wait(&barrier_Q, 0);
 
     const uint32_t num_iterations =
-        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (bx + 1) * CTA_Q) : kv_len, CTA_K);
+        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
 
     int p = 1;
     for (uint32_t iter = 1; iter < num_iterations; iter++) {
         p ^= 1;
 
-        float dequant_scale = q_scale * K_scale_base[k_scale_off + (iter - 1) * k_scale_advance_offset];
+        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (iter - 1) * k_scale_advance_offset];
         sm_scale            = original_sm_scale * dequant_scale;
 
         // wait for K
@@ -219,26 +219,26 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                for (uint32_t e = 0; e < 8; e++) {
+                    RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]);
                 }
             }
         }
 
-        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, row_max, denom, sm_scale);
 
-        // accumulate d on thread basis
+        // accumulate denom on thread basis
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-                d[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
-                d[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
+                denom[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
+                denom[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
             }
         }
 
         uint32_t RS_f8[num_tiles_q][num_tiles_pv_inner][4];
-        RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+        RS_f32_to_f8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
         // wait for V
         wait(&barrier_V, p);
@@ -262,8 +262,8 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
             for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    RO[fq][fv][k] += RO_temp[fq][fv][k];
+                for (uint32_t e = 0; e < 8; e++) {
+                    RO[fq][fv][e] += RO_temp[fq][fv][e];
                 }
             }
         }
@@ -278,7 +278,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     {
         p ^= 1;
 
-        float dequant_scale = q_scale * K_scale_base[k_scale_off + (num_iterations - 1) * k_scale_advance_offset];
+        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (num_iterations - 1) * k_scale_advance_offset];
         sm_scale            = original_sm_scale;
 
         // wait for K
@@ -305,8 +305,8 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+                for (uint32_t e = 0; e < 8; e++) {
+                    RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]) * dequant_scale;
                 }
             }
         }
@@ -317,41 +317,41 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    const uint32_t q_idx = Q_idx_lane_base + fq * 64 + 8 * ((k % 4) / 2);
-                    const uint32_t k_idx =
-                        (num_iterations - 1) * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (k / 4) + k % 2;
+                for (uint32_t e = 0; e < 8; e++) {
+                    const uint32_t q_idx = Q_idx_lane_base + fq * 64 + 8 * ((e % 4) / 2);
+                    const uint32_t kv_idx =
+                        (num_iterations - 1) * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4) + e % 2;
 
                     bool is_out_of_bounds;
 
                     if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (k_idx > q_idx) || (k_idx >= kv_len);
+                        is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= kv_len);
                     }
                     else {
-                        is_out_of_bounds = (k_idx >= kv_len);
+                        is_out_of_bounds = (kv_idx >= kv_len);
                     }
 
                     if (is_out_of_bounds) {
-                        RS_f32[fq][fk][k] = -5000000.0f;
+                        RS_f32[fq][fk][e] = -5000000.0f;
                     }
                 }
             }
         }
 
-        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, row_max, denom, sm_scale);
 
-        // accumulate d on thread basis
+        // accumulate denom on thread basis
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-                d[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
-                d[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
+                denom[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
+                denom[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
             }
         }
 
         uint32_t RS_f8[num_tiles_q][num_tiles_pv_inner][4];
-        RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+        RS_f32_to_f8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
         // wait for V
         wait(&barrier_V, p);
@@ -375,20 +375,20 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
             for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    RO[fq][fv][k] += RO_temp[fq][fv][k];
+                for (uint32_t e = 0; e < 8; e++) {
+                    RO[fq][fv][e] += RO_temp[fq][fv][e];
                 }
             }
         }
     }
 
-    normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
+    normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, row_max, denom);
 
     if constexpr (fuse_v_scale) {
         float        v_scale[4];
         const float* V_scale_base_ptr = V_scale
-                                        + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * head_dim
-                                        + static_cast<int64_t>(head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
+                                        + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
+                                        + static_cast<int64_t>(head_id / qo_per_kv_head) * head_dim + (lane_id % 4) * 2;
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
             ((float2*)v_scale)[0] = *((float2*)(V_scale_base_ptr + fv * 16));
@@ -408,8 +408,9 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         }
     }
 
-    DTypeOut* O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_bz_o + static_cast<int64_t>(head_id) * stride_h_o
-                           + static_cast<int64_t>(bx * CTA_Q + warp_idx * 16 + (lane_id / 4)) * stride_seq_o
+    DTypeOut* O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
+                           + static_cast<int64_t>(head_id) * stride_h_o
+                           + static_cast<int64_t>(cta_idx_q * CTA_Q + warp_idx * 16 + (lane_id / 4)) * stride_seq_o
                            + static_cast<int64_t>((lane_id % 4) * 2);
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -448,14 +449,14 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
         if constexpr (return_lse) {
             // only works for CTA_Q = 64
-            uint32_t lse_idx      = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + 16 * warp_idx;
+            uint32_t lse_idx      = cta_idx_q * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + 16 * warp_idx;
             float*   lse_lane_ptr = Lse + static_cast<int64_t>(batch_id) * (static_cast<int64_t>(qo_len) * num_qo_heads)
                                   + static_cast<int64_t>(head_id) * qo_len + lse_idx;
             uint32_t fq = (lane_id % 4) / 2;
-            uint32_t k  = (lane_id % 4) % 2;
+            uint32_t e  = (lane_id % 4) % 2;
 
             if (lse_idx < qo_len && (lane_id % 4) < 2) {
-                lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]);
+                lse_lane_ptr[0] = (math::ptx_log2(denom[fq][e]) + row_max[fq][e]);
             }
         }
     }
@@ -533,7 +534,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                                                                   num_qo_heads,
                                                                   qo_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_q,
+                                                                  stride_batch_q,
                                                                   stride_h_q,
                                                                   stride_seq_q);
                         CUtensorMap tma_map_K =
@@ -542,7 +543,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   kv_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_k,
+                                                                  stride_batch_k,
                                                                   stride_h_k,
                                                                   stride_seq_k);
                         CUtensorMap tma_map_V =
@@ -551,11 +552,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   HEAD_DIM,
                                                                   value.size(3),
-                                                                  stride_bz_v,
+                                                                  stride_batch_v,
                                                                   stride_h_v,
                                                                   stride_d_v);
 
-                        auto*  kernel   = qk_int8_sv_f8_attn_kernel<CTA_Q,
+                        auto*  kernel     = qk_int8_sv_f8_attn_kernel<CTA_Q,
                                                                  CTA_K,
                                                                  NUM_THREADS,
                                                                  HEAD_DIM,
@@ -565,12 +566,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                                                                  mask_mode,
                                                                  RETURN_LSE,
                                                                  false>;
-                        size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + CTA_K * HEAD_DIM * sizeof(int8_t);
-                        sage::set_max_dynamic_smem_once(kernel, sMemSize, query.get_device());
+                        size_t smem_bytes = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + CTA_K * HEAD_DIM * sizeof(int8_t);
+                        sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-                        kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
+                        kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
                             tma_map_Q,
                             tma_map_K,
                             tma_map_V,
@@ -579,12 +580,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                             nullptr,
                             reinterpret_cast<DTypeOut*>(output.data_ptr()),
                             (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_h_o,
                             stride_seq_o,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
+                            qo_per_kv_head,
                             sm_scale);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
@@ -671,7 +672,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                                                   num_qo_heads,
                                                                   qo_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_q,
+                                                                  stride_batch_q,
                                                                   stride_h_q,
                                                                   stride_seq_q);
                         CUtensorMap tma_map_K =
@@ -680,7 +681,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                                                   num_kv_heads,
                                                                   kv_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_k,
+                                                                  stride_batch_k,
                                                                   stride_h_k,
                                                                   stride_seq_k);
                         CUtensorMap tma_map_V =
@@ -689,11 +690,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                                                   num_kv_heads,
                                                                   HEAD_DIM,
                                                                   value.size(3),
-                                                                  stride_bz_v,
+                                                                  stride_batch_v,
                                                                   stride_h_v,
                                                                   stride_d_v);
 
-                        auto*  kernel   = qk_int8_sv_f8_attn_kernel<CTA_Q,
+                        auto*  kernel     = qk_int8_sv_f8_attn_kernel<CTA_Q,
                                                                  CTA_K,
                                                                  NUM_THREADS,
                                                                  HEAD_DIM,
@@ -703,12 +704,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                                                  mask_mode,
                                                                  RETURN_LSE,
                                                                  true>;
-                        size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + CTA_K * HEAD_DIM * sizeof(int8_t);
-                        sage::set_max_dynamic_smem_once(kernel, sMemSize, query.get_device());
+                        size_t smem_bytes = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + CTA_K * HEAD_DIM * sizeof(int8_t);
+                        sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-                        kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
+                        kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
                             tma_map_Q,
                             tma_map_K,
                             tma_map_V,
@@ -717,12 +718,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                             reinterpret_cast<float*>(value_scale.data_ptr()),
                             reinterpret_cast<DTypeOut*>(output.data_ptr()),
                             (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_h_o,
                             stride_seq_o,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
+                            qo_per_kv_head,
                             sm_scale);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });

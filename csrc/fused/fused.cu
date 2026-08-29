@@ -35,7 +35,7 @@ enum class QuantType {
 };
 
 template<uint32_t head_dim,
-         uint32_t BLOCK_SIZE,
+         uint32_t CTA_TOKENS,
          uint32_t num_pack_per_thread = 1,
          bool     has_sm_scale        = false,
          bool     sub_mean            = false,
@@ -46,15 +46,15 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
                                 float* __restrict__ scale,
                                 float          sm_scale,
                                 const uint32_t num_tokens,
-                                const int64_t  stride_bz_input,
+                                const int64_t  stride_batch_input,
                                 const uint32_t stride_seq_input,
                                 const int64_t  stride_h_input,
-                                const int64_t  stride_bz_mean,
+                                const int64_t  stride_batch_mean,
                                 const int64_t  stride_h_mean,
-                                const int64_t  stride_bz_output,
+                                const int64_t  stride_batch_output,
                                 const uint32_t stride_seq_output,
                                 const int64_t  stride_h_output,
-                                const int64_t  stride_bz_scale,
+                                const int64_t  stride_batch_scale,
                                 const int64_t  stride_h_scale)
 {
     static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value,
@@ -77,19 +77,19 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
     uint32_t batch_id  = blockIdx.z;
     uint32_t thread_id = threadIdx.x;
 
-    uint32_t thread_base_token = bx * BLOCK_SIZE + thread_id / num_threads_per_token;
-    T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_bz_input
+    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
+    T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
                         + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    T* mean_ptr_base = mean + static_cast<int64_t>(batch_id) * stride_bz_mean
+    T* mean_ptr_base = mean + static_cast<int64_t>(batch_id) * stride_batch_mean
                        + static_cast<int64_t>(head_id) * stride_h_mean
                        + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_bz_output
+    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
                               + static_cast<int64_t>(head_id) * stride_h_output
                               + static_cast<int64_t>(thread_base_token) * stride_seq_output
                               + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    float* scale_ptr_base = scale + static_cast<int64_t>(batch_id) * stride_bz_scale
+    float* scale_ptr_base = scale + static_cast<int64_t>(batch_id) * stride_batch_scale
                             + static_cast<int64_t>(head_id) * stride_h_scale + static_cast<int64_t>(bx);
 
     if constexpr (sub_mean) {
@@ -100,7 +100,7 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
         }
     }
 
-    constexpr uint32_t iter_stride = BLOCK_SIZE / num_pack_per_thread;
+    constexpr uint32_t iter_stride = CTA_TOKENS / num_pack_per_thread;
 
 // load the data
 #pragma unroll
@@ -179,17 +179,17 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
     }
 }
 
-template<uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename T>
+template<uint32_t head_dim, uint32_t CTA_TOKENS, uint32_t num_pack_per_thread = 1, typename T>
 __global__ void SubMeanKernel(T* __restrict__ input,
                               T* __restrict__ mean,
                               half* __restrict__ output,
                               const uint32_t num_tokens,
-                              const int64_t  stride_bz_input,
+                              const int64_t  stride_batch_input,
                               const uint32_t stride_seq_input,
                               const int64_t  stride_h_input,
-                              const int64_t  stride_bz_mean,
+                              const int64_t  stride_batch_mean,
                               const int64_t  stride_h_mean,
-                              const int64_t  stride_bz_output,
+                              const int64_t  stride_batch_output,
                               const uint32_t stride_seq_output,
                               const int64_t  stride_h_output)
 {
@@ -213,22 +213,22 @@ __global__ void SubMeanKernel(T* __restrict__ input,
     uint32_t batch_id  = blockIdx.z;
     uint32_t thread_id = threadIdx.x;
 
-    uint32_t thread_base_token = bx * BLOCK_SIZE + thread_id / num_threads_per_token;
-    T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_bz_input
+    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
+    T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
                         + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    T* mean_ptr_base = mean + static_cast<int64_t>(batch_id) * stride_bz_mean
+    T* mean_ptr_base = mean + static_cast<int64_t>(batch_id) * stride_batch_mean
                        + static_cast<int64_t>(head_id) * stride_h_mean
                        + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    half* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_bz_output
+    half* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
                             + static_cast<int64_t>(head_id) * stride_h_output
                             + static_cast<int64_t>(thread_base_token) * stride_seq_output
                             + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
 
     *(float4*)(&mean_val[0]) = *(float4*)(mean_ptr_base);
 
-    constexpr uint32_t iter_stride = BLOCK_SIZE / num_pack_per_thread;
+    constexpr uint32_t iter_stride = CTA_TOKENS / num_pack_per_thread;
 
 // load the data
 #pragma unroll
@@ -255,14 +255,14 @@ __global__ void SubMeanKernel(T* __restrict__ input,
     }
 }
 
-template<uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero = false, bool permute = true, typename T>
+template<uint32_t head_dim, uint32_t CTA_TOKENS, bool pad_zero = false, bool permute = true, typename T>
 __global__ void TransposePadPermuteKernel(T* __restrict__ input,
                                           T* __restrict__ output,
                                           const uint32_t num_tokens,
-                                          const int64_t  stride_bz_input,
+                                          const int64_t  stride_batch_input,
                                           const uint32_t stride_seq_input,
                                           const int64_t  stride_h_input,
-                                          const int64_t  stride_bz_output,
+                                          const int64_t  stride_batch_output,
                                           const uint32_t stride_d_output,
                                           const int64_t  stride_h_output)
 {
@@ -272,32 +272,32 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
 
     constexpr uint32_t pack_size             = 8;  // float4 contains 8 half or 8 bfloat16
     uint32_t           num_threads_per_token = head_dim / pack_size;
-    uint32_t           num_threads_per_cta   = CTA_SIZE / pack_size;
+    uint32_t           num_threads_per_cta   = CTA_TOKENS / pack_size;
 
     uint32_t bx        = blockIdx.x;
     uint32_t head_id   = blockIdx.y;
     uint32_t batch_id  = blockIdx.z;
     uint32_t thread_id = threadIdx.x;
 
-    uint32_t thread_base_token = bx * CTA_SIZE + thread_id / num_threads_per_token;
+    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
 
-    T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_bz_input
+    T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
                         + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
-    T* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_bz_output
-                         + static_cast<int64_t>(head_id) * stride_h_output + static_cast<int64_t>(bx * CTA_SIZE)
+    T* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
+                         + static_cast<int64_t>(head_id) * stride_h_output + static_cast<int64_t>(bx * CTA_TOKENS)
                          + static_cast<int64_t>(thread_id % num_threads_per_cta * pack_size)
                          + static_cast<int64_t>(thread_id / num_threads_per_cta) * stride_d_output;
 
     // +8 halves of row padding: the transpose loop below reads
-    // shared_load[row][col] with col warp-uniform, so an unpadded row stride of
+    // smem_load_tile[row][col] with col warp-uniform, so an unpadded row stride of
     // head_dim*2 bytes (a multiple of 128) lands all 32 lanes in one bank
     // (32-way conflict, 8 serialized trips per tile). The pad must stay a
     // multiple of 8 halves (16B) to keep the cp.async row starts aligned, which
     // caps the improvement at 4-way instead of conflict-free.
-    __shared__ T shared_load[CTA_SIZE][head_dim + 8];
-    __shared__ T shared_store[head_dim][CTA_SIZE];
+    __shared__ T smem_load_tile[CTA_TOKENS][head_dim + 8];
+    __shared__ T smem_store_tile[head_dim][CTA_TOKENS];
 
     // permute == true: reorder the seq dimension within 16-token groups as
     // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15 to match the
@@ -318,28 +318,28 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
     constexpr cp_async::SharedMemFillMode fill_mode =
         pad_zero ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
     cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(
-        shared_load[smem_load_row] + thread_id % num_threads_per_token * pack_size,
+        smem_load_tile[smem_load_row] + thread_id % num_threads_per_token * pack_size,
         input_ptr_base,
         thread_base_token < num_tokens);
     cp_async::commit_group();
     cp_async::wait_group<0>();
     __syncthreads();
 
-    uint32_t smem_row_base   = thread_id % CTA_SIZE;
-    uint32_t smem_col_base   = thread_id / CTA_SIZE;
+    uint32_t smem_row_base   = thread_id % CTA_TOKENS;
+    uint32_t smem_col_base   = thread_id / CTA_TOKENS;
     uint32_t smem_col_stride = head_dim / 8;
 
     // TODO: use ldmatrix to do permutation
 #pragma unroll
     for (uint32_t i = 0; i < 8; i++) {
-        shared_store[smem_col_base + i * smem_col_stride][smem_row_base] =
-            shared_load[smem_row_base][smem_col_base + i * smem_col_stride];
+        smem_store_tile[smem_col_base + i * smem_col_stride][smem_row_base] =
+            smem_load_tile[smem_row_base][smem_col_base + i * smem_col_stride];
     }
 
     __syncthreads();
 
     *(float4*)(output_ptr_base) =
-        *(float4*)(&shared_store[thread_id / num_threads_per_cta][thread_id % num_threads_per_cta * pack_size]);
+        *(float4*)(&smem_store_tile[thread_id / num_threads_per_cta][thread_id % num_threads_per_cta * pack_size]);
 }
 
 template<uint32_t pad_size, bool sub_mean = false, typename T>
@@ -349,15 +349,15 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
                                 float* __restrict__ scale,
                                 const float    scale_max,
                                 const uint32_t num_tokens,
-                                const int64_t  stride_bz_input,
+                                const int64_t  stride_batch_input,
                                 const int64_t  stride_d_input,
                                 const int64_t  stride_h_input,
-                                const int64_t  stride_bz_output,
+                                const int64_t  stride_batch_output,
                                 const int64_t  stride_d_output,
                                 const int64_t  stride_h_output,
-                                const int64_t  stride_bz_mean,
+                                const int64_t  stride_batch_mean,
                                 const int64_t  stride_h_mean,
-                                const int64_t  stride_bz_scale,
+                                const int64_t  stride_batch_scale,
                                 const int64_t  stride_h_scale)
 {
     static_assert(std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value,
@@ -393,11 +393,11 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
 
     const bool cached = (num_iters == num_quant_iters) && (num_iters <= kCache);
 
-    T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_bz_input
+    T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input + static_cast<int64_t>(d_id) * stride_d_input
                         + static_cast<int64_t>(thread_id * pack_size);
     int8_t* output_ptr_base =
-        output + static_cast<int64_t>(batch_id) * stride_bz_output + static_cast<int64_t>(head_id) * stride_h_output
+        output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
         + static_cast<int64_t>(d_id) * stride_d_output + static_cast<int64_t>(thread_id * pack_size);
 
     pack_t x_cache[kCache];
@@ -456,14 +456,14 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
         if constexpr (sub_mean) {
             s_mean_val = block_sum_val / fp8_padded_num_tokens;
             s_amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
-            mean[static_cast<int64_t>(batch_id) * stride_bz_mean + static_cast<int64_t>(head_id) * stride_h_mean
+            mean[static_cast<int64_t>(batch_id) * stride_batch_mean + static_cast<int64_t>(head_id) * stride_h_mean
                  + static_cast<int64_t>(d_id)] = s_mean_val;
         }
         else {
             s_amax_val = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
         }
 
-        scale[static_cast<int64_t>(batch_id) * stride_bz_scale + static_cast<int64_t>(head_id) * stride_h_scale
+        scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
               + static_cast<int64_t>(d_id)] = s_amax_val / scale_max;
     }
 
@@ -525,30 +525,30 @@ void quant_per_block_int8_cuda(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
+        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                 CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE));
+                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));
 
-                dim3 grid(at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE), num_heads, batch_size);
+                dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
 
-                constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+                constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
 
-                dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+                dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type>
+                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, true, false, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  nullptr,
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  sm_scale,
                                                  num_tokens,
-                                                 stride_bz_input,
+                                                 stride_batch_input,
                                                  stride_seq_input,
                                                  stride_h_input,
                                                  0,
                                                  0,
-                                                 stride_bz_output,
+                                                 stride_batch_output,
                                                  stride_seq_output,
                                                  stride_h_output,
                                                  scale.stride(0),
@@ -572,30 +572,30 @@ void quant_per_block_int8_cuda(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
+        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                 CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE));
+                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));
 
-                dim3 grid(at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE), num_heads, batch_size);
+                dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
 
-                constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+                constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
 
-                dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+                dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type>
+                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, false, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  nullptr,
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  0.0f,
                                                  num_tokens,
-                                                 stride_bz_input,
+                                                 stride_batch_input,
                                                  stride_seq_input,
                                                  stride_h_input,
                                                  0,
                                                  0,
-                                                 stride_bz_output,
+                                                 stride_batch_output,
                                                  stride_seq_output,
                                                  stride_h_output,
                                                  scale.stride(0),
@@ -626,31 +626,31 @@ void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor input,
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
+        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                 CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
                 CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE));
+                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));
 
-                dim3 grid(at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE), num_heads, batch_size);
+                dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
 
-                constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+                constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
 
-                dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+                dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type>
+                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  0.0f,
                                                  num_tokens,
-                                                 stride_bz_input,
+                                                 stride_batch_input,
                                                  stride_seq_input,
                                                  stride_h_input,
                                                  mean.stride(0),
                                                  mean.stride(1),
-                                                 stride_bz_output,
+                                                 stride_batch_output,
                                                  stride_seq_output,
                                                  stride_h_output,
                                                  scale.stride(0),
@@ -679,36 +679,36 @@ void quant_per_warp_int8_cuda(torch::Tensor input,
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
-            DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_BLOCK_SIZE, {
+        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
+            DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_TOKENS, {
                 DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
                     CHECK_SHAPE(scale,
                                 batch_size,
                                 num_heads,
-                                at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE) * (BLOCK_SIZE / WARP_BLOCK_SIZE));
+                                at::ceil_div<int64_t>(num_tokens, CTA_TOKENS) * (CTA_TOKENS / WARP_TOKENS));
 
-                    dim3 grid(at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE) * (BLOCK_SIZE / WARP_BLOCK_SIZE),
+                    dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS) * (CTA_TOKENS / WARP_TOKENS),
                               num_heads,
                               batch_size);
 
-                    constexpr int num_pack_per_thread = (WARP_BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+                    constexpr int num_pack_per_thread = (WARP_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
 
-                    dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+                    dim3 block(WARP_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                    QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type>
+                    QuantInt8Kernel<HEAD_DIM, WARP_TOKENS, num_pack_per_thread, false, false, c_type>
                         <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                      nullptr,
                                                      output.data_ptr<int8_t>(),
                                                      reinterpret_cast<float*>(scale.data_ptr()),
                                                      0.0f,
                                                      num_tokens,
-                                                     stride_bz_input,
+                                                     stride_batch_input,
                                                      stride_seq_input,
                                                      stride_h_input,
                                                      0,
                                                      0,
-                                                     stride_bz_output,
+                                                     stride_batch_output,
                                                      stride_seq_output,
                                                      stride_h_output,
                                                      scale.stride(0),
@@ -741,8 +741,8 @@ void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output
     const int64_t batch_size = input.size(0);
     const int64_t head_dim   = input.size(3);
 
-    int64_t stride_bz_input  = input.stride(0);
-    int64_t stride_bz_output = output.stride(0);
+    int64_t stride_batch_input  = input.stride(0);
+    int64_t stride_batch_output = output.stride(0);
 
     int64_t num_tokens, num_heads;
     int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
@@ -776,25 +776,25 @@ void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output
             CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
             CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
 
-            constexpr int BLOCK_SIZE = (HEAD_DIM == 128) ? 64 : 128;
+            constexpr int CTA_TOKENS = (HEAD_DIM == 128) ? 64 : 128;
 
-            dim3 grid(at::ceil_div<int64_t>(num_tokens, BLOCK_SIZE), num_heads, batch_size);
+            dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
 
-            constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+            constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
 
-            dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+            dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-            SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread>
+            SubMeanKernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                              reinterpret_cast<c_type*>(mean.data_ptr()),
                                              reinterpret_cast<half*>(output.data_ptr()),
                                              num_tokens,
-                                             stride_bz_input,
+                                             stride_batch_input,
                                              stride_seq_input,
                                              stride_h_input,
                                              mean.stride(0),
                                              mean.stride(1),
-                                             stride_bz_output,
+                                             stride_batch_output,
                                              stride_seq_output,
                                              stride_h_output);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -808,10 +808,10 @@ void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output
 // 64-aligned prefix; the caller owns the [seq, output.size(3)) tail.
 #define CHECK_SHAPE_PADDED_SEQ(x, d0, d1, d2, seq)                                                                     \
     TORCH_CHECK(x.size(0) == (d0) && x.size(1) == (d1) && x.size(2) == (d2) && x.size(3) >= (seq)                      \
-                    && x.size(3) % CTA_SIZE == 0,                                                                      \
+                    && x.size(3) % CTA_TOKENS == 0,                                                                    \
                 "Tensor " #x " must have shape (" #d0 ", " #d1 ", " #d2 ", n) "                                        \
                 "with n a multiple of ",                                                                               \
-                CTA_SIZE,                                                                                              \
+                CTA_TOKENS,                                                                                            \
                 " and n >= " #seq " (",                                                                                \
                 seq,                                                                                                   \
                 "), got (",                                                                                            \
@@ -837,20 +837,20 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
     CHECK_DIMS(input, 4);
     CHECK_DIMS(output, 4);
 
-    constexpr int CTA_SIZE = 64;
+    constexpr int CTA_TOKENS = 64;
 
     const int64_t batch_size = input.size(0);
     const int64_t head_dim   = input.size(3);
 
-    int64_t stride_bz_input = input.stride(0);
+    int64_t stride_batch_input = input.stride(0);
 
     // The output is the transposed-value layout. Only its strides come from the
     // parsed layout: its sizes are what the CHECK_SHAPE below validates against
     // the input-derived ones, so they must stay input-derived.
-    const VTLayout ol               = parse_vt_layout(output, tensor_layout);
-    const int64_t  stride_bz_output = ol.stride_bz;
-    const int64_t  stride_d_output  = ol.stride_d;
-    const int64_t  stride_h_output  = ol.stride_h;
+    const VTLayout ol                  = parse_vt_layout(output, tensor_layout);
+    const int64_t  stride_batch_output = ol.stride_batch;
+    const int64_t  stride_d_output     = ol.stride_d;
+    const int64_t  stride_h_output     = ol.stride_h;
 
     int64_t num_tokens, padded_num_tokens, num_heads;
     int64_t stride_seq_input, stride_h_input;
@@ -861,7 +861,7 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
         stride_seq_input = input.stride(1);
         stride_h_input   = input.stride(2);
 
-        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_SIZE);
+        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
 
         CHECK_SHAPE_PADDED_SEQ(output, batch_size, head_dim, num_heads, padded_num_tokens);
     }
@@ -871,7 +871,7 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
         stride_seq_input = input.stride(2);
         stride_h_input   = input.stride(1);
 
-        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_SIZE);
+        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
         CHECK_SHAPE_PADDED_SEQ(output, batch_size, num_heads, head_dim, padded_num_tokens);
     }
 
@@ -884,34 +884,34 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            dim3 grid(padded_num_tokens / CTA_SIZE, num_heads, batch_size);
+            dim3 grid(padded_num_tokens / CTA_TOKENS, num_heads, batch_size);
 
-            static_assert(CTA_SIZE * HEAD_DIM <= 8192);
+            static_assert(CTA_TOKENS * HEAD_DIM <= 8192);
 
-            dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+            dim3 block(CTA_TOKENS * (HEAD_DIM / 8));
 
             if (permute) {
-                TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, true, c_type>
+                TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, true, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(output.data_ptr()),
                                                  num_tokens,
-                                                 stride_bz_input,
+                                                 stride_batch_input,
                                                  stride_seq_input,
                                                  stride_h_input,
-                                                 stride_bz_output,
+                                                 stride_batch_output,
                                                  stride_d_output,
                                                  stride_h_output);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             else {
-                TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, false, c_type>
+                TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, false, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(output.data_ptr()),
                                                  num_tokens,
-                                                 stride_bz_input,
+                                                 stride_batch_input,
                                                  stride_seq_input,
                                                  stride_h_input,
-                                                 stride_bz_output,
+                                                 stride_batch_output,
                                                  stride_d_output,
                                                  stride_h_output);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -968,21 +968,21 @@ void scale_fuse_quant_cuda(
     const int64_t num_heads  = il.num_heads;
     const int64_t head_dim   = il.head_dim;
 
-    const int64_t stride_bz_input = il.stride_bz;
-    const int64_t stride_d_input  = il.stride_d;
-    const int64_t stride_h_input  = il.stride_h;
+    const int64_t stride_batch_input = il.stride_batch;
+    const int64_t stride_d_input     = il.stride_d;
+    const int64_t stride_h_input     = il.stride_h;
 
-    const int64_t stride_bz_output = ol.stride_bz;
-    const int64_t stride_d_output  = ol.stride_d;
-    const int64_t stride_h_output  = ol.stride_h;
+    const int64_t stride_batch_output = ol.stride_batch;
+    const int64_t stride_d_output     = ol.stride_d;
+    const int64_t stride_h_output     = ol.stride_h;
 
     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
 
-    constexpr int CTA_SIZE = 256;
+    constexpr int CTA_THREADS = 256;
 
     dim3 grid(num_heads, batch_size, head_dim);
-    dim3 block(CTA_SIZE);
+    dim3 block(CTA_THREADS);
 
     auto input_dtype = input.scalar_type();
 
@@ -995,10 +995,10 @@ void scale_fuse_quant_cuda(
                                                                        reinterpret_cast<float*>(scale.data_ptr()),
                                                                        scale_max,
                                                                        num_tokens,
-                                                                       stride_bz_input,
+                                                                       stride_batch_input,
                                                                        stride_d_input,
                                                                        stride_h_input,
-                                                                       stride_bz_output,
+                                                                       stride_batch_output,
                                                                        stride_d_output,
                                                                        stride_h_output,
                                                                        0,
@@ -1056,22 +1056,22 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
     const int64_t num_heads  = il.num_heads;
     const int64_t head_dim   = il.head_dim;
 
-    const int64_t stride_bz_input = il.stride_bz;
-    const int64_t stride_d_input  = il.stride_d;
-    const int64_t stride_h_input  = il.stride_h;
+    const int64_t stride_batch_input = il.stride_batch;
+    const int64_t stride_d_input     = il.stride_d;
+    const int64_t stride_h_input     = il.stride_h;
 
-    const int64_t stride_bz_output = ol.stride_bz;
-    const int64_t stride_d_output  = ol.stride_d;
-    const int64_t stride_h_output  = ol.stride_h;
+    const int64_t stride_batch_output = ol.stride_batch;
+    const int64_t stride_d_output     = ol.stride_d;
+    const int64_t stride_h_output     = ol.stride_h;
 
     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
 
-    constexpr int CTA_SIZE = 256;
+    constexpr int CTA_THREADS = 256;
 
     dim3 grid(num_heads, batch_size, head_dim);
-    dim3 block(CTA_SIZE);
+    dim3 block(CTA_THREADS);
 
     auto input_dtype = input.scalar_type();
 
@@ -1084,10 +1084,10 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
                                                                       reinterpret_cast<float*>(scale.data_ptr()),
                                                                       scale_max,
                                                                       num_tokens,
-                                                                      stride_bz_input,
+                                                                      stride_batch_input,
                                                                       stride_d_input,
                                                                       stride_h_input,
-                                                                      stride_bz_output,
+                                                                      stride_batch_output,
                                                                       stride_d_output,
                                                                       stride_h_output,
                                                                       mean.stride(0),

@@ -28,11 +28,11 @@ namespace SAGEATTN_ARCH_NS {
 // qk_int8_sv_f8 variant (all of them fuse the V scale):
 //   USE_INST_BUF  - inst_buf PV accumulation kernels
 //   FUSE_V_MEAN   - fuse the +V_mean epilogue (value_mean_opt must be set)
-//   USE_FP16_ACCU - fp16 short-term PV accumulator (inst_buf variants only)
+//   USE_FP16_ACCUM - fp16 short-term PV accumulator (inst_buf variants only)
 // The thin sm89_*.cu / sm120_*.cu TUs bind the public function names to
 // instantiations of this template; each sm120 TU stays byte-identical to its
 // sm89 sibling except for the attn_cuda_*.h include line (sed-regenerable).
-template<bool USE_INST_BUF, bool FUSE_V_MEAN, bool USE_FP16_ACCU>
+template<bool USE_INST_BUF, bool FUSE_V_MEAN, bool USE_FP16_ACCUM>
 torch::Tensor qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89(torch::Tensor        query,
                                                             torch::Tensor        key,
                                                             torch::Tensor        value,
@@ -130,7 +130,7 @@ torch::Tensor qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89(torch::Tensor       
                                                                     RETURN_LSE,
                                                                     true,
                                                                     FUSE_V_MEAN,
-                                                                    USE_FP16_ACCU>;
+                                                                    USE_FP16_ACCUM>;
 
                         sage::set_max_dynamic_smem_once(kernel_func, smem_max, query.get_device());
 
@@ -154,17 +154,17 @@ torch::Tensor qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89(torch::Tensor       
                             value_mean_ptr,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
-                            stride_bz_q,
+                            qo_per_kv_head,
+                            stride_batch_q,
                             stride_seq_q,
                             stride_h_q,
-                            stride_bz_k,
+                            stride_batch_k,
                             stride_seq_k,
                             stride_h_k,
-                            stride_bz_v,
+                            stride_batch_v,
                             stride_h_v,
                             stride_d_v,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_seq_o,
                             stride_h_o,
                             sm_scale);

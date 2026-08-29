@@ -83,26 +83,26 @@
         TORCH_CHECK(false, __PRETTY_FUNCTION__, " failed to dispatch data type ", pytorch_dtype);                      \
     }
 
-#define DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, ...)                                                               \
+#define DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, ...)                                                               \
     if (block_size == 64) {                                                                                            \
-        constexpr int BLOCK_SIZE = 64;                                                                                 \
+        constexpr int CTA_TOKENS = 64;                                                                                 \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else if (block_size == 128) {                                                                                      \
-        constexpr int BLOCK_SIZE = 128;                                                                                \
+        constexpr int CTA_TOKENS = 128;                                                                                \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else {                                                                                                             \
         TORCH_CHECK_VALUE(false, "Unsupported block_size ", int(block_size));                                          \
     }
 
-#define DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_BLOCK_SIZE, ...)                                                \
+#define DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_TOKENS, ...)                                                    \
     if (warp_block_size == 16) {                                                                                       \
-        constexpr int WARP_BLOCK_SIZE = 16;                                                                            \
+        constexpr int WARP_TOKENS = 16;                                                                                \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else if (warp_block_size == 32) {                                                                                  \
-        constexpr int WARP_BLOCK_SIZE = 32;                                                                            \
+        constexpr int WARP_TOKENS = 32;                                                                                \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else {                                                                                                             \
@@ -113,13 +113,13 @@
 // twice the Q one; 64 and 128 are the only values plan.cpp's fill_tiles()
 // produces for warp_k. Kept separate from DISPATCH_WARP_BLOCK_SIZE so the
 // per-warp Q path does not instantiate tiles it never launches.
-#define DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_BLOCK_SIZE, ...)                                              \
+#define DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, ...)                                                  \
     if (warp_block_size == 64) {                                                                                       \
-        constexpr int WARP_BLOCK_SIZE = 64;                                                                            \
+        constexpr int WARP_TOKENS = 64;                                                                                \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else if (warp_block_size == 128) {                                                                                 \
-        constexpr int WARP_BLOCK_SIZE = 128;                                                                           \
+        constexpr int WARP_TOKENS = 128;                                                                               \
         __VA_ARGS__                                                                                                    \
     }                                                                                                                  \
     else {                                                                                                             \

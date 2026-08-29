@@ -57,11 +57,11 @@ __device__ __forceinline__ int8_t quantize_round_half_away(float x, float scale)
     return static_cast<int8_t>(q);
 }
 
-// One warp handles one scale group; lane `l` covers columns [l*VEC, (l+1)*VEC).
+// One warp handles one scale group; lane `l` covers columns [l*pack_size, (l+1)*pack_size).
 template<uint32_t head_dim>
 struct PerThreadVec {
-    static constexpr uint32_t VEC = head_dim / 32;
-    static_assert(VEC == 2 || VEC == 4, "head_dim must be 64 or 128");
+    static constexpr uint32_t pack_size = head_dim / 32;
+    static_assert(pack_size == 2 || pack_size == 4, "head_dim must be 64 or 128");
 };
 
 // The quantize pass re-reads exactly the rows the amax pass read, so holding
@@ -79,25 +79,26 @@ constexpr uint32_t kQuantCacheRows  = 16;
 
 // Query: warp tld of a WARP_BLOCK-token slab owns rows {slab*WARP_BLOCK + r*8 + tld},
 // r in [0, WARP_BLOCK/8); one scale over all of them, stored at [slab*8 + tld].
-template<uint32_t head_dim, uint32_t warp_block_size, typename T>
+template<uint32_t head_dim, uint32_t WARP_TOKENS, typename T>
 __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
                                           int8_t* __restrict__ output,
                                           float* __restrict__ scale,
                                           const uint32_t num_tokens,
-                                          const int64_t  stride_bz_input,
+                                          const int64_t  stride_batch_input,
                                           const uint32_t stride_seq_input,
                                           const int64_t  stride_h_input,
-                                          const int64_t  stride_bz_output,
+                                          const int64_t  stride_batch_output,
                                           const uint32_t stride_seq_output,
                                           const int64_t  stride_h_output,
-                                          const int64_t  stride_bz_scale,
+                                          const int64_t  stride_batch_scale,
                                           const int64_t  stride_h_scale)
 {
-    constexpr uint32_t VEC            = PerThreadVec<head_dim>::VEC;
-    using pack_t                      = sage::vec_t<T, VEC>;
-    using store_t                     = sage::vec_t<int8_t, VEC>;
-    constexpr uint32_t rows_per_group = warp_block_size / 8;
-    constexpr bool kCache = rows_per_group <= kQuantCacheRows && rows_per_group * VEC * sizeof(T) <= kQuantCacheBytes;
+    constexpr uint32_t pack_size      = PerThreadVec<head_dim>::pack_size;
+    using pack_t                      = sage::vec_t<T, pack_size>;
+    using store_t                     = sage::vec_t<int8_t, pack_size>;
+    constexpr uint32_t rows_per_group = WARP_TOKENS / 8;
+    constexpr bool     kCache =
+        rows_per_group <= kQuantCacheRows && rows_per_group * pack_size * sizeof(T) <= kQuantCacheBytes;
     // full unroll only pays for the cached form, which needs constant cache
     // indices; unrolling the reload form as well just inflates the live ranges
     constexpr uint32_t kUnroll = kCache ? rows_per_group : 4;
@@ -107,17 +108,17 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
     const uint32_t batch_id        = blockIdx.z;
     const uint32_t tld             = threadIdx.y;
     const uint32_t lane_id         = threadIdx.x;
-    const uint32_t col             = lane_id * VEC;
-    const uint32_t slab_base_token = slab_id * warp_block_size;
+    const uint32_t col             = lane_id * pack_size;
+    const uint32_t slab_base_token = slab_id * WARP_TOKENS;
 
     // The slab base is the only offset that can reach the n*h*hd range, so it is
     // computed in 64-bit once; the in-slab row offsets stay 32-bit.
-    const T* input_base = input + static_cast<int64_t>(batch_id) * stride_bz_input
-                          + static_cast<int64_t>(head_id) * stride_h_input
-                          + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
-    int8_t* output_base = output + static_cast<int64_t>(batch_id) * stride_bz_output
-                          + static_cast<int64_t>(head_id) * stride_h_output
-                          + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
+    const T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
+                              + static_cast<int64_t>(head_id) * stride_h_input
+                              + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
+    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
+                              + static_cast<int64_t>(head_id) * stride_h_output
+                              + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t x_cache[kCache ? rows_per_group : 1];
 
@@ -128,12 +129,12 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
         const uint32_t token = slab_base_token + local;
         if (token < num_tokens) {
             pack_t x_val;
-            x_val.load_ro(input_base + local * stride_seq_input);
+            x_val.load_ro(input_ptr_base + local * stride_seq_input);
             if constexpr (kCache) {
                 x_cache[r] = x_val;
             }
 #pragma unroll
-            for (uint32_t j = 0; j < VEC; j++) {
+            for (uint32_t j = 0; j < pack_size; j++) {
                 amax = fmaxf(amax, fabsf(fp_traits<T>::to_fp32(x_val[j])));
             }
         }
@@ -152,19 +153,19 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
                 x_val = x_cache[r];
             }
             else {
-                x_val.load_ro(input_base + local * stride_seq_input);
+                x_val.load_ro(input_ptr_base + local * stride_seq_input);
             }
             store_t o_val;
 #pragma unroll
-            for (uint32_t j = 0; j < VEC; j++) {
+            for (uint32_t j = 0; j < pack_size; j++) {
                 o_val[j] = quantize_round_half_away(fp_traits<T>::to_fp32(x_val[j]), group_scale);
             }
-            o_val.store(output_base + local * stride_seq_output);
+            o_val.store(output_ptr_base + local * stride_seq_output);
         }
     }
 
     if (lane_id == 0) {
-        scale[static_cast<int64_t>(batch_id) * stride_bz_scale + static_cast<int64_t>(head_id) * stride_h_scale
+        scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
               + slab_id * 8 + tld] = group_scale;
     }
 }
@@ -174,29 +175,30 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 // all of them, stored at [slab*4 + tld]. Optionally fuses the k - km
 // smoothing subtraction (done in the input dtype, matching the torch sub the
 // Triton path performs beforehand).
-template<uint32_t head_dim, uint32_t warp_block_size, bool sub_mean, typename T>
+template<uint32_t head_dim, uint32_t WARP_TOKENS, bool sub_mean, typename T>
 __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
                                           T* __restrict__ mean,
                                           int8_t* __restrict__ output,
                                           float* __restrict__ scale,
                                           const uint32_t num_tokens,
-                                          const int64_t  stride_bz_input,
+                                          const int64_t  stride_batch_input,
                                           const uint32_t stride_seq_input,
                                           const int64_t  stride_h_input,
-                                          const int64_t  stride_bz_mean,
+                                          const int64_t  stride_batch_mean,
                                           const int64_t  stride_h_mean,
-                                          const int64_t  stride_bz_output,
+                                          const int64_t  stride_batch_output,
                                           const uint32_t stride_seq_output,
                                           const int64_t  stride_h_output,
-                                          const int64_t  stride_bz_scale,
+                                          const int64_t  stride_batch_scale,
                                           const int64_t  stride_h_scale)
 {
-    constexpr uint32_t VEC             = PerThreadVec<head_dim>::VEC;
-    using pack_t                       = sage::vec_t<T, VEC>;
-    using store_t                      = sage::vec_t<int8_t, VEC>;
-    constexpr uint32_t pairs_per_group = warp_block_size / 8;
+    constexpr uint32_t pack_size       = PerThreadVec<head_dim>::pack_size;
+    using pack_t                       = sage::vec_t<T, pack_size>;
+    using store_t                      = sage::vec_t<int8_t, pack_size>;
+    constexpr uint32_t pairs_per_group = WARP_TOKENS / 8;
     constexpr uint32_t rows_per_thread = pairs_per_group * 2;
-    constexpr bool kCache = rows_per_thread <= kQuantCacheRows && rows_per_thread * VEC * sizeof(T) <= kQuantCacheBytes;
+    constexpr bool     kCache =
+        rows_per_thread <= kQuantCacheRows && rows_per_thread * pack_size * sizeof(T) <= kQuantCacheBytes;
     // full unroll only pays for the cached form, which needs constant cache
     // indices; unrolling the reload form as well just inflates the live ranges
     constexpr uint32_t kUnroll = kCache ? pairs_per_group : 4;
@@ -206,21 +208,21 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     const uint32_t batch_id        = blockIdx.z;
     const uint32_t tld             = threadIdx.y;
     const uint32_t lane_id         = threadIdx.x;
-    const uint32_t col             = lane_id * VEC;
-    const uint32_t slab_base_token = slab_id * warp_block_size;
+    const uint32_t col             = lane_id * pack_size;
+    const uint32_t slab_base_token = slab_id * WARP_TOKENS;
 
     // The slab base is the only offset that can reach the n*h*hd range, so it is
     // computed in 64-bit once; the in-slab row offsets stay 32-bit.
-    const T* input_base = input + static_cast<int64_t>(batch_id) * stride_bz_input
-                          + static_cast<int64_t>(head_id) * stride_h_input
-                          + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
-    int8_t* output_base = output + static_cast<int64_t>(batch_id) * stride_bz_output
-                          + static_cast<int64_t>(head_id) * stride_h_output
-                          + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
+    const T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
+                              + static_cast<int64_t>(head_id) * stride_h_input
+                              + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
+    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
+                              + static_cast<int64_t>(head_id) * stride_h_output
+                              + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t mean_val;
     if constexpr (sub_mean) {
-        mean_val.load_ro(mean + static_cast<int64_t>(batch_id) * stride_bz_mean
+        mean_val.load_ro(mean + static_cast<int64_t>(batch_id) * stride_batch_mean
                          + static_cast<int64_t>(head_id) * stride_h_mean + static_cast<int64_t>(col));
     }
 
@@ -228,10 +230,10 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     // cached rows are the already-subtracted ones and the subtract runs once.
     auto load_row = [&](uint32_t local) {
         pack_t x_val;
-        x_val.load_ro(input_base + local * stride_seq_input);
+        x_val.load_ro(input_ptr_base + local * stride_seq_input);
         if constexpr (sub_mean) {
 #pragma unroll
-            for (uint32_t j = 0; j < VEC; j++) {
+            for (uint32_t j = 0; j < pack_size; j++) {
                 x_val[j] = x_val[j] - mean_val[j];
             }
         }
@@ -253,7 +255,7 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
                     x_cache[r * 2 + p] = x_val;
                 }
 #pragma unroll
-                for (uint32_t j = 0; j < VEC; j++) {
+                for (uint32_t j = 0; j < pack_size; j++) {
                     amax = fmaxf(amax, fabsf(fp_traits<T>::to_fp32(x_val[j])));
                 }
             }
@@ -279,16 +281,16 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
                 }
                 store_t o_val;
 #pragma unroll
-                for (uint32_t j = 0; j < VEC; j++) {
+                for (uint32_t j = 0; j < pack_size; j++) {
                     o_val[j] = quantize_round_half_away(fp_traits<T>::to_fp32(x_val[j]), group_scale);
                 }
-                o_val.store(output_base + local * stride_seq_output);
+                o_val.store(output_ptr_base + local * stride_seq_output);
             }
         }
     }
 
     if (lane_id == 0) {
-        scale[static_cast<int64_t>(batch_id) * stride_bz_scale + static_cast<int64_t>(head_id) * stride_h_scale
+        scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
               + slab_id * 4 + tld] = group_scale;
     }
 }
@@ -318,18 +320,18 @@ void quant_per_thread_int8_q_cuda(torch::Tensor input,
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
         DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
-            DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_BLOCK_SIZE, {
+            DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_TOKENS, {
                 dim3 grid(num_slabs, l.num_heads, l.batch_size);
                 dim3 block(32, 8);
-                QuantPerThreadQInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, c_type>
+                QuantPerThreadQInt8Kernel<HEAD_DIM, WARP_TOKENS, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  l.num_tokens,
-                                                 l.stride_bz_input,
+                                                 l.stride_batch_input,
                                                  l.stride_seq_input,
                                                  l.stride_h_input,
-                                                 l.stride_bz_output,
+                                                 l.stride_batch_output,
                                                  l.stride_seq_output,
                                                  l.stride_h_output,
                                                  scale.stride(0),
@@ -363,21 +365,21 @@ void quant_per_thread_int8_k_cuda(torch::Tensor input,
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
         DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
-            DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_BLOCK_SIZE, {
+            DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
                 dim3 grid(num_slabs, l.num_heads, l.batch_size);
                 dim3 block(32, 4);
-                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, false, c_type>
+                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, false, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  nullptr,
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  l.num_tokens,
-                                                 l.stride_bz_input,
+                                                 l.stride_batch_input,
                                                  l.stride_seq_input,
                                                  l.stride_h_input,
                                                  0,
                                                  0,
-                                                 l.stride_bz_output,
+                                                 l.stride_batch_output,
                                                  l.stride_seq_output,
                                                  l.stride_h_output,
                                                  scale.stride(0),
@@ -418,21 +420,21 @@ void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor input,
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
         DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
-            DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_BLOCK_SIZE, {
+            DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
                 dim3 grid(num_slabs, l.num_heads, l.batch_size);
                 dim3 block(32, 4);
-                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, true, c_type>
+                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, true, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
                                                  l.num_tokens,
-                                                 l.stride_bz_input,
+                                                 l.stride_batch_input,
                                                  l.stride_seq_input,
                                                  l.stride_h_input,
                                                  mean.stride(0),
                                                  mean.stride(1),
-                                                 l.stride_bz_output,
+                                                 l.stride_batch_output,
                                                  l.stride_seq_output,
                                                  l.stride_h_output,
                                                  scale.stride(0),

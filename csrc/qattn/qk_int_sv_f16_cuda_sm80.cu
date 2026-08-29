@@ -67,7 +67,7 @@ template<uint32_t         CTA_Q,
          QuantGranularity Q_GRAN,
          QuantGranularity K_GRAN,
          typename DTypeSVAccum = float,
-         bool use_inst_buffer  = false,
+         bool use_inst_buf     = false,
          typename DTypeOut     = half,
          ComputeUnit DenominatorAccumUnit,
          MaskMode    mask_mode   = MaskMode::kNone,
@@ -83,17 +83,17 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                           const DTypeOut* __restrict__ V_mean,
                                           const uint32_t qo_len,
                                           const uint32_t kv_len,
-                                          const uint32_t num_kv_groups,
-                                          const int64_t  stride_bz_q,
+                                          const uint32_t qo_per_kv_head,
+                                          const int64_t  stride_batch_q,
                                           const uint32_t stride_seq_q,
                                           const int64_t  stride_h_q,
-                                          const int64_t  stride_bz_k,
+                                          const int64_t  stride_batch_k,
                                           const uint32_t stride_seq_k,
                                           const int64_t  stride_h_k,
-                                          const int64_t  stride_bz_v,
+                                          const int64_t  stride_batch_v,
                                           const uint32_t stride_seq_v,
                                           const int64_t  stride_h_v,
-                                          const int64_t  stride_bz_o,
+                                          const int64_t  stride_batch_o,
                                           const uint32_t stride_seq_o,
                                           const int64_t  stride_h_o,
                                           float          sm_scale)
@@ -108,8 +108,8 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp
                       || K_GRAN == QuantGranularity::kPerThread,
                   "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
-    static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buffer,
-                  "use_inst_buffer only supports DTypeSVAccum as float");
+    static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buf,
+                  "use_inst_buf only supports DTypeSVAccum as float");
     static_assert(std::is_same<DTypeSVAccum, float>::value || std::is_same<DTypeSVAccum, half>::value,
                   "DTypeSVAccum must be float or half");
     static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value,
@@ -135,8 +135,8 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 
     extern __shared__ int8_t smem[];
 
-    const uint32_t lane_id = get_lane_id();
-    const uint32_t warp_id = get_warp_id();
+    const uint32_t lane_id = get_lane_id_2d();
+    const uint32_t warp_id = get_warp_id_2d();
 
     // maximize L2 hit rate
     const uint32_t batch_id = blockIdx.z;
@@ -144,7 +144,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     // blockIdx.x backwards: the heaviest CTAs are scheduled first and the tail of
     // the grid is filled with the cheap ones instead of the other way round. Each
     // CTA owns a disjoint slice of O, so the permutation changes no results.
-    const uint32_t bx           = (mask_mode == MaskMode::kCausal) ? (gridDim.x - 1 - blockIdx.x) : blockIdx.x;
+    const uint32_t cta_idx_q    = (mask_mode == MaskMode::kCausal) ? (gridDim.x - 1 - blockIdx.x) : blockIdx.x;
     const uint32_t num_qo_heads = gridDim.y;
     const uint32_t head_id      = blockIdx.y;
 
@@ -154,51 +154,51 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     // RS holds the fragment of S
     int32_t      RS[num_tiles_q][num_tiles_k][8];
     DTypeSVAccum RO[num_tiles_q][num_tiles_v][8];
-    float        m[num_tiles_q][2];  // max
-    float        d[num_tiles_q][2];  // denominator
+    float        row_max[num_tiles_q][2];  // max
+    float        denom[num_tiles_q][2];    // denominator
 
     // q_scale is read once, so the whole index can stay 64-bit. k_scale is read
     // once per iteration, so it is split into a 64-bit base pointer plus a
     // 32-bit running offset.
     int64_t      q_scale_idx;
-    const float* K_scale_base;
+    const float* K_scale_base_ptr;
     uint32_t     k_scale_off;
 
     if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_block_q = gridDim.x;
-        q_scale_idx                = static_cast<int64_t>(batch_id) * num_qo_heads * num_block_q
-                      + static_cast<int64_t>(head_id) * num_block_q + bx;
+        const uint32_t num_ctas_q = gridDim.x;
+        q_scale_idx               = static_cast<int64_t>(batch_id) * num_qo_heads * num_ctas_q
+                      + static_cast<int64_t>(head_id) * num_ctas_q + cta_idx_q;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
-        const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_block_q
-                      + static_cast<int64_t>(head_id) * num_warp_block_q + bx * num_warps_q
+        const uint32_t num_warp_tiles_q = gridDim.x * num_warps_q;
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
+                      + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * num_warps_q
                       + get_warp_idx_q<num_warps_q, num_warps_k>();
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
-        const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_block_q * 8)
-                      + static_cast<int64_t>(head_id) * (num_warp_block_q * 8) + bx * (num_warps_q * 8)
+        const uint32_t num_warp_tiles_q = gridDim.x * num_warps_q;
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
+                      + static_cast<int64_t>(head_id) * (num_warp_tiles_q * 8) + cta_idx_q * (num_warps_q * 8)
                       + get_warp_idx_q<num_warps_q, num_warps_k>() * 8 + lane_id / 4;
     }
 
     if constexpr (K_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * num_block_k
-                       + static_cast<int64_t>(head_id / num_kv_groups) * num_block_k;
+        const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
         k_scale_off = 0;
     }
     else if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
-        const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * num_warp_block_k
-                       + static_cast<int64_t>(head_id / num_kv_groups) * num_warp_block_k;
+        const uint32_t num_warp_tiles_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_warp_tiles_k
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * num_warp_tiles_k;
         k_scale_off = get_warp_idx_k<num_warps_q, num_warps_k>();
     }
     else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-        const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
-        K_scale_base                    = K_scale
-                       + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4)
-                       + static_cast<int64_t>(head_id / num_kv_groups) * (num_warp_block_k * 4);
+        const uint32_t num_warp_tiles_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
+        K_scale_base_ptr                = K_scale
+                           + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_warp_tiles_k * 4)
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_warp_tiles_k * 4);
         k_scale_off = get_warp_idx_k<num_warps_q, num_warps_k>() * 4 + lane_id % 4;
     }
 
@@ -206,21 +206,21 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                                 (K_GRAN == QuantGranularity::kPerWarp)  ? (CTA_K / WARP_K) :
                                                                                           (CTA_K / WARP_K) * 4;
 
-    // initialize o, m, d
+    // initialize o, row_max, denom
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
             if constexpr (std::is_same<DTypeSVAccum, float>::value) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    RO[fq][fv][k] = 0.0f;
+                for (uint32_t e = 0; e < 8; e++) {
+                    RO[fq][fv][e] = 0.0f;
                 }
             }
             else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
 #pragma unroll
-                for (uint32_t k = 0; k < 4; k++) {
-                    ((int32_t*)RO[fq][fv])[k] = 0;
+                for (uint32_t e = 0; e < 4; e++) {
+                    ((int32_t*)RO[fq][fv])[e] = 0;
                 }
             }
         }
@@ -228,9 +228,9 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-        for (uint32_t k = 0; k < 2; k++) {
-            m[fq][k] = -5000000.0f;
-            d[fq][k] = 1.0f;
+        for (uint32_t e = 0; e < 2; e++) {
+            row_max[fq][e] = -5000000.0f;
+            denom[fq][e]   = 1.0f;
         }
     }
 
@@ -264,17 +264,20 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     constexpr uint32_t O_smem_iters_row  = O_SMEM_STRIDE / (global_to_shared_line_lanes_O * PACK_SIZE_O);
     constexpr uint32_t O_smem_iters_col  = CTA_Q / (num_warps * global_to_shared_copy_lines_per_warp_O);
 
-    const int8_t* Q_lane_base_ptr =
-        Q + static_cast<int64_t>(batch_id) * stride_bz_q + static_cast<int64_t>(head_id) * stride_h_q
-        + static_cast<int64_t>(bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK)
-              * stride_seq_q
-        + static_cast<int64_t>((lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK);
+    const int8_t* Q_lane_base_ptr = Q + static_cast<int64_t>(batch_id) * stride_batch_q
+                                    + static_cast<int64_t>(head_id) * stride_h_q
+                                    + static_cast<int64_t>(cta_idx_q * CTA_Q + CTA_Q / num_warps * warp_id
+                                                           + lane_id / global_to_shared_line_lanes_QK)
+                                          * stride_seq_q
+                                    + static_cast<int64_t>((lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK);
     const int8_t* K_lane_base_ptr =
-        K + static_cast<int64_t>(batch_id) * stride_bz_k + static_cast<int64_t>(head_id / num_kv_groups) * stride_h_k
+        K + static_cast<int64_t>(batch_id) * stride_batch_k
+        + static_cast<int64_t>(head_id / qo_per_kv_head) * stride_h_k
         + static_cast<int64_t>(CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_k
         + static_cast<int64_t>((lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK);
     const half* V_lane_base_ptr =
-        V + static_cast<int64_t>(batch_id) * stride_bz_v + static_cast<int64_t>(head_id / num_kv_groups) * stride_h_v
+        V + static_cast<int64_t>(batch_id) * stride_batch_v
+        + static_cast<int64_t>(head_id / qo_per_kv_head) * stride_h_v
         + static_cast<int64_t>(CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_V) * stride_seq_v
         + static_cast<int64_t>((lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V);
     uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(
@@ -295,25 +298,26 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         smem_V.get_permuted_offset(get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + lane_id % 16, lane_id / 16);
 
     // for causal masking
-    uint32_t Q_idx_lane_base = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
+    uint32_t Q_idx_lane_base = cta_idx_q * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
     uint32_t K_idx_lane_base = get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + 2 * (lane_id % 4);
 
     // for loading
-    uint32_t Q_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
+    uint32_t Q_load_idx_lane_base =
+        cta_idx_q * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
     uint32_t K_load_idx_lane_base = CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
     uint32_t V_load_idx_lane_base = CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_V;
 
     const uint32_t num_iterations =
-        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (bx + 1) * CTA_Q) : kv_len, CTA_K);
+        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
 
     // load Q with predicate
-    load_global_to_share<global_to_shared_line_lanes_QK,
-                         global_to_shared_copy_lines_per_warp_QK,
-                         QK_smem_iters_row,
-                         Q_smem_iters_col,
-                         swizzle_mode_QK,
-                         QK_SMEM_STRIDE / PACK_SIZE_QK,
-                         CTA_Q>(
+    load_global_to_shared<global_to_shared_line_lanes_QK,
+                          global_to_shared_copy_lines_per_warp_QK,
+                          QK_smem_iters_row,
+                          Q_smem_iters_col,
+                          swizzle_mode_QK,
+                          QK_SMEM_STRIDE / PACK_SIZE_QK,
+                          CTA_Q>(
         &Q_lane_base_ptr, Q_smem_offset_load, stride_seq_q, smem_Q, Q_load_idx_lane_base, qo_len);
     cp_async::commit_group();
 
@@ -334,31 +338,31 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     }
 
     // load K with predicate
-    load_global_to_share<global_to_shared_line_lanes_QK,
-                         global_to_shared_copy_lines_per_warp_QK,
-                         QK_smem_iters_row,
-                         K_smem_iters_col,
-                         swizzle_mode_QK,
-                         QK_SMEM_STRIDE / PACK_SIZE_QK,
-                         CTA_K>(
+    load_global_to_shared<global_to_shared_line_lanes_QK,
+                          global_to_shared_copy_lines_per_warp_QK,
+                          QK_smem_iters_row,
+                          K_smem_iters_col,
+                          swizzle_mode_QK,
+                          QK_SMEM_STRIDE / PACK_SIZE_QK,
+                          CTA_K>(
         &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
     cp_async::commit_group();
 
     float q_scale = Q_scale[q_scale_idx];
 
     float original_sm_scale = sm_scale;
-    float dequant_scale     = q_scale * K_scale_base[k_scale_off + 0 * k_scale_advance_offset];
+    float dequant_scale     = q_scale * K_scale_base_ptr[k_scale_off + 0 * k_scale_advance_offset];
 
     sm_scale = original_sm_scale * dequant_scale;
 
     // load V with predicate
-    load_global_to_share<global_to_shared_line_lanes_V,
-                         global_to_shared_copy_lines_per_warp_V,
-                         V_smem_iters_row,
-                         V_smem_iters_col,
-                         swizzle_mode_V,
-                         V_SMEM_STRIDE / PACK_SIZE_V,
-                         CTA_K>(
+    load_global_to_shared<global_to_shared_line_lanes_V,
+                          global_to_shared_copy_lines_per_warp_V,
+                          V_smem_iters_row,
+                          V_smem_iters_col,
+                          swizzle_mode_V,
+                          V_SMEM_STRIDE / PACK_SIZE_V,
+                          CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
     cp_async::commit_group();
 
@@ -420,13 +424,13 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
-                    const float S_magic = __int_as_float(RS[fq][fk][k] + 0x4B400000);
+                for (uint32_t e = 0; e < 8; e++) {
+                    const float S_magic = __int_as_float(RS[fq][fk][e] + 0x4B400000);
                     if constexpr (kind == TileKind::kBulk) {
-                        RS_f32[fq][fk][k] = S_magic + magic_bias;
+                        RS_f32[fq][fk][e] = S_magic + magic_bias;
                     }
                     else {
-                        RS_f32[fq][fk][k] = __fmaf_rn(S_magic, dequant_scale, magic_bias);
+                        RS_f32[fq][fk][e] = __fmaf_rn(S_magic, dequant_scale, magic_bias);
                     }
                 }
             }
@@ -437,12 +441,12 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-                for (uint32_t k = 0; k < 8; k++) {
+                for (uint32_t e = 0; e < 8; e++) {
                     if constexpr (kind == TileKind::kBulk) {
-                        RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                        RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]);
                     }
                     else {
-                        RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+                        RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]) * dequant_scale;
                     }
                 }
             }
@@ -454,7 +458,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         }
         if constexpr (kind == TileKind::kLast) {
             // check out of bound in the last iter
-            apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
+            apply_out_of_bounds_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
         }
         K_idx_lane_base += CTA_K;
 
@@ -463,21 +467,23 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         const float mdo_sm_scale = (kind == TileKind::kBulk) ? sm_scale : original_sm_scale;
 
         if constexpr (std::is_same<DTypeSVAccum, float>::value) {
-            update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, false, false>(RS_f32, RO, m, d, mdo_sm_scale);
+            update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, false, false>(
+                RS_f32, RO, row_max, denom, mdo_sm_scale);
         }
         else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
-            update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, false, false>(RS_f32, RO, m, d, mdo_sm_scale);
+            update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, false, false>(
+                RS_f32, RO, row_max, denom, mdo_sm_scale);
         }
 
         if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
-            accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
+            accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, denom);
         }
 
         uint32_t RS_f16[num_tiles_q][num_tiles_k][4];
-        RS_32_to_16<num_tiles_q, num_tiles_k>(RS_f32, RS_f16);
+        RS_f32_to_f16<num_tiles_q, num_tiles_k>(RS_f32, RS_f16);
 
         if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore) {
-            accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kTensorCore>(RS_f16, d);
+            accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kTensorCore>(RS_f16, denom);
         }
 
         if constexpr (kind != TileKind::kLast) {
@@ -485,27 +491,27 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 
             // load K
             if constexpr (kind == TileKind::kBulk) {
-                load_global_to_share<global_to_shared_line_lanes_QK,
-                                     global_to_shared_copy_lines_per_warp_QK,
-                                     QK_smem_iters_row,
-                                     K_smem_iters_col,
-                                     swizzle_mode_QK,
-                                     QK_SMEM_STRIDE / PACK_SIZE_QK,
-                                     CTA_K>(&K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+                load_global_to_shared<global_to_shared_line_lanes_QK,
+                                      global_to_shared_copy_lines_per_warp_QK,
+                                      QK_smem_iters_row,
+                                      K_smem_iters_col,
+                                      swizzle_mode_QK,
+                                      QK_SMEM_STRIDE / PACK_SIZE_QK,
+                                      CTA_K>(&K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
             }
             else {
-                load_global_to_share<global_to_shared_line_lanes_QK,
-                                     global_to_shared_copy_lines_per_warp_QK,
-                                     QK_smem_iters_row,
-                                     K_smem_iters_col,
-                                     swizzle_mode_QK,
-                                     QK_SMEM_STRIDE / PACK_SIZE_QK,
-                                     CTA_K>(
+                load_global_to_shared<global_to_shared_line_lanes_QK,
+                                      global_to_shared_copy_lines_per_warp_QK,
+                                      QK_smem_iters_row,
+                                      K_smem_iters_col,
+                                      swizzle_mode_QK,
+                                      QK_SMEM_STRIDE / PACK_SIZE_QK,
+                                      CTA_K>(
                     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
             }
             cp_async::commit_group();
 
-            dequant_scale = q_scale * K_scale_base[k_scale_off + next_iter * k_scale_advance_offset];
+            dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + next_iter * k_scale_advance_offset];
             sm_scale      = original_sm_scale * dequant_scale;
 
             // ensure V is ready
@@ -517,7 +523,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         }
         __syncthreads();
 
-        if constexpr (!use_inst_buffer) {
+        if constexpr (!use_inst_buf) {
             compute_fp16_sv_permuted<num_warps_q,
                                      num_warps_k,
                                      num_tiles_q,
@@ -525,7 +531,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                      num_tiles_v,
                                      swizzle_mode_V,
                                      V_SMEM_STRIDE / PACK_SIZE_V,
-                                     4>(smem_V, RS_f16, RO, d, V_smem_offset_mma);
+                                     4>(smem_V, RS_f16, RO, denom, V_smem_offset_mma);
         }
         else {
             compute_fp16_sv_permuted_inst_buf<num_warps_q,
@@ -535,7 +541,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                               num_tiles_v,
                                               swizzle_mode_V,
                                               V_SMEM_STRIDE / PACK_SIZE_V,
-                                              4>(smem_V, RS_f16, RO, d, V_smem_offset_mma);
+                                              4>(smem_V, RS_f16, RO, denom, V_smem_offset_mma);
         }
 
         __syncthreads();
@@ -543,22 +549,22 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         if constexpr (kind != TileKind::kLast) {
             // load V
             if constexpr (kind == TileKind::kBulk) {
-                load_global_to_share<global_to_shared_line_lanes_V,
-                                     global_to_shared_copy_lines_per_warp_V,
-                                     V_smem_iters_row,
-                                     V_smem_iters_col,
-                                     swizzle_mode_V,
-                                     V_SMEM_STRIDE / PACK_SIZE_V,
-                                     CTA_K>(&V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V);
+                load_global_to_shared<global_to_shared_line_lanes_V,
+                                      global_to_shared_copy_lines_per_warp_V,
+                                      V_smem_iters_row,
+                                      V_smem_iters_col,
+                                      swizzle_mode_V,
+                                      V_SMEM_STRIDE / PACK_SIZE_V,
+                                      CTA_K>(&V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V);
             }
             else {
-                load_global_to_share<global_to_shared_line_lanes_V,
-                                     global_to_shared_copy_lines_per_warp_V,
-                                     V_smem_iters_row,
-                                     V_smem_iters_col,
-                                     swizzle_mode_V,
-                                     V_SMEM_STRIDE / PACK_SIZE_V,
-                                     CTA_K>(
+                load_global_to_shared<global_to_shared_line_lanes_V,
+                                      global_to_shared_copy_lines_per_warp_V,
+                                      V_smem_iters_row,
+                                      V_smem_iters_col,
+                                      swizzle_mode_V,
+                                      V_SMEM_STRIDE / PACK_SIZE_V,
+                                      CTA_K>(
                     &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
             }
             cp_async::commit_group();
@@ -582,7 +588,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 
     // TODO: thread block sync mdo state for num_warps_k > 0
 
-    normalize_d<num_tiles_q, num_tiles_v, DenominatorAccumUnit>(RO, m, d);
+    normalize_d<num_tiles_q, num_tiles_v, DenominatorAccumUnit>(RO, row_max, denom);
 
     // save the result
     // if (get_warp_idx_k<num_warps_q, num_warps_k>() == 0)
@@ -605,13 +611,13 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     // add v_mean
     if constexpr (fuse_v_mean) {
         DTypeOut2       v_mean[2];
-        const DTypeOut* V_mean_lane_ptr = V_mean
-                                          + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * head_dim
-                                          + static_cast<int64_t>(head_id / num_kv_groups) * head_dim + lane_id % 4 * 2;
+        const DTypeOut* V_mean_base_ptr = V_mean
+                                          + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
+                                          + static_cast<int64_t>(head_id / qo_per_kv_head) * head_dim + lane_id % 4 * 2;
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-            v_mean[0] = *((DTypeOut2*)(V_mean_lane_ptr + fv * 16));
-            v_mean[1] = *((DTypeOut2*)(V_mean_lane_ptr + 8 + fv * 16));
+            v_mean[0] = *((DTypeOut2*)(V_mean_base_ptr + fv * 16));
+            v_mean[1] = *((DTypeOut2*)(V_mean_base_ptr + 8 + fv * 16));
 #pragma unroll
             for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
                 ((DTypeOut2*)RO[fq][fv])[0] = __hadd2(((DTypeOut2*)RO[fq][fv])[0], v_mean[0]);
@@ -623,43 +629,43 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     }
 
     // save the result to shared memory
-    uint32_t smem_O_row_base = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
+    uint32_t O_smem_row_base = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-            uint32_t offset_O =
-                smem_O.get_permuted_offset(smem_O_row_base + fq * MMA_QK_M, fv * (MMA_SV_N / PACK_SIZE_O));
+            uint32_t O_smem_offset =
+                smem_O.get_permuted_offset(O_smem_row_base + fq * MMA_QK_M, fv * (MMA_SV_N / PACK_SIZE_O));
 
             if constexpr (std::is_same<DTypeSVAccum, float>::value) {
                 // convert RO to half
                 uint32_t RO_f16[4];
 #pragma unroll
-                for (uint32_t k = 0; k < 4; k++) {
+                for (uint32_t e = 0; e < 4; e++) {
                     if constexpr (std::is_same<DTypeOut, half>::value) {
-                        ((half2*)RO_f16)[k] = __float22half2_rn(((float2*)RO[fq][fv])[k]);
+                        ((half2*)RO_f16)[e] = __float22half2_rn(((float2*)RO[fq][fv])[e]);
                     }
                     else if constexpr (std::is_same<DTypeOut, nv_bfloat16>::value) {
-                        ((nv_bfloat162*)RO_f16)[k] = __float22bfloat162_rn(((float2*)RO[fq][fv])[k]);
+                        ((nv_bfloat162*)RO_f16)[e] = __float22bfloat162_rn(((float2*)RO[fq][fv])[e]);
                     }
                 }
 
-                ((uint32_t*)(smem_O.base + offset_O))[lane_id % 4]                                     = RO_f16[0];
-                ((uint32_t*)(smem_O.base + offset_O + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] = RO_f16[1];
+                ((uint32_t*)(smem_O.base + O_smem_offset))[lane_id % 4]                                     = RO_f16[0];
+                ((uint32_t*)(smem_O.base + O_smem_offset + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] = RO_f16[1];
 
                 // ! permuted, make sure you know what you are doing
-                ((uint32_t*)(smem_O.base + (offset_O ^ 0x1)))[lane_id % 4] = RO_f16[2];
-                ((uint32_t*)(smem_O.base + (offset_O ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
+                ((uint32_t*)(smem_O.base + (O_smem_offset ^ 0x1)))[lane_id % 4] = RO_f16[2];
+                ((uint32_t*)(smem_O.base + (O_smem_offset ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
                     RO_f16[3];
             }
             else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
-                ((uint32_t*)(smem_O.base + offset_O))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[0];
-                ((uint32_t*)(smem_O.base + offset_O + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
+                ((uint32_t*)(smem_O.base + O_smem_offset))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[0];
+                ((uint32_t*)(smem_O.base + O_smem_offset + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
                     ((uint32_t*)RO[fq][fv])[1];
 
                 // ! permuted, make sure you know what you are doing
-                ((uint32_t*)(smem_O.base + (offset_O ^ 0x1)))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[2];
-                ((uint32_t*)(smem_O.base + (offset_O ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
+                ((uint32_t*)(smem_O.base + (O_smem_offset ^ 0x1)))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[2];
+                ((uint32_t*)(smem_O.base + (O_smem_offset ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] =
                     ((uint32_t*)RO[fq][fv])[3];
             }
         }
@@ -674,29 +680,31 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     __syncwarp();
 
     // shared memory to global memory
-    DTypeOut* O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_bz_o + static_cast<int64_t>(head_id) * stride_h_o
-                           + static_cast<int64_t>(bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>()
-                                                  + lane_id / global_to_shared_line_lanes_O)
-                                 * stride_seq_o
-                           + static_cast<int64_t>(lane_id % global_to_shared_line_lanes_O * PACK_SIZE_O);
-    uint32_t offset_O             = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q
-                                                       + lane_id / global_to_shared_line_lanes_O,
-                                                   lane_id % global_to_shared_line_lanes_O);
-    uint32_t O_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
+    DTypeOut* O_lane_ptr =
+        O + static_cast<int64_t>(batch_id) * stride_batch_o + static_cast<int64_t>(head_id) * stride_h_o
+        + static_cast<int64_t>(cta_idx_q * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>()
+                               + lane_id / global_to_shared_line_lanes_O)
+              * stride_seq_o
+        + static_cast<int64_t>(lane_id % global_to_shared_line_lanes_O * PACK_SIZE_O);
+    uint32_t O_smem_offset = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q
+                                                            + lane_id / global_to_shared_line_lanes_O,
+                                                        lane_id % global_to_shared_line_lanes_O);
+    uint32_t O_load_idx_lane_base =
+        cta_idx_q * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
 
 #pragma unroll
     for (uint32_t i = 0; i < O_smem_iters_col; i++) {
 #pragma unroll
         for (uint32_t j = 0; j < O_smem_iters_row; j++) {
             if (O_load_idx_lane_base < qo_len) {
-                smem_O.store_128b(offset_O, O_lane_ptr);
+                smem_O.store_128b(O_smem_offset, O_lane_ptr);
             }
             O_lane_ptr += (global_to_shared_line_lanes_O * PACK_SIZE_O);
-            offset_O = smem_O.advance_offset_by_column<global_to_shared_line_lanes_O>(offset_O);
+            O_smem_offset = smem_O.advance_offset_by_column<global_to_shared_line_lanes_O>(O_smem_offset);
         }
 
-        offset_O = smem_O.advance_offset_by_row<global_to_shared_copy_lines_per_warp_O>(
-            offset_O - (O_smem_iters_row * global_to_shared_line_lanes_O));
+        O_smem_offset = smem_O.advance_offset_by_row<global_to_shared_copy_lines_per_warp_O>(
+            O_smem_offset - (O_smem_iters_row * global_to_shared_line_lanes_O));
         O_lane_ptr += ((global_to_shared_copy_lines_per_warp_O * stride_seq_o)
                        - (O_smem_iters_row * global_to_shared_line_lanes_O * PACK_SIZE_O));
         O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
@@ -704,14 +712,14 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 
     if constexpr (return_lse) {
         uint32_t lse_idx =
-            bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
+            cta_idx_q * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
         float* lse_lane_ptr = Lse + static_cast<int64_t>(batch_id) * (qo_len * num_qo_heads)
                               + static_cast<int64_t>(head_id) * qo_len + lse_idx;
         uint32_t fq = (lane_id % 4) / 2;
-        uint32_t k  = (lane_id % 4) % 2;
+        uint32_t e  = (lane_id % 4) % 2;
 
         if (lse_idx < qo_len && (lane_id % 4) < 2 * num_tiles_q) {
-            lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]);
+            lse_lane_ptr[0] = (math::ptx_log2(denom[fq][e]) + row_max[fq][e]);
         }
     }
 
@@ -816,17 +824,17 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
                             nullptr,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
-                            stride_bz_q,
+                            qo_per_kv_head,
+                            stride_batch_q,
                             stride_seq_q,
                             stride_h_q,
-                            stride_bz_k,
+                            stride_batch_k,
                             stride_seq_k,
                             stride_h_k,
-                            stride_bz_v,
+                            stride_batch_v,
                             stride_seq_v,
                             stride_h_v,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_seq_o,
                             stride_h_o,
                             sm_scale);
@@ -937,17 +945,17 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
                             nullptr,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
-                            stride_bz_q,
+                            qo_per_kv_head,
+                            stride_batch_q,
                             stride_seq_q,
                             stride_h_q,
-                            stride_bz_k,
+                            stride_batch_k,
                             stride_seq_k,
                             stride_h_k,
-                            stride_bz_v,
+                            stride_batch_v,
                             stride_seq_v,
                             stride_h_v,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_seq_o,
                             stride_h_o,
                             sm_scale);
@@ -1058,17 +1066,17 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
                             nullptr,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
-                            stride_bz_q,
+                            qo_per_kv_head,
+                            stride_batch_q,
                             stride_seq_q,
                             stride_h_q,
-                            stride_bz_k,
+                            stride_batch_k,
                             stride_seq_k,
                             stride_h_k,
-                            stride_bz_v,
+                            stride_batch_v,
                             stride_seq_v,
                             stride_h_v,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_seq_o,
                             stride_h_o,
                             sm_scale);
@@ -1185,17 +1193,17 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
                             reinterpret_cast<DTypeOut*>(value_mean.data_ptr()),
                             qo_len,
                             kv_len,
-                            num_kv_groups,
-                            stride_bz_q,
+                            qo_per_kv_head,
+                            stride_batch_q,
                             stride_seq_q,
                             stride_h_q,
-                            stride_bz_k,
+                            stride_batch_k,
                             stride_seq_k,
                             stride_h_k,
-                            stride_bz_v,
+                            stride_batch_v,
                             stride_seq_v,
                             stride_h_v,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_seq_o,
                             stride_h_o,
                             sm_scale);

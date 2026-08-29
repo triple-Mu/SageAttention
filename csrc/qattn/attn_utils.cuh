@@ -54,12 +54,12 @@ enum class ComputeUnit {
     kCudaCore,
 };
 
-__device__ __forceinline__ uint32_t get_warp_id()
+__device__ __forceinline__ uint32_t get_warp_id_2d()
 {
     return threadIdx.y;
 }
 
-__device__ __forceinline__ uint32_t get_lane_id()
+__device__ __forceinline__ uint32_t get_lane_id_2d()
 {
     return threadIdx.x;
 }
@@ -67,13 +67,13 @@ __device__ __forceinline__ uint32_t get_lane_id()
 template<uint32_t num_warps_q, uint32_t num_warps_k>
 __device__ __forceinline__ uint32_t get_warp_idx_q()
 {
-    return get_warp_id() / num_warps_k;
+    return get_warp_id_2d() / num_warps_k;
 }
 
 template<uint32_t num_warps_q, uint32_t num_warps_k>
 __device__ __forceinline__ uint32_t get_warp_idx_k()
 {
-    return get_warp_id() % num_warps_k;
+    return get_warp_id_2d() % num_warps_k;
 }
 
 template<uint32_t    global_to_shared_line_lanes,
@@ -84,10 +84,10 @@ template<uint32_t    global_to_shared_line_lanes,
          uint32_t    stride,
          uint32_t    CTA,
          typename T>
-__device__ __forceinline__ void load_global_to_share(T**                                 lane_ptr,
-                                                     uint32_t&                           smem_offset,
-                                                     const uint32_t&                     gmem_stride,
-                                                     const smem_t<swizzle_mode, stride>& smem)
+__device__ __forceinline__ void load_global_to_shared(T**                                 lane_ptr,
+                                                      uint32_t&                           smem_offset,
+                                                      const uint32_t&                     gmem_stride,
+                                                      const smem_t<swizzle_mode, stride>& smem)
 {
     static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
     static_assert(std::is_same<std::remove_const_t<T>, half>::value
@@ -122,12 +122,12 @@ template<uint32_t    global_to_shared_line_lanes,
          uint32_t    stride,
          uint32_t    CTA,
          typename T>
-__device__ __forceinline__ void load_global_to_share(T**                                 lane_ptr,
-                                                     uint32_t&                           smem_offset,
-                                                     const uint32_t&                     gmem_stride,
-                                                     const smem_t<swizzle_mode, stride>& smem,
-                                                     uint32_t                            base_idx,
-                                                     uint32_t                            max_len)
+__device__ __forceinline__ void load_global_to_shared(T**                                 lane_ptr,
+                                                      uint32_t&                           smem_offset,
+                                                      const uint32_t&                     gmem_stride,
+                                                      const smem_t<swizzle_mode, stride>& smem,
+                                                      uint32_t                            base_idx,
+                                                      uint32_t                            max_len)
 {
     static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
     static_assert(std::is_same<std::remove_const_t<T>, half>::value
@@ -161,10 +161,10 @@ template<uint32_t    global_to_shared_line_lanes,
          SwizzleMode swizzle_mode,
          uint32_t    stride,
          uint32_t    CTA>
-__device__ __forceinline__ void load_fp8_V_global_to_share(const int8_t**                      lane_ptr,
-                                                           uint32_t&                           smem_offset,
-                                                           const uint32_t&                     gmem_stride,
-                                                           const smem_t<swizzle_mode, stride>& smem)
+__device__ __forceinline__ void load_fp8_V_global_to_shared(const int8_t**                      lane_ptr,
+                                                            uint32_t&                           smem_offset,
+                                                            const uint32_t&                     gmem_stride,
+                                                            const smem_t<swizzle_mode, stride>& smem)
 {
     static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
     constexpr uint32_t pack_size_fp8 = 16;
@@ -314,16 +314,16 @@ apply_causal_mask(const uint32_t& Q_idx_lane_base, const uint32_t& K_idx_lane_ba
 #pragma unroll
         for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-                const uint32_t q_idx           = Q_idx_lane_base + fq * 16 + 8 * ((k % 4) / 2);
-                const uint32_t kv_idx          = K_idx_lane_base + fk * 16 + 8 * (k / 4) + k % 2;
-                const bool     out_of_boundary = (kv_idx > q_idx);
+            for (uint32_t e = 0; e < 8; e++) {
+                const uint32_t q_idx            = Q_idx_lane_base + fq * 16 + 8 * ((e % 4) / 2);
+                const uint32_t kv_idx           = K_idx_lane_base + fk * 16 + 8 * (e / 4) + e % 2;
+                const bool     is_out_of_bounds = (kv_idx > q_idx);
 
                 if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-                    RS[fq][fk][k] = (out_of_boundary ? -5000000.0f : RS[fq][fk][k]);
+                    RS[fq][fk][e] = (is_out_of_bounds ? -5000000.0f : RS[fq][fk][e]);
                 }
                 else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
-                    RS[fq][fk][k] = (out_of_boundary ? __float2half_rn(-50000.0f) : RS[fq][fk][k]);
+                    RS[fq][fk][e] = (is_out_of_bounds ? __float2half_rn(-50000.0f) : RS[fq][fk][e]);
                 }
             }
         }
@@ -332,22 +332,22 @@ apply_causal_mask(const uint32_t& Q_idx_lane_base, const uint32_t& K_idx_lane_ba
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
 __device__ __forceinline__ void
-apply_out_of_bound_mask(const uint32_t& K_idx_lane_base, DTypeQKAccum RS[][num_tiles_k][8], const uint32_t& kv_len)
+apply_out_of_bounds_mask(const uint32_t& K_idx_lane_base, DTypeQKAccum RS[][num_tiles_k][8], const uint32_t& kv_len)
 {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-                const uint32_t kv_idx          = K_idx_lane_base + fk * 16 + 8 * (k / 4) + k % 2;
-                const bool     out_of_boundary = (kv_idx >= kv_len);
+            for (uint32_t e = 0; e < 8; e++) {
+                const uint32_t kv_idx           = K_idx_lane_base + fk * 16 + 8 * (e / 4) + e % 2;
+                const bool     is_out_of_bounds = (kv_idx >= kv_len);
 
                 if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-                    RS[fq][fk][k] = (out_of_boundary ? -5000000.0f : RS[fq][fk][k]);
+                    RS[fq][fk][e] = (is_out_of_bounds ? -5000000.0f : RS[fq][fk][e]);
                 }
                 else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
-                    RS[fq][fk][k] = (out_of_boundary ? __float2half_rn(-50000.0f) : RS[fq][fk][k]);
+                    RS[fq][fk][e] = (is_out_of_bounds ? __float2half_rn(-50000.0f) : RS[fq][fk][e]);
                 }
             }
         }
@@ -362,21 +362,24 @@ template<uint32_t num_tiles_q,
          bool     exp_offset,
          bool     fuse_scale = false,
          typename DTypeSVAccum>
-__device__ __forceinline__ void update_mdo(
-    float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float& sm_scale)
+__device__ __forceinline__ void update_mdo(float        RS[][num_tiles_k][8],
+                                           DTypeSVAccum RO[][num_tiles_v][8],
+                                           float        row_max[][2],
+                                           float        denom[][2],
+                                           const float& sm_scale)
 {
     static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-        for (uint32_t k = 0; k < 2; k++) {
+        for (uint32_t e = 0; e < 2; e++) {
             // assign the smallest value possible
-            float m_prev = m[fq][k];
+            float m_prev = row_max[fq][e];
             float m_temp = -5000000.0f;
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-                float m_local = max(max(RS[fq][fk][k * 2 + 0], RS[fq][fk][k * 2 + 1]),
-                                    max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+                float m_local = max(max(RS[fq][fk][e * 2 + 0], RS[fq][fk][e * 2 + 1]),
+                                    max(RS[fq][fk][e * 2 + 4], RS[fq][fk][e * 2 + 5]));
                 m_temp        = max(m_temp, m_local);
             }
 
@@ -396,12 +399,12 @@ __device__ __forceinline__ void update_mdo(
             m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));  // 0 exchange with 1, 2 exchange with 3
             m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));  // 0 exchange with 2, 1 exchange with 3
 
-            m[fq][k] = max(m[fq][k], m_temp);
+            row_max[fq][e] = max(row_max[fq][e], m_temp);
 
-            float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
+            float o_scale = math::ptx_exp2(m_prev - row_max[fq][e]);
 
             // update denominator
-            d[fq][k] *= o_scale;
+            denom[fq][e] *= o_scale;
 
             half2 o_scale2;
             if constexpr (use_half_o_scale) {
@@ -412,40 +415,40 @@ __device__ __forceinline__ void update_mdo(
 #pragma unroll
             for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
                 if constexpr (std::is_same<DTypeSVAccum, float>::value) {
-                    RO[fq][fv][k * 2 + 0] *= o_scale;
-                    RO[fq][fv][k * 2 + 1] *= o_scale;
-                    RO[fq][fv][k * 2 + 4] *= o_scale;
-                    RO[fq][fv][k * 2 + 5] *= o_scale;
+                    RO[fq][fv][e * 2 + 0] *= o_scale;
+                    RO[fq][fv][e * 2 + 1] *= o_scale;
+                    RO[fq][fv][e * 2 + 4] *= o_scale;
+                    RO[fq][fv][e * 2 + 5] *= o_scale;
                 }
                 else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
                     if constexpr (use_half_o_scale) {
-                        ((half2*)RO[fq][fv])[k]     = __hmul2(((half2*)RO[fq][fv])[k], o_scale2);
-                        ((half2*)RO[fq][fv])[k + 2] = __hmul2(((half2*)RO[fq][fv])[k + 2], o_scale2);
+                        ((half2*)RO[fq][fv])[e]     = __hmul2(((half2*)RO[fq][fv])[e], o_scale2);
+                        ((half2*)RO[fq][fv])[e + 2] = __hmul2(((half2*)RO[fq][fv])[e + 2], o_scale2);
                     }
                     else {
-                        RO[fq][fv][k * 2 + 0] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 0]) * o_scale);
-                        RO[fq][fv][k * 2 + 1] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 1]) * o_scale);
-                        RO[fq][fv][k * 2 + 4] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 4]) * o_scale);
-                        RO[fq][fv][k * 2 + 5] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 5]) * o_scale);
+                        RO[fq][fv][e * 2 + 0] = __float2half_rn(__half2float(RO[fq][fv][e * 2 + 0]) * o_scale);
+                        RO[fq][fv][e * 2 + 1] = __float2half_rn(__half2float(RO[fq][fv][e * 2 + 1]) * o_scale);
+                        RO[fq][fv][e * 2 + 4] = __float2half_rn(__half2float(RO[fq][fv][e * 2 + 4]) * o_scale);
+                        RO[fq][fv][e * 2 + 5] = __float2half_rn(__half2float(RO[fq][fv][e * 2 + 5]) * o_scale);
                     }
                 }
             }
 
             // raise RS to exponent
-            float negative_m = -m[fq][k];
+            float neg_row_max = -row_max[fq][e];
 #pragma unroll
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
                 if constexpr (fuse_scale) {
-                    RS[fq][fk][k * 2 + 0] = math::ptx_exp2(RS[fq][fk][k * 2 + 0] + negative_m);
-                    RS[fq][fk][k * 2 + 1] = math::ptx_exp2(RS[fq][fk][k * 2 + 1] + negative_m);
-                    RS[fq][fk][k * 2 + 4] = math::ptx_exp2(RS[fq][fk][k * 2 + 4] + negative_m);
-                    RS[fq][fk][k * 2 + 5] = math::ptx_exp2(RS[fq][fk][k * 2 + 5] + negative_m);
+                    RS[fq][fk][e * 2 + 0] = math::ptx_exp2(RS[fq][fk][e * 2 + 0] + neg_row_max);
+                    RS[fq][fk][e * 2 + 1] = math::ptx_exp2(RS[fq][fk][e * 2 + 1] + neg_row_max);
+                    RS[fq][fk][e * 2 + 4] = math::ptx_exp2(RS[fq][fk][e * 2 + 4] + neg_row_max);
+                    RS[fq][fk][e * 2 + 5] = math::ptx_exp2(RS[fq][fk][e * 2 + 5] + neg_row_max);
                 }
                 else {
-                    RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
-                    RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
-                    RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
-                    RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
+                    RS[fq][fk][e * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][e * 2 + 0], sm_scale, neg_row_max));
+                    RS[fq][fk][e * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][e * 2 + 1], sm_scale, neg_row_max));
+                    RS[fq][fk][e * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][e * 2 + 4], sm_scale, neg_row_max));
+                    RS[fq][fk][e * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][e * 2 + 5], sm_scale, neg_row_max));
                 }
             }
         }
@@ -453,39 +456,39 @@ __device__ __forceinline__ void update_mdo(
 }
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_k, typename T>
-__device__ __forceinline__ void RS_32_to_16(T RS[][num_tiles_k][8], uint32_t RS_16[][num_tiles_k][4])
+__device__ __forceinline__ void RS_f32_to_f16(T RS[][num_tiles_k][8], uint32_t RS_f16[][num_tiles_k][4])
 {
     static_assert(sizeof(T) == 4);
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-            ((half2*)RS_16[fq][fk])[0] = __float22half2_rn(((float2*)RS[fq][fk])[0]);
-            ((half2*)RS_16[fq][fk])[1] = __float22half2_rn(((float2*)RS[fq][fk])[1]);
-            ((half2*)RS_16[fq][fk])[2] = __float22half2_rn(((float2*)RS[fq][fk])[2]);
-            ((half2*)RS_16[fq][fk])[3] = __float22half2_rn(((float2*)RS[fq][fk])[3]);
+            ((half2*)RS_f16[fq][fk])[0] = __float22half2_rn(((float2*)RS[fq][fk])[0]);
+            ((half2*)RS_f16[fq][fk])[1] = __float22half2_rn(((float2*)RS[fq][fk])[1]);
+            ((half2*)RS_f16[fq][fk])[2] = __float22half2_rn(((float2*)RS[fq][fk])[2]);
+            ((half2*)RS_f16[fq][fk])[3] = __float22half2_rn(((float2*)RS[fq][fk])[3]);
         }
     }
 }
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_k>
-__device__ __forceinline__ void RS_32_to_8(float RS[][num_tiles_k][8], uint32_t RS_8[][num_tiles_k / 2][4])
+__device__ __forceinline__ void RS_f32_to_f8(float RS[][num_tiles_k][8], uint32_t RS_f8[][num_tiles_k / 2][4])
 {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
-            floatx4_to_e4m3x4(RS_8[fq][fk], RS[fq][fk * 2 + 0], RS[fq][fk * 2 + 0] + 4);
-            floatx4_to_e4m3x4(RS_8[fq][fk] + 1, RS[fq][fk * 2 + 0] + 2, RS[fq][fk * 2 + 0] + 6);
-            floatx4_to_e4m3x4(RS_8[fq][fk] + 2, RS[fq][fk * 2 + 1], RS[fq][fk * 2 + 1] + 4);
-            floatx4_to_e4m3x4(RS_8[fq][fk] + 3, RS[fq][fk * 2 + 1] + 2, RS[fq][fk * 2 + 1] + 6);
+            floatx4_to_e4m3x4(RS_f8[fq][fk], RS[fq][fk * 2 + 0], RS[fq][fk * 2 + 0] + 4);
+            floatx4_to_e4m3x4(RS_f8[fq][fk] + 1, RS[fq][fk * 2 + 0] + 2, RS[fq][fk * 2 + 0] + 6);
+            floatx4_to_e4m3x4(RS_f8[fq][fk] + 2, RS[fq][fk * 2 + 1], RS[fq][fk * 2 + 1] + 4);
+            floatx4_to_e4m3x4(RS_f8[fq][fk] + 3, RS[fq][fk * 2 + 1] + 2, RS[fq][fk * 2 + 1] + 6);
         }
     }
 }
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_k, ComputeUnit compute_unit = ComputeUnit::kTensorCore, typename T>
 __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit == ComputeUnit::kTensorCore) ? 4 : 8],
-                                             float d[][2])
+                                             float denom[][2])
 {
     // for compute unit cuda core, RS is float
     // for compute unit tensor core, RS is packed half
@@ -498,25 +501,25 @@ __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit =
         for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
             if constexpr (compute_unit == ComputeUnit::kTensorCore) {
                 // full accumulate with tensor core
-                mma::rowsum_f16f16f32(d[fq], (uint32_t*)(RS[fq][fk]));
+                mma::rowsum_f16f16f32(denom[fq], (uint32_t*)(RS[fq][fk]));
             }
             else if constexpr (compute_unit == ComputeUnit::kCudaCore) {
                 // partial accumulate with cuda core
-                d[fq][0] += RS[fq][fk][0] + RS[fq][fk][1] + RS[fq][fk][4] + RS[fq][fk][5];
-                d[fq][1] += RS[fq][fk][2] + RS[fq][fk][3] + RS[fq][fk][6] + RS[fq][fk][7];
+                denom[fq][0] += RS[fq][fk][0] + RS[fq][fk][1] + RS[fq][fk][4] + RS[fq][fk][5];
+                denom[fq][1] += RS[fq][fk][2] + RS[fq][fk][3] + RS[fq][fk][6] + RS[fq][fk][7];
             }
         }
     }
 }
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_k>
-__device__ __forceinline__ void accumulate_d_f8(uint32_t RS[][num_tiles_k / 2][4], float d[][2])
+__device__ __forceinline__ void accumulate_d_f8(uint32_t RS[][num_tiles_k / 2][4], float denom[][2])
 {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
         for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
-            mma::rowsum_f8f8f32(d[fq], RS[fq][fk]);
+            mma::rowsum_f8f8f32(denom[fq], RS[fq][fk]);
         }
     }
 }
@@ -532,10 +535,10 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp16_sv(const smem_t<swizzle_mode, stride>& smem_V,
                                                 uint32_t                            RS_f16[][num_tiles_k][4],
                                                 DTypeSVAccum                        RO[][num_tiles_v][8],
-                                                float                               d[][2])
+                                                float                               denom[][2])
 {
-    uint32_t smem_V_row_base = get_warp_idx_k<num_warps_q, num_warps_k>() * (num_tiles_k * 16) + get_lane_id() % 16;
-    uint32_t smem_V_col_base = get_lane_id() / 16;
+    uint32_t smem_V_row_base = get_warp_idx_k<num_warps_q, num_warps_k>() * (num_tiles_k * 16) + get_lane_id_2d() % 16;
+    uint32_t smem_V_col_base = get_lane_id_2d() / 16;
 #pragma unroll
     for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
@@ -570,7 +573,7 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mode, stride>& smem_V,
                                                          T            RS_f16[][num_tiles_k][RS_width],
                                                          DTypeSVAccum RO[][num_tiles_v][8],
-                                                         float        d[][2],
+                                                         float        denom[][2],
                                                          uint32_t&    offset_V)
 {
     static_assert(sizeof(T) == 4);
@@ -615,7 +618,7 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp16_sv_permuted_inst_buf(const smem_t<swizzle_mode, stride>& smem_V,
                                                                   T            RS_f16[][num_tiles_k][RS_width],
                                                                   DTypeSVAccum RO[][num_tiles_v][8],
-                                                                  float        d[][2],
+                                                                  float        denom[][2],
                                                                   uint32_t&    offset_V)
 {
     static_assert(sizeof(T) == 4);
@@ -689,29 +692,30 @@ template<uint32_t    num_tiles_q,
          ComputeUnit compute_unit = ComputeUnit::kTensorCore,  // compute unit for accumulate_d
          typename DTypeQKAccum,
          typename DTypeSVAccum>
-__device__ __forceinline__ void normalize_d(DTypeSVAccum RO[][num_tiles_v][8], DTypeQKAccum m[][2], float d[][2])
+__device__ __forceinline__ void
+normalize_d(DTypeSVAccum RO[][num_tiles_v][8], DTypeQKAccum row_max[][2], float denom[][2])
 {
     if constexpr (compute_unit == ComputeUnit::kCudaCore) {
         // accumulate_d performs partial accumulation with cuda core
-        // aggregate d
+        // aggregate denom
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 2; k++) {
-                d[fq][k] += __shfl_xor_sync(0xffffffff, d[fq][k], 0x1);  // sum 0 and 1, 2 and 3
-                d[fq][k] += __shfl_xor_sync(0xffffffff, d[fq][k], 0x2);  // sum 0 and 2, 1 and 3
+            for (uint32_t e = 0; e < 2; e++) {
+                denom[fq][e] += __shfl_xor_sync(0xffffffff, denom[fq][e], 0x1);  // sum 0 and 1, 2 and 3
+                denom[fq][e] += __shfl_xor_sync(0xffffffff, denom[fq][e], 0x2);  // sum 0 and 2, 1 and 3
             }
         }
     }
 
-    // divide O by d
+    // divide O by denom
     float d_rcp[num_tiles_q][2];
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-        for (uint32_t k = 0; k < 2; k++) {
-            // TODO: check m to prevent nan
-            d_rcp[fq][k] = math::ptx_rcp(d[fq][k]);
+        for (uint32_t e = 0; e < 2; e++) {
+            // TODO: check row_max to prevent nan
+            d_rcp[fq][e] = math::ptx_rcp(denom[fq][e]);
         }
     }
 
@@ -720,24 +724,24 @@ __device__ __forceinline__ void normalize_d(DTypeSVAccum RO[][num_tiles_v][8], D
 #pragma unroll
         for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
+            for (uint32_t e = 0; e < 8; e++) {
                 if constexpr (std::is_same<DTypeSVAccum, float>::value) {
-                    RO[fq][fv][k] *= d_rcp[fq][(k % 4) / 2];
+                    RO[fq][fv][e] *= d_rcp[fq][(e % 4) / 2];
                 }
                 else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
 #if defined(SAGE_OPT_HMUL2_NORM)
-                    // Packed single-rounding normalize. k and k+1 share a d_rcp entry
-                    // ((k % 4) / 2 is constant across the pair), so the even k drives one
+                    // Packed single-rounding normalize. e and e+1 share a d_rcp entry
+                    // ((e % 4) / 2 is constant across the pair), so the even e drives one
                     // HMUL2 in place of two widen-multiply-narrow chains. It drops the
                     // reference's fp32-then-fp16 double rounding but pays for it up front:
                     // d_rcp is rounded to fp16 first, so every element of the row inherits
                     // one shared <= 2^-11 relative error the reference does not have.
-                    if (k % 2 == 0) {
+                    if (e % 2 == 0) {
                         half2* RO_pack = (half2*)RO[fq][fv];
-                        RO_pack[k / 2] = __hmul2(RO_pack[k / 2], __float2half2_rn(d_rcp[fq][(k % 4) / 2]));
+                        RO_pack[e / 2] = __hmul2(RO_pack[e / 2], __float2half2_rn(d_rcp[fq][(e % 4) / 2]));
                     }
 #else
-                    RO[fq][fv][k] = __float2half_rn(__half2float(RO[fq][fv][k]) * d_rcp[fq][(k % 4) / 2]);
+                    RO[fq][fv][e] = __float2half_rn(__half2float(RO[fq][fv][e]) * d_rcp[fq][(e % 4) / 2]);
 #endif
                 }
             }
@@ -756,12 +760,12 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp8_sv(const smem_t<swizzle_mode, stride>& smem_V,
                                                uint32_t                            RS_f8[][num_tiles_k / 2][4],
                                                DTypeSVAccum                        RO[][num_tiles_v][8],
-                                               float                               d[][2])
+                                               float                               denom[][2])
 {
-    uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+    uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
-    // (get_lane_id() / 8) % 2;
-    uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+    // (get_lane_id_2d() / 8) % 2;
+    uint32_t smem_V_col_base = (get_lane_id_2d() / 8) % 2;
 #pragma unroll
     for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
         uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
@@ -796,12 +800,12 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp8_sv_inst_buf(const smem_t<swizzle_mode, stride>& smem_V,
                                                         uint32_t                            RS_f8[][num_tiles_k / 2][4],
                                                         DTypeSVAccum                        RO[][num_tiles_v][8],
-                                                        float                               d[][2])
+                                                        float                               denom[][2])
 {
-    uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+    uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
-    // (get_lane_id() / 8) % 2;
-    uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+    // (get_lane_id_2d() / 8) % 2;
+    uint32_t smem_V_col_base = (get_lane_id_2d() / 8) % 2;
 
     float RO_inst_buf[num_tiles_q][num_tiles_v][8];
 
@@ -875,15 +879,15 @@ template<uint32_t    num_warps_q,
          SwizzleMode swizzle_mode,
          uint32_t    stride,
          typename DTypeSVAccum>
-__device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accu(const smem_t<swizzle_mode, stride>& smem_V,
-                                                                  uint32_t     RS_f8[][num_tiles_k / 2][4],
-                                                                  DTypeSVAccum RO[][num_tiles_v][8],
-                                                                  float        d[][2])
+__device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<swizzle_mode, stride>& smem_V,
+                                                                   uint32_t     RS_f8[][num_tiles_k / 2][4],
+                                                                   DTypeSVAccum RO[][num_tiles_v][8],
+                                                                   float        denom[][2])
 {
-    uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+    uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
-    // (get_lane_id() / 8) % 2;
-    uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+    // (get_lane_id_2d() / 8) % 2;
+    uint32_t smem_V_col_base = (get_lane_id_2d() / 8) % 2;
 
     uint32_t RO_int32[num_tiles_q][num_tiles_v][4];
 
@@ -941,10 +945,10 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accu(const smem_t<s
 #pragma unroll
         for (int j = 0; j < num_tiles_v; j++) {
 #pragma unroll
-            for (int k = 0; k < 4; k++) {
-                unpack_half2_from_uint32_to_float(RO_tmp_float, RO_int32[i][j][k]);
-                RO[i][j][k * 2 + 0] += RO_tmp_float[0];
-                RO[i][j][k * 2 + 1] += RO_tmp_float[1];
+            for (int e = 0; e < 4; e++) {
+                unpack_half2_from_uint32_to_float(RO_tmp_float, RO_int32[i][j][e]);
+                RO[i][j][e * 2 + 0] += RO_tmp_float[0];
+                RO[i][j][e * 2 + 1] += RO_tmp_float[1];
             }
         }
     }

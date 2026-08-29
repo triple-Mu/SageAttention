@@ -133,12 +133,12 @@ __global__ void __launch_bounds__(NUM_THREADS)
                                     const float* __restrict__ V_scale,
                                     DTypeOut* O,
                                     float* __restrict__ Lse,
-                                    const int64_t  stride_bz_o,
+                                    const int64_t  stride_batch_o,
                                     const int64_t  stride_h_o,
                                     uint32_t       stride_seq_o,
                                     const uint32_t qo_len,
                                     const uint32_t kv_len,
-                                    const uint32_t num_kv_groups,
+                                    const uint32_t qo_per_kv_head,
                                     float          sm_scale)
 {
     // --- static shape checks (design plan section 5) ---
@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     constexpr uint32_t num_chunks_s   = CTA_K / 32;     // 32x32b.x32 loads per S row
     constexpr uint32_t num_chunks_o   = head_dim / 32;  // 32x32b.x32 loads per O row
 
-    // --- smem plan (mirrors the launcher's sMemSize computation) ---
+    // --- smem plan (mirrors the launcher's smem_bytes computation) ---
     constexpr uint32_t SMEM_Q_BYTES = CTA_Q * head_dim;
     constexpr uint32_t SMEM_K_BYTES = CTA_K * head_dim;
     constexpr uint32_t SMEM_V_BYTES = CTA_K * head_dim;  // V^T: head_dim rows x CTA_K cols
@@ -202,10 +202,10 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint32_t row      = threadIdx.x;  // S/O row owned by this thread == TMEM lane
 
     const uint32_t batch_id     = blockIdx.z;
-    const uint32_t bx           = blockIdx.x;
+    const uint32_t cta_idx_q    = blockIdx.x;
     const uint32_t head_id      = blockIdx.y;
     const uint32_t num_qo_heads = gridDim.y;
-    const uint32_t kv_head_id   = head_id / num_kv_groups;
+    const uint32_t kv_head_id   = head_id / qo_per_kv_head;
 
     sm_scale *= math::log2e;  // softmax runs in base 2 (attn_utils.cuh convention)
 
@@ -220,45 +220,45 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // once per KV tile, so it is split into a 64-bit base pointer plus the 32-bit
     // running offset the tile loop advances (no lane term here, unlike sm90).
     int64_t      q_scale_idx;
-    const float* K_scale_base;
+    const float* K_scale_base_ptr;
 
     if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_block_q = gridDim.x;
-        q_scale_idx                = static_cast<int64_t>(batch_id) * num_qo_heads * num_block_q
-                      + static_cast<int64_t>(head_id) * num_block_q + bx;
+        const uint32_t num_ctas_q = gridDim.x;
+        q_scale_idx               = static_cast<int64_t>(batch_id) * num_qo_heads * num_ctas_q
+                      + static_cast<int64_t>(head_id) * num_ctas_q + cta_idx_q;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
         // per_warp_int8_cuda(BLKQ=128, WARPQ=32): 4 scales per block, one per 32 rows
-        const uint32_t num_warp_block_q = gridDim.x * (CTA_Q / 32);
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_block_q
-                      + static_cast<int64_t>(head_id) * num_warp_block_q + bx * (CTA_Q / 32) + row / 32;
+        const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
+                      + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * (CTA_Q / 32) + row / 32;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
         // per_thread quant (WARPQ=32): 8 scales per 32-row group, class = row % 8
-        const uint32_t num_warp_block_q = gridDim.x * (CTA_Q / 32);
-        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_block_q * 8)
-                      + static_cast<int64_t>(head_id) * (num_warp_block_q * 8) + bx * ((CTA_Q / 32) * 8)
+        const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
+        q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
+                      + static_cast<int64_t>(head_id) * (num_warp_tiles_q * 8) + cta_idx_q * ((CTA_Q / 32) * 8)
                       + (row / 32) * 8 + (row % 8);
     }
 
     if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
-        const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * num_block_k
-                       + static_cast<int64_t>(head_id / num_kv_groups) * num_block_k;
+        const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
     }
     else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
         // per_thread K quant: 4 scales per KV tile; S column j uses class (j%8)/2
-        const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-        K_scale_base = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * (num_block_k * 4)
-                       + static_cast<int64_t>(head_id / num_kv_groups) * (num_block_k * 4);
+        const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
+        K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
+                           + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
     }
 
     constexpr uint32_t k_scale_advance_offset =
         (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
     // --- flash-attention state (thread-local; this thread's row) ---
-    float m = -5000000.0f;
-    float d = 1.0f;
+    float row_max = -5000000.0f;
+    float denom   = 1.0f;
 
     // --- barriers: TMA trio (Q/K/V) + tcgen05.commit trackers (S/O) ---
     __shared__ __align__(8) uint64_t barrier_Q;
@@ -283,7 +283,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
         tcgen05::expect_bytes<(CTA_Q * head_dim) * sizeof(int8_t)>(&barrier_Q);
         tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
         tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
-        tcgen05::load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, bx * CTA_Q, head_id, batch_id);
+        tcgen05::load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, cta_idx_q * CTA_Q, head_id, batch_id);
         tcgen05::load_async_4D(sK, &tensorMapK, &barrier_K, 0, 0, kv_head_id, batch_id);
         tcgen05::load_async_4D(sV, &tensorMapV, &barrier_V, 0, 0, kv_head_id, batch_id);
     }
@@ -309,9 +309,9 @@ __global__ void __launch_bounds__(NUM_THREADS)
     tcgen05::wait(&barrier_Q, 0);
 
     const uint32_t num_iterations =
-        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (bx + 1) * CTA_Q) : kv_len, CTA_K);
+        div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
 
-    const uint32_t q_idx = bx * CTA_Q + row;
+    const uint32_t q_idx = cta_idx_q * CTA_Q + row;
 
     // mbarrier phase bits (all barriers complete exactly once per KV tile;
     // see docs/barrier_ledger.md)
@@ -359,11 +359,11 @@ __global__ void __launch_bounds__(NUM_THREADS)
         if constexpr (K_GRAN == QuantGranularity::kPerThread) {
 #pragma unroll
             for (uint32_t cls = 0; cls < 4; cls++) {
-                dq[cls] = q_scale * K_scale_base[iter * k_scale_advance_offset + cls];
+                dq[cls] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset + cls];
             }
         }
         else {
-            dq[0] = q_scale * K_scale_base[iter * k_scale_advance_offset];
+            dq[0] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset];
         }
 
         float s_f32[CTA_K];
@@ -387,13 +387,13 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
                 if constexpr (is_last) {
                     // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
-                    const uint32_t k_idx = iter * CTA_K + j;
+                    const uint32_t kv_idx = iter * CTA_K + j;
                     bool           is_out_of_bounds;
                     if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (k_idx > q_idx) || (k_idx >= kv_len);
+                        is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= kv_len);
                     }
                     else {
-                        is_out_of_bounds = (k_idx >= kv_len);
+                        is_out_of_bounds = (kv_idx >= kv_len);
                     }
                     if (is_out_of_bounds) {
                         s = -5000000.0f;
@@ -406,21 +406,21 @@ __global__ void __launch_bounds__(NUM_THREADS)
         }
 
         // ---- online softmax update (thread-local; no shuffles) ----
-        // m folds sm_scale (already x log2e) and the e4m3-saturation offset:
-        // p[j] = exp2(s[j]*sm_scale - m) = exp2(s' - max' + S_FP8_OFFSET) in (0, 448]
-        const float m_prev = m;
-        m                  = max(m, fmaf(m_local, sm_scale, -S_FP8_OFFSET));
-        const float alpha  = math::ptx_exp2(m_prev - m);  // o_scale
-        d *= alpha;
-        const float neg_m = -m;
-        float       d_sum = 0.0f;
+        // row_max folds sm_scale (already x log2e) and the e4m3-saturation offset:
+        // p[j] = exp2(s[j]*sm_scale - row_max) = exp2(s' - max' + S_FP8_OFFSET) in (0, 448]
+        const float m_prev = row_max;
+        row_max            = max(row_max, fmaf(m_local, sm_scale, -S_FP8_OFFSET));
+        const float alpha  = math::ptx_exp2(m_prev - row_max);  // o_scale
+        denom *= alpha;
+        const float neg_row_max = -row_max;
+        float       d_sum       = 0.0f;
 #pragma unroll
         for (uint32_t j = 0; j < CTA_K; j++) {
-            const float p = math::ptx_exp2(fmaf(s_f32[j], sm_scale, neg_m));
+            const float p = math::ptx_exp2(fmaf(s_f32[j], sm_scale, neg_row_max));
             s_f32[j]      = p;
             d_sum += p;
         }
-        d += d_sum;
+        denom += d_sum;
 
         // ---- P re-quant: pack e4m3 in LINEAR row order (word c = K elems
         //      4c..4c+3, byte b = elem 4c+b) - the TS A-operand TMEM layout ----
@@ -512,15 +512,15 @@ __global__ void __launch_bounds__(NUM_THREADS)
     process_tile(std::true_type{}, num_iterations - 1);  // peeled: fused mask, no prefetch
 
     // -------------------------------------------------------------------------
-    // Epilogue: O = O * v_scale / d, cvt to fp16/bf16, direct global stores
+    // Epilogue: O = O * v_scale / denom, cvt to fp16/bf16, direct global stores
     // (thread = row; MVP keeps the sm90-style register->global epilogue).
     // -------------------------------------------------------------------------
-    const float d_rcp     = math::ptx_rcp(d);
+    const float d_rcp     = math::ptx_rcp(denom);
     const bool  row_valid = q_idx < qo_len;
-    DTypeOut* O_row_ptr = O + static_cast<int64_t>(batch_id) * stride_bz_o + static_cast<int64_t>(head_id) * stride_h_o
-                          + static_cast<int64_t>(q_idx) * stride_seq_o;
+    DTypeOut*   O_row_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
+                          + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
     const float* V_scale_ptr = fuse_v_scale ?
-                                   V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / num_kv_groups) * head_dim
+                                   V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
                                        + static_cast<int64_t>(kv_head_id) * head_dim :
                                    nullptr;
 
@@ -558,7 +558,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
         // sm90 CTA_Q=64-only lane dance)
         if (row_valid) {
             Lse[static_cast<int64_t>(batch_id) * (static_cast<int64_t>(qo_len) * num_qo_heads)
-                + static_cast<int64_t>(head_id) * qo_len + q_idx] = math::ptx_log2(d) + m;
+                + static_cast<int64_t>(head_id) * qo_len + q_idx] = math::ptx_log2(denom) + row_max;
         }
     }
 
@@ -654,7 +654,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                                                                   num_qo_heads,
                                                                   qo_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_q,
+                                                                  stride_batch_q,
                                                                   stride_h_q,
                                                                   stride_seq_q);
                         CUtensorMap tma_map_K =
@@ -663,7 +663,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   kv_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_k,
+                                                                  stride_batch_k,
                                                                   stride_h_k,
                                                                   stride_seq_k);
                         CUtensorMap tma_map_V =
@@ -672,11 +672,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   HEAD_DIM,
                                                                   value.size(3),
-                                                                  stride_bz_v,
+                                                                  stride_batch_v,
                                                                   stride_h_v,
                                                                   stride_d_v);
 
-                        auto*  kernel   = qk_int8_sv_f8_attn_kernel_sm100<CTA_Q,
+                        auto*  kernel     = qk_int8_sv_f8_attn_kernel_sm100<CTA_Q,
                                                                        CTA_K,
                                                                        NUM_THREADS,
                                                                        HEAD_DIM,
@@ -687,13 +687,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                                                                        RETURN_LSE,
                                                                        false,
                                                                        kPVFromSmem>;
-                        size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + (kPVFromSmem ? CTA_Q * CTA_K * sizeof(int8_t) : 0);
-                        sage::set_max_dynamic_smem_once(kernel, sMemSize, query.get_device());
+                        size_t smem_bytes = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + (kPVFromSmem ? CTA_Q * CTA_K * sizeof(int8_t) : 0);
+                        sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-                        kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
+                        kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
                             tma_map_Q,
                             tma_map_K,
                             tma_map_V,
@@ -702,12 +702,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                             nullptr,
                             reinterpret_cast<DTypeOut*>(output.data_ptr()),
                             (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_h_o,
                             stride_seq_o,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
+                            qo_per_kv_head,
                             sm_scale);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
@@ -791,7 +791,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                                   num_qo_heads,
                                                                   qo_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_q,
+                                                                  stride_batch_q,
                                                                   stride_h_q,
                                                                   stride_seq_q);
                         CUtensorMap tma_map_K =
@@ -800,7 +800,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   kv_len,
                                                                   HEAD_DIM,
-                                                                  stride_bz_k,
+                                                                  stride_batch_k,
                                                                   stride_h_k,
                                                                   stride_seq_k);
                         CUtensorMap tma_map_V =
@@ -809,11 +809,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                                   num_kv_heads,
                                                                   HEAD_DIM,
                                                                   value.size(3),
-                                                                  stride_bz_v,
+                                                                  stride_batch_v,
                                                                   stride_h_v,
                                                                   stride_d_v);
 
-                        auto*  kernel   = qk_int8_sv_f8_attn_kernel_sm100<CTA_Q,
+                        auto*  kernel     = qk_int8_sv_f8_attn_kernel_sm100<CTA_Q,
                                                                        CTA_K,
                                                                        NUM_THREADS,
                                                                        HEAD_DIM,
@@ -824,13 +824,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                                        RETURN_LSE,
                                                                        true,
                                                                        kPVFromSmem>;
-                        size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + CTA_K * HEAD_DIM * sizeof(int8_t)
-                                          + (kPVFromSmem ? CTA_Q * CTA_K * sizeof(int8_t) : 0);
-                        sage::set_max_dynamic_smem_once(kernel, sMemSize, query.get_device());
+                        size_t smem_bytes = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + (kPVFromSmem ? CTA_Q * CTA_K * sizeof(int8_t) : 0);
+                        sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-                        kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
+                        kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
                             tma_map_Q,
                             tma_map_K,
                             tma_map_V,
@@ -839,12 +839,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                             reinterpret_cast<float*>(value_scale.data_ptr()),
                             reinterpret_cast<DTypeOut*>(output.data_ptr()),
                             (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-                            stride_bz_o,
+                            stride_batch_o,
                             stride_h_o,
                             stride_seq_o,
                             qo_len,
                             kv_len,
-                            num_kv_groups,
+                            qo_per_kv_head,
                             sm_scale);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });

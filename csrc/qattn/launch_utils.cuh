@@ -52,8 +52,8 @@ struct QKVLayout {
     int64_t       batch_size;
     int64_t       head_dim;
     int64_t       qo_len, kv_len;
-    int64_t       num_qo_heads, num_kv_heads, num_kv_groups;
-    int64_t       stride_bz_q, stride_bz_k, stride_bz_v, stride_bz_o;
+    int64_t       num_qo_heads, num_kv_heads, qo_per_kv_head;
+    int64_t       stride_batch_q, stride_batch_k, stride_batch_v, stride_batch_o;
     int64_t       stride_seq_q, stride_h_q;
     int64_t       stride_seq_k, stride_h_k;
     int64_t       stride_h_v;
@@ -162,14 +162,14 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
     const int64_t head_dim   = query.size(3);
 
     QKVLayout layout;
-    layout.batch_size   = batch_size;
-    layout.head_dim     = head_dim;
-    layout.stride_bz_q  = query.stride(0);
-    layout.stride_bz_k  = key.stride(0);
-    layout.stride_bz_v  = value.stride(0);
-    layout.stride_bz_o  = output.stride(0);
-    layout.stride_d_v   = 0;
-    layout.stride_seq_v = 0;
+    layout.batch_size     = batch_size;
+    layout.head_dim       = head_dim;
+    layout.stride_batch_q = query.stride(0);
+    layout.stride_batch_k = key.stride(0);
+    layout.stride_batch_v = value.stride(0);
+    layout.stride_batch_o = output.stride(0);
+    layout.stride_d_v     = 0;
+    layout.stride_seq_v   = 0;
 
     int64_t qo_len, kv_len, num_qo_heads, num_kv_heads;
 
@@ -300,11 +300,11 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
                       num_kv_heads,
                       ")");
 
-    layout.qo_len        = qo_len;
-    layout.kv_len        = kv_len;
-    layout.num_qo_heads  = num_qo_heads;
-    layout.num_kv_heads  = num_kv_heads;
-    layout.num_kv_groups = num_qo_heads / num_kv_heads;
+    layout.qo_len         = qo_len;
+    layout.kv_len         = kv_len;
+    layout.num_qo_heads   = num_qo_heads;
+    layout.num_kv_heads   = num_kv_heads;
+    layout.qo_per_kv_head = num_qo_heads / num_kv_heads;
 
     // Width contract (see QKVLayout): sequence lengths index in 32-bit, and the
     // loop-carried strides feed single-IMAD 32-bit pointer bumps inside the
@@ -337,25 +337,25 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
 // per kernel for the 64-bit base offset), loop-carried strides re-narrow to
 // uint32_t (bounds-checked in qkv_layout_parse above).
 #define SAGEATTN_QKV_LAYOUT_LOCALS_COMMON(L)                                                                           \
-    const int64_t  batch_size    = (L).batch_size;                                                                     \
-    const int64_t  head_dim      = (L).head_dim;                                                                       \
-    const int64_t  qo_len        = (L).qo_len;                                                                         \
-    const int64_t  kv_len        = (L).kv_len;                                                                         \
-    const int64_t  num_qo_heads  = (L).num_qo_heads;                                                                   \
-    const int64_t  num_kv_heads  = (L).num_kv_heads;                                                                   \
-    const int64_t  num_kv_groups = (L).num_kv_groups;                                                                  \
-    const int64_t  stride_bz_q   = (L).stride_bz_q;                                                                    \
-    const int64_t  stride_bz_k   = (L).stride_bz_k;                                                                    \
-    const int64_t  stride_bz_v   = (L).stride_bz_v;                                                                    \
-    const int64_t  stride_bz_o   = (L).stride_bz_o;                                                                    \
-    const uint32_t stride_seq_q  = static_cast<uint32_t>((L).stride_seq_q);                                            \
-    const int64_t  stride_h_q    = (L).stride_h_q;                                                                     \
-    const uint32_t stride_seq_k  = static_cast<uint32_t>((L).stride_seq_k);                                            \
-    const int64_t  stride_h_k    = (L).stride_h_k;                                                                     \
-    const int64_t  stride_h_v    = (L).stride_h_v;                                                                     \
-    const uint32_t stride_seq_o  = static_cast<uint32_t>((L).stride_seq_o);                                            \
-    const int64_t  stride_h_o    = (L).stride_h_o;                                                                     \
-    torch::Tensor  lse           = (L).lse
+    const int64_t  batch_size     = (L).batch_size;                                                                    \
+    const int64_t  head_dim       = (L).head_dim;                                                                      \
+    const int64_t  qo_len         = (L).qo_len;                                                                        \
+    const int64_t  kv_len         = (L).kv_len;                                                                        \
+    const int64_t  num_qo_heads   = (L).num_qo_heads;                                                                  \
+    const int64_t  num_kv_heads   = (L).num_kv_heads;                                                                  \
+    const int64_t  qo_per_kv_head = (L).qo_per_kv_head;                                                                \
+    const int64_t  stride_batch_q = (L).stride_batch_q;                                                                \
+    const int64_t  stride_batch_k = (L).stride_batch_k;                                                                \
+    const int64_t  stride_batch_v = (L).stride_batch_v;                                                                \
+    const int64_t  stride_batch_o = (L).stride_batch_o;                                                                \
+    const uint32_t stride_seq_q   = static_cast<uint32_t>((L).stride_seq_q);                                           \
+    const int64_t  stride_h_q     = (L).stride_h_q;                                                                    \
+    const uint32_t stride_seq_k   = static_cast<uint32_t>((L).stride_seq_k);                                           \
+    const int64_t  stride_h_k     = (L).stride_h_k;                                                                    \
+    const int64_t  stride_h_v     = (L).stride_h_v;                                                                    \
+    const uint32_t stride_seq_o   = static_cast<uint32_t>((L).stride_seq_o);                                           \
+    const int64_t  stride_h_o     = (L).stride_h_o;                                                                    \
+    torch::Tensor  lse            = (L).lse
 
 // Transposed-value (fp8) launchers additionally use stride_d_v.
 #define SAGEATTN_QKV_LAYOUT_LOCALS_FP8(L)                                                                              \

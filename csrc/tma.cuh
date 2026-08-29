@@ -147,7 +147,7 @@ store_async_4D(void const* dst_tma_map, T* src, int global_token_idx, int global
 // `: "memory"` to the loop below reproduces the baseline exactly.
 __device__ __forceinline__ void wait(uint64_t* bar, int kPhaseBit)
 {
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     asm volatile("{\n"
                  ".reg .pred                P1;\n"
                  "LAB_WAIT:\n"
@@ -155,7 +155,7 @@ __device__ __forceinline__ void wait(uint64_t* bar, int kPhaseBit)
                  "@P1                       bra.uni DONE;\n"
                  "bra.uni                   LAB_WAIT;\n"
                  "DONE:\n"
-                 "}\n" ::"r"(mbar_ptr),
+                 "}\n" ::"r"(mbar_addr),
                  "r"(kPhaseBit));
 }
 

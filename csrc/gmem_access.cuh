@@ -34,14 +34,14 @@ namespace sage {
 // Block-level base offset in one 64-bit expression. __host__ __device__ so a
 // host-side unit test can sweep the 2^32 boundary without touching a GPU.
 __host__ __device__ __forceinline__ int64_t gmem_base_offset(uint32_t batch_id,
-                                                             int64_t  stride_bz,
+                                                             int64_t  stride_batch,
                                                              uint32_t head_id,
                                                              int64_t  stride_h,
                                                              uint32_t seq_idx,
                                                              uint32_t stride_seq,
                                                              uint32_t lane_off)
 {
-    return static_cast<int64_t>(batch_id) * stride_bz + static_cast<int64_t>(head_id) * stride_h
+    return static_cast<int64_t>(batch_id) * stride_batch + static_cast<int64_t>(head_id) * stride_h
            + static_cast<int64_t>(seq_idx) * stride_seq + static_cast<int64_t>(lane_off);
 }
 
@@ -66,14 +66,14 @@ struct vec_storage<16> {
 
 // One LDG/STG worth of elements. alignas guarantees the vector width is legal
 // whenever the pointer arithmetic that produced `p` is element-aligned.
-template<typename T, int VEC>
-struct alignas(VEC * sizeof(T)) vec_t {
-    static constexpr int kBytes = VEC * static_cast<int>(sizeof(T));
+template<typename T, int pack_size>
+struct alignas(pack_size * sizeof(T)) vec_t {
+    static constexpr int kBytes = pack_size * static_cast<int>(sizeof(T));
     static_assert(kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
                   "vec_t must map to exactly one LDG/STG (2/4/8/16 bytes)");
     using storage_t = typename vec_storage<kBytes>::type;
 
-    T data[VEC];
+    T data[pack_size];
 
     __device__ __forceinline__ T& operator[](int i)
     {

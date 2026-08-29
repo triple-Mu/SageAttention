@@ -41,13 +41,13 @@ namespace mma {
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120400)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
-#define MMA_F8F8F32_M16N8K16_ENABLED
+#define MMA_F8F8F32_M16N8K32_ENABLED
 #endif
 #endif
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
-#define MMA_F8F8F16_M16N8K16_ENABLED
+#define MMA_F8F8F16_M16N8K32_ENABLED
 #endif
 #endif
 
@@ -74,10 +74,10 @@ template<typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x2(uint32_t* R, T* smem_ptr)
 {
 #ifdef LDMATRIX_M8N8X2_ENABLED
-    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                  : "=r"(R[0]), "=r"(R[1])
-                 : "r"(smem_int_ptr));
+                 : "r"(smem_addr));
 #else
     RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
@@ -94,10 +94,10 @@ template<typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr)
 {
 #ifdef LDMATRIX_M8N8X4_ENABLED
-    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
-                 : "r"(smem_int_ptr));
+                 : "r"(smem_addr));
 #else
     RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
@@ -114,10 +114,10 @@ template<typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr)
 {
 #ifdef LDMATRIX_M8N8X4_ENABLED
-    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile("ldmatrix.sync.aligned.trans.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
-                 : "r"(smem_int_ptr));
+                 : "r"(smem_addr));
 #else
     RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
@@ -448,7 +448,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
 template<MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k32_row_col_f8f8f32(float* C, uint32_t* A, uint32_t* B)
 {
-#ifdef MMA_F8F8F32_M16N8K16_ENABLED
+#ifdef MMA_F8F8F32_M16N8K32_ENABLED
     if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                      "{%0,  %1,  %2,  %3},"
@@ -494,7 +494,7 @@ template<MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f16(uint32_t* C_uint32, uint32_t* A, uint32_t* B)
 {
     // uint32_t* C_uint32 = reinterpret_cast<uint32_t*>(C);
-#ifdef MMA_F8F8F16_M16N8K16_ENABLED
+#ifdef MMA_F8F8F16_M16N8K32_ENABLED
     if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
@@ -547,7 +547,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f16(uint32_t* C_u
 template<MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uint32_t* A, uint32_t* B)
 {
-#ifdef MMA_F8F8F32_M16N8K16_ENABLED
+#ifdef MMA_F8F8F32_M16N8K32_ENABLED
     if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                      "{%0,  %1,  %2,  %3},"
@@ -639,7 +639,7 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s)
  */
 __device__ __forceinline__ void rowsum_f8f8f32(float* d, uint32_t* s)
 {
-#ifdef MMA_F8F8F32_M16N8K16_ENABLED
+#ifdef MMA_F8F8F32_M16N8K32_ENABLED
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,  _,  %1,  _},"
                  "{%2,  %3,  %4,  %5},"
