@@ -392,6 +392,38 @@ def test_quant_v_fp8_varlen_tail_is_zero(v_layout, smooth_v, pad):
 
 @requires_fp8_cast
 @pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
+def test_quant_v_fp8_varlen_zero_amax_channel(v_layout):
+    """The dense and packed paths are the same kernel, so the zero-amax guard
+    (a channel whose amax is 0 used to quantize as 0 * inf = NaN) has to hold
+    per sequence here as well -- amax is reduced over one sequence's slab, and
+    an empty sequence leaves the scale at the zero the allocation put there."""
+    lens = [37, 128, 0, 300]
+    zero_ch, live_ch = 3, 0
+    cu_list = cu_of(lens)
+    packed = rand_packed(lens, seed=37)
+    packed[..., zero_ch] = 0.0
+    cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
+
+    v_fp8, v_scale, _ = OPS.quant_v_fp8_varlen(
+        packed,
+        cu,
+        max_seqlen_k=max(lens),
+        v_layout=v_layout,
+        scale_max=448.0,
+        smooth_v=False,
+        pad_multiple=V_PAD,
+    )
+
+    assert not v_fp8.float().isnan().any()
+    assert (v_fp8[:, zero_ch].float() == 0).all()
+    assert (v_scale[:, :, zero_ch] == 0).all()
+    for b, n in enumerate(lens):
+        if n:
+            assert (v_scale[b, :, live_ch] > 0).all(), f"sequence {b}"
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
 @pytest.mark.parametrize("smooth_v", [False, True])
 def test_opcheck_quant_v_fp8_varlen(v_layout, smooth_v):
     lens = [37, 128, 300]

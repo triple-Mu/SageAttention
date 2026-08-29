@@ -69,10 +69,23 @@ requires_varlen = pytest.mark.skipif(
 
 # The fp8 quantization kernels emit `cvt.rn.satfinite.e4m3x2.f32`, which only
 # exists on sm_89+; below that the device code falls into RUNTIME_ASSERT ->
-# __brkpt(), which kills the CUDA context rather than raising.
+# __brkpt(), which kills the CUDA context rather than raising. The same trap
+# is reached on an sm_89+ GPU running a build with no sm_89+ code in it (an
+# sm_86 cubin loads fine on sm_89), so gate on the build as well.
 requires_fp8_cast = pytest.mark.skipif(
-    CC is None or CC < (8, 9),
-    reason=f"fp8 cast instruction needs sm_89+, device is sm_{CC}" if CC else "needs CUDA",
+    CC is None or CC < (8, 9) or not any(a >= 89 for a in COMPILED_ARCHS),
+    reason=f"fp8 cast needs an sm_89+ device and build, "
+    f"device=sm_{CC}, compiled_archs={COMPILED_ARCHS}"
+    if CC
+    else "needs CUDA",
+)
+
+# End-to-end fp8 PV coverage additionally needs this GPU to resolve to an fp8
+# backend (every backend except sm80); a mismatched build resolves to sm80 or
+# to nothing and would silently test the fp16 path instead.
+requires_fp8_backend = pytest.mark.skipif(
+    RESOLVED_BACKEND in (None, "sm80"),
+    reason=f"needs an fp8 PV backend, resolved={RESOLVED_BACKEND}",
 )
 
 

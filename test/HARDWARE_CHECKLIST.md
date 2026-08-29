@@ -33,6 +33,16 @@ max_seqlen 的 dense,同数据同 API,`--csv` 存表)。
 
 - [ ] sm89(4090/L40S):`--dump`/`--check` 全绿;A4-1 主循环合并(见 §3)与
       `quant_v_fp8(pad_multiple)` 修复由 equiv 段覆盖。
+- [ ] sm89+ 任一实机:fp8 zero-amax 回归(`test_ops.py` 的
+      `test_quant_v_fp8_zero_amax_channel` / `test_quant_v_fp8_subnormal_amax_channel`
+      / `test_sageattn_zero_v_channel_fp8`,以及 `test_varlen.py` 的
+      `test_quant_v_fp8_varlen_zero_amax_channel`,本机 sm86 全部 skip)。
+      修复前 V 的全零 channel(或 smooth_v 下常数 channel、bf16 subnormal
+      amax)量化成 fp8 NaN 行,污染对应输出 channel;修复后应为精确 0。
+      dense 与 packed 是同一个 `MeanScaleKernel`,所以两条路径一起修好。
+      对 §1 bitwise 对拍无影响:degenerate channel 只出现在 hd=96 e2e case 的
+      head_dim pad 区,dump 前已被 slice 掉。e2e 的 smooth_v 只在 sm120 真正
+      生效,其余 fp8 backend 降级。
 - [ ] sm120(5090):同上,并且 `backend="sm89"` fallback 路径与
       `backend="sm120"` 各自对拍(sm120 是同一批 sm89 TU 的
       `SAGEATTN_ARCH_NS=sm120` 双编译)。

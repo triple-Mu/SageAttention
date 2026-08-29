@@ -537,7 +537,16 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
     if constexpr (sub_mean) {
         mean_val = smem_mean;
     }
+    // amax == 0 (an all-zero channel, or a constant channel under sub_mean)
+    // makes this division inf, and quantizing 0 * inf = NaN emits fp8 0x7f,
+    // which poisons the whole output channel through the PV mma. A subnormal
+    // amax (bf16 input) reaches inf too: ftz flushes it to zero, or without
+    // ftz the division overflows. The stored scale is (near) zero in both
+    // cases, so quantizing the channel to (signed) zero is exact.
     float recip_scale = scale_max / smem_amax;
+    if (!isfinite(recip_scale)) {
+        recip_scale = 0.0f;
+    }
 
     auto quantize_store = [&](const pack_t& x_val, uint32_t i) {
         float    x_val_float[8];

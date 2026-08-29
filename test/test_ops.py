@@ -15,8 +15,10 @@ from conftest import (
     backend_available,
     requires_backend,
     requires_cuda,
+    requires_fp8_backend,
     requires_fp8_cast,
 )
+from sageattention import sageattn
 from sageattention._plan import Plan
 
 DEV = "cuda"
@@ -483,6 +485,98 @@ def test_opcheck_quant_v_fp8(layout, v_layout, smooth_v):
             pad_multiple=64,
         ),
     )
+
+
+# ------------------------------------- fp8 V quantization, zero-amax channels
+
+# arbitrary channel indices, < every supported head_dim; LIVE_CH stays random
+ZERO_CH, CONST_CH, LIVE_CH = 3, 5, 0
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("smooth_v", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_quant_v_fp8_zero_amax_channel(layout, smooth_v, head_dim):
+    """A channel with amax == 0 used to quantize as 0 * (scale_max / 0) = NaN,
+    i.e. a whole fp8 row of 0x7f that poisons its output channel through the
+    PV mma. It must quantize to zero values with a zero scale instead. amax is
+    zero for an all-zero channel and, under smooth_v, for a constant channel
+    (max == min == mean). seq must stay 256: the constant-channel mean is only
+    exact when the token count is 16-aligned and (3.0 * n) / n survives the
+    fast-math reciprocal division, both of which hold for n = 256."""
+    v = torch.randn(_v_shape(layout, seq=256, head_dim=head_dim), device=DEV, dtype=torch.float16)
+    v[..., ZERO_CH] = 0.0
+    v[..., CONST_CH] = 3.0
+
+    v_fp8, v_scale, v_mean = OPS.quant_v_fp8(
+        v,
+        tensor_layout=layout,
+        v_layout="mma_k16",
+        scale_max=448.0,
+        smooth_v=smooth_v,
+        pad_multiple=64,
+    )
+
+    assert not v_fp8.float().isnan().any()
+    d_dim = 2 if layout == "HND" else 1  # v_fp8 is transposed: [B,H,D,seq] / [B,D,H,seq]
+    # compare values, not bytes: -0.0 (byte 0x80) is a legal quantization of 0
+    assert (v_fp8.select(d_dim, ZERO_CH).float() == 0).all()
+    assert (v_scale[..., ZERO_CH] == 0).all()
+    # a healthy channel must not get zeroed along with the degenerate ones
+    assert (v_scale[..., LIVE_CH] > 0).all()
+    assert v_fp8.select(d_dim, LIVE_CH).view(torch.uint8).any()
+    if smooth_v:
+        assert (v_fp8.select(d_dim, CONST_CH).float() == 0).all()
+        assert (v_scale[..., CONST_CH] == 0).all()
+        assert (v_mean[..., CONST_CH] == 3.0).all()
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_quant_v_fp8_subnormal_amax_channel(layout):
+    """bf16 subnormals are fp32 subnormals, so scale_max / amax reaches inf
+    without amax being zero (ftz flushes amax to zero, or the division itself
+    overflows); the channel's zero elements then quantized to NaN exactly like
+    the amax == 0 case. fp16 cannot trigger this: its smallest subnormal is a
+    normal fp32 value."""
+    v = torch.randn(_v_shape(layout), device=DEV, dtype=torch.bfloat16)
+    v[..., ZERO_CH] = 0.0
+    v[0, 0, 0, ZERO_CH] = 1e-40  # rounds to the smallest bf16 subnormal
+
+    v_fp8, v_scale, _ = OPS.quant_v_fp8(
+        v,
+        tensor_layout=layout,
+        v_layout="mma_k16",
+        scale_max=448.0,
+        smooth_v=False,
+        pad_multiple=64,
+    )
+
+    assert not v_fp8.float().isnan().any()
+    d_dim = 2 if layout == "HND" else 1
+    assert (v_fp8.select(d_dim, ZERO_CH).float() == 0).all()
+    # amax / scale_max: either flushed to zero or an fp32 subnormal
+    assert (v_scale[..., ZERO_CH] < 1e-30).all()
+
+
+@requires_fp8_backend
+@pytest.mark.parametrize("smooth_v", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_sageattn_zero_v_channel_fp8(smooth_v, head_dim):
+    """End-to-end on the fp8 PV backends: an all-zero V channel must come out
+    as exactly zero, not NaN. smooth_v only reaches the fused v_mean kernel on
+    the backends whose plan supports it (sm120); elsewhere it downgrades and
+    duplicates the False case."""
+    q, k, v = [
+        torch.randn((2, 4, 256, head_dim), device=DEV, dtype=torch.float16) for _ in range(3)
+    ]
+    v[..., ZERO_CH] = 0.0
+    with torch.no_grad():
+        out = sageattn(q, k, v, is_causal=False, smooth_v=smooth_v)
+    assert not out.isnan().any()
+    assert (out[..., ZERO_CH] == 0).all()
+    assert out[..., LIVE_CH].any()  # the rest of the output must survive
 
 
 # ------------------------------------------------------------- fake coverage
