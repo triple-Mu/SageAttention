@@ -23,6 +23,7 @@ from conftest import (
     requires_cuda,
     requires_fp8_cast,
     requires_varlen,
+    requires_varlen_backend,
 )
 from sageattention import sageattn, sageattn_varlen
 
@@ -285,29 +286,30 @@ def one_sequence(packed, cu_list, b):
 @requires_cuda
 @pytest.mark.parametrize("permute", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("pad", [64, 128])
 @pytest.mark.parametrize("lens", [[128], [37, 128, 1, 300], [64, 0, 64]], ids=str)
-def test_transpose_pad_v_varlen_matches_per_sequence_dense(permute, head_dim, lens):
+def test_transpose_pad_v_varlen_matches_per_sequence_dense(permute, head_dim, pad, lens):
     """The transpose is the only fp16-in/fp16-out stage of the fp8 V pipeline,
     so it is the one whose packed addressing can be checked on a pre-sm_89
     device. Each sequence's slab must equal the dense transpose of that
     sequence, zero fill included, and nothing past the written prefix may move
-    (the buffer starts as NaN)."""
+    (the buffer starts as NaN). pad=128 is the sm90/sm100 alignment: the kernel
+    still writes only the 64-aligned prefix, so a slab's tail stays untouched
+    and the fp8 allocation is what zeroes it."""
     cu_list = cu_of(lens)
     total, batch, heads = cu_list[-1], len(lens), 2
     packed = rand_packed(lens, heads, head_dim)
     cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
 
-    padded_total = blk_total(total, batch, V_PAD) * V_PAD
-    out = torch.full(
-        (heads, head_dim, padded_total), float("nan"), device=DEV, dtype=torch.float16
-    )
-    OPS.transpose_pad_v(packed, out, "HND", permute, cu, max_seqlen=max(lens), pad_multiple=V_PAD)
+    padded_total = blk_total(total, batch, pad) * pad
+    out = torch.full((heads, head_dim, padded_total), float("nan"), device=DEV, dtype=torch.float16)
+    OPS.transpose_pad_v(packed, out, "HND", permute, cu, max_seqlen=max(lens), pad_multiple=pad)
 
     for b, n in enumerate(lens):
-        base = pad_offset(cu_list, b, V_PAD)
+        base = pad_offset(cu_list, b, pad)
         written = cdiv(n, 64) * 64
         # a sequence never writes past the blocks varlen.h gave it
-        assert out[:, :, base + written : pad_offset(cu_list, b + 1, V_PAD)].isnan().all(), (
+        assert out[:, :, base + written : pad_offset(cu_list, b + 1, pad)].isnan().all(), (
             f"sequence {b} spilled"
         )
         if n == 0:
@@ -347,22 +349,25 @@ def test_quant_v_fp8_varlen_matches_per_sequence_dense(v_layout, smooth_v):
 
 @requires_fp8_cast
 @pytest.mark.parametrize("smooth_v", [False, True])
-def test_quant_v_fp8_varlen_tail_is_zero(smooth_v):
+@pytest.mark.parametrize("pad", [64, 128])
+def test_quant_v_fp8_varlen_tail_is_zero(smooth_v, pad):
     """The white-box invariant the sm89 V load runs on: it reads whole CTA_K
     tiles straight out of the slab with no predicate, so every byte from a
     sequence's length to the end of its blocks has to be a zero fp8 - not
-    stale, and above all not a NaN encoding (0 * NaN would poison PV)."""
+    stale, and above all not a NaN encoding (0 * NaN would poison PV). At
+    pad=128 (sm90/sm100) part of that tail is never written at all, and the
+    zeroed allocation is what has to cover it."""
     lens = [37, 128, 0, 1, 300]
     cu_list = cu_of(lens)
     packed = rand_packed(lens, seed=29)
     cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
 
     v_fp8 = OPS.quant_v_fp8_varlen(
-        packed, cu, max_seqlen_k=max(lens), smooth_v=smooth_v, pad_multiple=V_PAD
+        packed, cu, max_seqlen_k=max(lens), smooth_v=smooth_v, pad_multiple=pad
     )[0].view(torch.uint8)
 
     for b, n in enumerate(lens):
-        base, end = pad_offset(cu_list, b, V_PAD), pad_offset(cu_list, b + 1, V_PAD)
+        base, end = pad_offset(cu_list, b, pad), pad_offset(cu_list, b + 1, pad)
         assert (v_fp8[:, :, base + n : end] == 0).all(), f"sequence {b}"
 
 
@@ -657,6 +662,10 @@ def test_opcheck_fwd_varlen(causal, return_lse):
 
 
 # ------------------------------------------------------- sageattn_varlen API
+# From here down the tests go through the public entry point and name no tile
+# geometry, accumulator or V layout, so they are gated on "some packed-layout
+# backend is runnable" rather than on sm80: an sm89 / sm120 device runs this
+# whole section against its own fp8 kernels.
 
 
 def dense_of(packed, lens):
@@ -665,7 +674,7 @@ def dense_of(packed, lens):
     return packed.view(len(lens), n, packed.size(1), packed.size(2)).transpose(1, 2).contiguous()
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 @pytest.mark.parametrize("smooth_k", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -712,7 +721,7 @@ VARLEN_SEGMENTATIONS = [
 ]
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 @pytest.mark.parametrize("smooth_k", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("q_lens,k_lens", VARLEN_SEGMENTATIONS, ids=lambda p: "x".join(map(str, p)))
@@ -750,7 +759,7 @@ def test_sageattn_varlen_matches_segmented_sdpa(smooth_k, causal, q_lens, k_lens
     assert torch.equal(lse[~live], ref_lse[~live]), "dead rows must carry -inf"
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 def test_sageattn_varlen_gqa_and_head_dim_pad():
     """GQA plus a head_dim that is not 64 or 128: the pad is the dense one and
     the output is sliced back."""
@@ -768,7 +777,34 @@ def test_sageattn_varlen_gqa_and_head_dim_pad():
     assert cs > COS_MIN, f"cos_sim={cs:.5f}"
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
+@pytest.mark.parametrize("causal", [False, True])
+def test_sageattn_varlen_empty_kv_through_the_api(causal):
+    """The empty-KV shortcut, reached through the public entry point so that it
+    covers whichever backend the device resolves to (the kernel-level version
+    above is pinned to sm80). On the fp8 backends this is also the check that
+    the sequence owning no key still has a valid, zeroed V^T slab."""
+    q_lens, k_lens = [64, 128, 32], [64, 0, 32]
+    cu_q, cu_k = cu_of(q_lens), cu_of(k_lens)
+    g = torch.Generator(device=DEV).manual_seed(53)
+    q = torch.randn((cu_q[-1], 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((cu_k[-1], 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((cu_k[-1], 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    tq = torch.tensor(cu_q, device=DEV, dtype=torch.int32)
+    tk = torch.tensor(cu_k, device=DEV, dtype=torch.int32)
+
+    with torch.no_grad():
+        out, lse = sageattn_varlen(
+            q, k, v, tq, tk, max(q_lens), max(k_lens), is_causal=causal, return_lse=True
+        )
+
+    empty = slice(cu_q[1], cu_q[2])
+    assert not out[empty].any(), "the empty sequence must produce zeros"
+    assert torch.isinf(lse[:, empty]).all() and (lse[:, empty] < 0).all()
+    assert out[: cu_q[1]].any() and out[cu_q[2] :].any(), "the neighbours must be untouched"
+
+
+@requires_varlen_backend
 def test_sageattn_varlen_rejects_dense_input():
     q = torch.randn((2, 4, 64, 64), device=DEV, dtype=torch.float16)
     cu = torch.tensor([0, 64, 128], device=DEV, dtype=torch.int32)
@@ -779,7 +815,7 @@ def test_sageattn_varlen_rejects_dense_input():
 # ---------------------------------------------------------- compile / cudagraph
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 @pytest.mark.parametrize("smooth_k", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_varlen_no_graph_breaks(smooth_k, return_lse):
@@ -805,7 +841,7 @@ def test_varlen_no_graph_breaks(smooth_k, return_lse):
     assert explanation.graph_break_count == 0, explanation.break_reasons
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 def test_varlen_compiled_matches_eager():
     torch._dynamo.reset()
     lens = [100, 256, 37]
@@ -822,7 +858,7 @@ def test_varlen_compiled_matches_eager():
     assert torch.equal(got, want)
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 def test_cudagraph_replay_with_a_new_segmentation():
     """The whole point of the closed-form block algebra: no tensor shape depends
     on the contents of cu_seqlens, so a replay may re-split the same tokens.
@@ -861,7 +897,7 @@ def test_cudagraph_replay_with_a_new_segmentation():
             assert torch.equal(static_out, want), f"replay with {lens}"
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 def test_smooth_v_is_ignored_with_a_warning():
     """resolve() drops smooth_v for varlen; the entry point says so once and
     returns the same answer it would have without the request."""
@@ -882,7 +918,7 @@ def test_smooth_v_is_ignored_with_a_warning():
     assert torch.equal(got, want)
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 def test_requires_grad_raises():
     lens = [64]
     cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
@@ -891,7 +927,7 @@ def test_requires_grad_raises():
         sageattn_varlen(q, q, q, cu, cu, 64, 64)
 
 
-@requires_backend("sm80")
+@requires_varlen_backend
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_output_dtype_follows_input(dtype):
     """bfloat16 is a separate kernel instantiation (DTypeOut), so it gets its

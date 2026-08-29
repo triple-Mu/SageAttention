@@ -35,6 +35,11 @@ import torch
 from ._plan import get_plan
 from .core import _LOG2E_V2, _pad_qkv_head_dim, _warned_configs
 
+# Backends with a packed-layout attention kernel, mirroring the dispatch table
+# in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
+# raise keeps a device without one from paying for the quantization first.
+_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm120"})
+
 
 def _segment_ids(cu_seqlens: torch.Tensor, batch_size: int, total: int) -> torch.Tensor:
     """``[total]`` int64 tensor mapping each packed token to its sequence."""
@@ -228,10 +233,10 @@ def sageattn_varlen(
         if key not in _warned_configs:
             _warned_configs.add(key)
             warnings.warn("smooth_v has no varlen kernel and will be ignored.", stacklevel=2)
-    if p.pv_fp8:
+    if p.backend not in _VARLEN_BACKENDS:
         raise NotImplementedError(
-            f"sageattn_varlen is implemented for the sm80 backend; this device resolves to "
-            f"{p.backend}, whose fp8 value path has no packed-layout kernel yet"
+            f"sageattn_varlen has packed-layout kernels for {sorted(_VARLEN_BACKENDS)}; "
+            f"this device resolves to {p.backend}"
         )
 
     # batch_size and the totals are static shapes, so the traced graph never
@@ -261,15 +266,33 @@ def sageattn_varlen(
         warp_k=p.warp_k,
     )
 
+    # ---- V preparation ----
+    # The fp8 V^T is padded per sequence rather than per batch entry: the
+    # attention kernel reads whole CTA_K tiles out of a sequence's slab with no
+    # bound predicate, so the padding has to sit inside the sequence.
+    value_scale = None
+    if p.pv_fp8:
+        v_prep, value_scale, _ = torch.ops.sageattention.quant_v_fp8_varlen(
+            v,
+            cu_seqlens_k,
+            max_seqlen_k=max_seqlen_k,
+            v_layout=p.v_layout,
+            scale_max=p.v_scale_max,
+            smooth_v=False,  # resolve() downgrades it; there is no varlen v_mean kernel
+            pad_multiple=p.v_pad_multiple,
+        )
+    else:
+        v_prep = v.to(torch.float16)
+
     out, lse = torch.ops.sageattention.fwd_varlen(
         q_int8,
         k_int8,
-        v.to(torch.float16),
+        v_prep,
         q_scale,
         k_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
+        value_scale,
         None,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,

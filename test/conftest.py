@@ -49,6 +49,17 @@ def requires_backend(name):
 
 requires_cuda = pytest.mark.skipif(not CUDA_AVAILABLE, reason="needs CUDA")
 
+# Backends with a packed-layout kernel. The sageattn_varlen API tests are
+# written against the public entry point and say nothing about tile geometry or
+# accumulator, so they run on whichever of these the device resolves to; the
+# kernel-level tests stay pinned to one backend with requires_backend.
+VARLEN_BACKENDS = ("sm80", "sm89", "sm120")
+requires_varlen_backend = pytest.mark.skipif(
+    not any(backend_available(b) for b in VARLEN_BACKENDS),
+    reason=f"no packed-layout backend runnable here "
+    f"(compiled_archs={COMPILED_ARCHS}, cc={CC}, resolved={RESOLVED_BACKEND})",
+)
+
 # -DSAGE_BUILD_VARLEN=OFF drops the packed-layout kernel TUs; the ops stay
 # registered and raise, so their tests skip rather than fail.
 BUILD_VARLEN = bool(getattr(sageattention._C, "build_varlen", 0))

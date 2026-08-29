@@ -35,6 +35,25 @@ python compare_reference.py --check --golden-dir <dir> --backend new
 - [ ] sm100(B200/GB200):顺序必须是 `SAGE_SM100_PV_FROM_SMEM=1` 的 SS twin
       先验数值 → 切 TS 路径对拍 → 才谈性能。`SAGEATTN_SM100_TCGEN05=1` 开门。
 
+## 1b. varlen(packed cu_seqlens 布局)
+
+本机 sm_86 只能跑 sm80 的 packed kernel,以及 fp8 V 流水里唯一 fp16 进
+fp16 出的那一级(transpose)。fp8 的 V^T 量化和 sm89/sm120 的 packed
+attention 一行都没在硬件上执行过。H200 也顶不上:sm90 resolve 到
+`kSm90F8`,还没有 packed kernel(P3 的事)。
+
+- [ ] sm89(4090/L40S)与 sm120(5090):`pytest test/test_varlen.py -q`。
+      `sageattn_varlen` 那一段的开关是「本机 resolve 到哪个 packed
+      backend」,所以在这两张卡上它跑的就是新的 fp8 packed kernel——等长
+      batch 对 dense 的 `torch.equal`、ragged 的分段 SDPA 精度、
+      bottom-right causal、空 KV 段、cudagraph 换分段 replay。
+- [ ] 同两张卡:`quant_v_fp8_varlen` 的三个 fp8 用例(逐段对 dense 全等、
+      每段 `[n_b, 段 padded 末)` 的 fp8 字节全零、opcheck)。这条白盒不变量
+      是 sm89 V 加载能不带边界 predicate 的前提。
+- [ ] 口径提醒:sm89 的 varlen 只实例化 `pv_accum_dtype="fp32+fp16"`、
+      sm120 只实例化 `"fp32"`(plan.cpp 的默认值)。别的组合会明确报错,
+      不会静默降级,所以对拍脚本里不要顺手换 pv。
+
 ## 2. A4-1 合并的性能复核(sm89/sm120)
 
 本机已验证:SASS 算术/MMA/访存指令 132/132 实例逐条相同,spill 合计净减

@@ -53,17 +53,17 @@ torch::Tensor qk_int8_sv_f16_accum_f32_varlen_attn(torch::Tensor query,
 {
     const c10::cuda::CUDAGuard device_guard(query.device());
 
-    QKVVarlenLayout qkv = qkv_varlen_layout_parse(query,
-                                                  key,
-                                                  value,
-                                                  output,
-                                                  query_scale,
-                                                  key_scale,
-                                                  cu_seqlens_q,
-                                                  cu_seqlens_k,
-                                                  max_seqlen_q_in,
-                                                  max_seqlen_k_in,
-                                                  return_lse);
+    QKVVarlenLayout qkv = qkv_varlen_layout_parse<QKVFamily::kSVF16>(query,
+                                                                     key,
+                                                                     value,
+                                                                     output,
+                                                                     query_scale,
+                                                                     key_scale,
+                                                                     cu_seqlens_q,
+                                                                     cu_seqlens_k,
+                                                                     max_seqlen_q_in,
+                                                                     max_seqlen_k_in,
+                                                                     return_lse);
     SAGEATTN_QKV_VARLEN_LOCALS_F16(qkv);
 
     auto         out_dtype = output.scalar_type();

@@ -133,6 +133,13 @@ set(SAGE_SRC_SM120_TUS
   csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu
   csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu
   csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu)
+# The packed-layout TUs of the same family. They compile the same header with
+# -DSAGE_VARLEN into <arch>_varlen namespaces, one TU each: the pv_accum_dtype
+# plan.cpp resolves to by default for that arch (sm89 fp32+fp16, sm120 fp32).
+set(SAGE_SRC_SM89_VARLEN_TUS
+  csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf.cu)
+set(SAGE_SRC_SM120_VARLEN_TUS
+  csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn.cu)
 
 set(SAGE_SOURCES ${SAGE_SRC_BINDING})
 set(SAGEATTN_BUILD_SM80 0)
@@ -183,6 +190,14 @@ if(SAGE_ARCHS_SM89)
   list(APPEND SAGE_ARCH_OBJECT_TARGETS sage_sm89_objs)
   set(SAGEATTN_BUILD_SM89 1)
   message(STATUS "[sageattention] SM89: ${_sm89_gencode}")
+  if(SAGE_BUILD_VARLEN)
+    add_library(sage_sm89_varlen_objs OBJECT ${SAGE_SRC_SM89_VARLEN_TUS})
+    target_link_libraries(sage_sm89_varlen_objs PRIVATE sage_common)
+    target_compile_definitions(sage_sm89_varlen_objs PRIVATE SAGEATTN_ARCH_NS=sm89_varlen)
+    target_compile_options(sage_sm89_varlen_objs PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${_sm89_gencode}>)
+    list(APPEND SAGE_ARCH_OBJECT_TARGETS sage_sm89_varlen_objs)
+  endif()
 else()
   message(STATUS "[sageattention] skip SM89: no requested compute capability is served by it")
 endif()
@@ -196,6 +211,14 @@ if(SAGE_ARCHS_SM120)
   list(APPEND SAGE_ARCH_OBJECT_TARGETS sage_sm120_objs)
   set(SAGEATTN_BUILD_SM120 1)
   message(STATUS "[sageattention] SM120: ${_sm120_gencode}")
+  if(SAGE_BUILD_VARLEN)
+    add_library(sage_sm120_varlen_objs OBJECT ${SAGE_SRC_SM120_VARLEN_TUS})
+    target_link_libraries(sage_sm120_varlen_objs PRIVATE sage_common)
+    target_compile_definitions(sage_sm120_varlen_objs PRIVATE SAGEATTN_ARCH_NS=sm120_varlen)
+    target_compile_options(sage_sm120_varlen_objs PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${_sm120_gencode}>)
+    list(APPEND SAGE_ARCH_OBJECT_TARGETS sage_sm120_varlen_objs)
+  endif()
 else()
   message(STATUS "[sageattention] skip SM120: no requested compute capability is served by it")
 endif()

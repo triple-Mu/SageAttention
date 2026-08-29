@@ -335,8 +335,13 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
 // The packed [total_tokens, heads, head_dim] counterpart of the above. It is a
 // separate parse rather than a flag on qkv_layout_parse: the ranks differ, the
 // scale tensors lose their batch dimension, and the dense error strings are
-// pinned by tests. Only the fp16 (seq-major value) family exists so far - the
-// transposed-value families get their value branch with their varlen TUs.
+// pinned by tests.
+//
+// The value tensor is the one that differs between the families, exactly as it
+// does on the dense side. kSVF16 takes it packed like q and k; the fp8
+// families take it already transposed and zero-padded per sequence, as
+// [heads, head_dim, blk_total * pad], so it is addressed through the padded
+// coordinate system of varlen.h rather than the token one.
 struct QKVVarlenLayout {
     int64_t       batch_size;
     int64_t       head_dim;
@@ -346,11 +351,14 @@ struct QKVVarlenLayout {
     int64_t       stride_seq_q, stride_h_q;
     int64_t       stride_seq_k, stride_h_k;
     int64_t       stride_seq_v, stride_h_v;
+    int64_t       stride_d_v;  // transposed-value families
+    int64_t       padded_k;    // their value's padded token axis
     int64_t       stride_seq_o, stride_h_o;
     int64_t       q_scale_stride_h, k_scale_stride_h;
     torch::Tensor lse;  // empty unless return_lse
 };
 
+template<QKVFamily kFamily>
 inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
                                                const torch::Tensor& key,
                                                const torch::Tensor& value,
@@ -363,6 +371,8 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
                                                int64_t              max_seqlen_k,
                                                int                  return_lse)
 {
+    static_assert(kFamily != QKVFamily::kSVF8TMA, "the sm90/sm100 varlen value branch is not written yet");
+
     CHECK_CUDA(query);
     CHECK_CUDA(key);
     CHECK_CUDA(value);
@@ -372,14 +382,22 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
 
     CHECK_CONTIGUOUS(query);
     CHECK_CONTIGUOUS(key);
-    CHECK_LASTDIM_CONTIGUOUS(value);
+    if constexpr (kFamily == QKVFamily::kSVF16) {
+        CHECK_LASTDIM_CONTIGUOUS(value);
+    }
+    else {
+        CHECK_CONTIGUOUS(value);  // ensure value is contiguous to prevent troubles in the kernel
+    }
     CHECK_LASTDIM_CONTIGUOUS(output);
     CHECK_CONTIGUOUS(query_scale);
     CHECK_CONTIGUOUS(key_scale);
 
     CHECK_DTYPE(query, torch::kInt8);
     CHECK_DTYPE(key, torch::kInt8);
-    CHECK_DTYPE(value, torch::kHalf);
+    if constexpr (kFamily == QKVFamily::kSVF16) {
+        CHECK_DTYPE(value, torch::kHalf);
+    }
+    // kSVF8CudaCore leaves the fp8 value's dtype unchecked, as the dense parse does
     CHECK_DTYPE(query_scale, torch::kFloat32);
     CHECK_DTYPE(key_scale, torch::kFloat32);
 
@@ -415,7 +433,25 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     const int64_t num_kv_heads = layout.num_kv_heads;
 
     CHECK_SHAPE(key, total_k, num_kv_heads, head_dim);
-    CHECK_SHAPE(value, total_k, num_kv_heads, head_dim);
+    if constexpr (kFamily == QKVFamily::kSVF16) {
+        CHECK_SHAPE(value, total_k, num_kv_heads, head_dim);
+    }
+    else {
+        // [heads, head_dim, padded]; the padded extent is the caller's block
+        // algebra and is checked against CTA_K at the launcher.
+        TORCH_CHECK(value.size(0) == num_kv_heads,
+                    "transposed value dim 0 (",
+                    value.size(0),
+                    ") must be num_kv_heads (",
+                    num_kv_heads,
+                    ")");
+        TORCH_CHECK(value.size(1) == head_dim,
+                    "transposed value dim 1 (",
+                    value.size(1),
+                    ") must be head_dim (",
+                    head_dim,
+                    ")");
+    }
     CHECK_SHAPE(output, total_q, num_qo_heads, head_dim);
 
     TORCH_CHECK_VALUE(num_qo_heads % num_kv_heads == 0,
@@ -430,10 +466,20 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     layout.stride_h_q   = query.stride(1);
     layout.stride_seq_k = key.stride(0);
     layout.stride_h_k   = key.stride(1);
-    layout.stride_seq_v = value.stride(0);
-    layout.stride_h_v   = value.stride(1);
     layout.stride_seq_o = output.stride(0);
     layout.stride_h_o   = output.stride(1);
+    layout.stride_seq_v = 0;
+    layout.stride_d_v   = 0;
+    layout.padded_k     = 0;
+    if constexpr (kFamily == QKVFamily::kSVF16) {
+        layout.stride_seq_v = value.stride(0);
+        layout.stride_h_v   = value.stride(1);
+    }
+    else {
+        layout.stride_h_v = value.stride(0);
+        layout.stride_d_v = value.stride(1);
+        layout.padded_k   = value.size(2);
+    }
 
     TORCH_CHECK(query_scale.size(0) == num_qo_heads,
                 "query_scale must be [num_qo_heads, blocks], got dim 0 = ",
@@ -451,7 +497,13 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     CHECK_LEN_I32(max_seqlen_k, max_seqlen_k);
     CHECK_STRIDE_LOOP32(query, layout.stride_seq_q);
     CHECK_STRIDE_LOOP32(key, layout.stride_seq_k);
-    CHECK_STRIDE_LOOP32(value, layout.stride_seq_v);
+    if constexpr (kFamily == QKVFamily::kSVF16) {
+        CHECK_STRIDE_LOOP32(value, layout.stride_seq_v);
+    }
+    else {
+        CHECK_LEN_I32(padded_k, layout.padded_k);
+        CHECK_STRIDE_LOOP32(value, layout.stride_d_v);
+    }
     CHECK_STRIDE_LOOP32(output, layout.stride_seq_o);
     CHECK_STRIDE_LOOP32(query_scale, layout.q_scale_stride_h);
     CHECK_STRIDE_LOOP32(key_scale, layout.k_scale_stride_h);
@@ -507,7 +559,7 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
 // The varlen counterpart. Same width contract: the per-head strides stay
 // 64-bit (used once for the base offset), the loop-carried token strides
 // re-narrow to uint32_t.
-#define SAGEATTN_QKV_VARLEN_LOCALS_F16(L)                                                                              \
+#define SAGEATTN_QKV_VARLEN_LOCALS_COMMON(L)                                                                           \
     const int64_t  batch_size       = (L).batch_size;                                                                  \
     const int64_t  head_dim         = (L).head_dim;                                                                    \
     const int64_t  total_q          = (L).total_q;                                                                     \
@@ -521,10 +573,21 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     const int64_t  stride_h_q       = (L).stride_h_q;                                                                  \
     const uint32_t stride_seq_k     = static_cast<uint32_t>((L).stride_seq_k);                                         \
     const int64_t  stride_h_k       = (L).stride_h_k;                                                                  \
-    const uint32_t stride_seq_v     = static_cast<uint32_t>((L).stride_seq_v);                                         \
     const int64_t  stride_h_v       = (L).stride_h_v;                                                                  \
     const uint32_t stride_seq_o     = static_cast<uint32_t>((L).stride_seq_o);                                         \
     const int64_t  stride_h_o       = (L).stride_h_o;                                                                  \
     const uint32_t q_scale_stride_h = static_cast<uint32_t>((L).q_scale_stride_h);                                     \
     const uint32_t k_scale_stride_h = static_cast<uint32_t>((L).k_scale_stride_h);                                     \
     torch::Tensor  lse              = (L).lse
+
+// Seq-major-value (fp16) varlen launchers additionally use stride_seq_v.
+#define SAGEATTN_QKV_VARLEN_LOCALS_F16(L)                                                                              \
+    SAGEATTN_QKV_VARLEN_LOCALS_COMMON(L);                                                                              \
+    const uint32_t stride_seq_v = static_cast<uint32_t>((L).stride_seq_v)
+
+// Transposed-value (fp8) varlen launchers use stride_d_v and the padded token
+// extent the value tensor was built with.
+#define SAGEATTN_QKV_VARLEN_LOCALS_FP8(L)                                                                              \
+    SAGEATTN_QKV_VARLEN_LOCALS_COMMON(L);                                                                              \
+    const uint32_t stride_d_v = static_cast<uint32_t>((L).stride_d_v);                                                 \
+    const int64_t  padded_k   = (L).padded_k
