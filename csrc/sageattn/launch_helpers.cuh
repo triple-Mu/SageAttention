@@ -26,23 +26,31 @@
 
 namespace sage {
 
-// Opt into >48KB dynamic smem once per (kernel instantiation, device) instead
-// of on every launch. Launches with <=48KB never need the opt-in. Also turns
-// the "this fatbin has no cubin for the current device" failure into an
-// actionable error instead of a silent no-op (the old code discarded the
-// cudaFuncSetAttribute return value).
+// Opt into the launch's dynamic smem size once per (kernel instantiation,
+// device) instead of on every launch. Also turns the "this fatbin has no cubin
+// for the current device" failure into an actionable error instead of a silent
+// no-op (the old code discarded the cudaFuncSetAttribute return value).
+//
+// Two things this must NOT do, both learned on B200 (2026-08-29):
+//
+//  - skip the call when smem_bytes <= 48 KB. The 48 KB default budget covers
+//    static __shared__ too, so a kernel asking for exactly 49152 dynamic bytes
+//    plus a few mbarriers is already over it and fails to launch. sm100 asks
+//    for exactly that at head_dim=128.
+//  - memoize on smem_bytes. KernelT is only the function-pointer *type*, which
+//    every HEAD_DIM/gran/causal/lse instantiation of a family shares, so one
+//    static memo serves all of them: a size-keyed cache opts in whichever
+//    kernel launches first and silently skips the rest. The kernel address is
+//    the right key (smem_bytes is a compile-time constant of the instantiation).
 template<typename KernelT>
 inline void set_max_dynamic_smem_once(KernelT kernel, size_t smem_bytes, int device)
 {
-    if (smem_bytes <= 48 * 1024) {
+    static std::array<std::atomic<const void*>, C10_COMPILE_TIME_MAX_GPUS> done{};
+    const void*                                                           fn = reinterpret_cast<const void*>(kernel);
+    if (done[device].load(std::memory_order_acquire) == fn) {
         return;
     }
-    static std::array<std::atomic<size_t>, C10_COMPILE_TIME_MAX_GPUS> done{};
-    if (done[device].load(std::memory_order_acquire) == smem_bytes) {
-        return;
-    }
-    cudaError_t err = cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaError_t err = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err == cudaErrorInvalidDeviceFunction || err == cudaErrorNoKernelImageForDevice) {
         (void)cudaGetLastError();  // clear the sticky error before raising
         int major = 0, minor = 0;
@@ -58,7 +66,7 @@ inline void set_max_dynamic_smem_once(KernelT kernel, size_t smem_bytes, int dev
                     minor);
     }
     C10_CUDA_CHECK(err);
-    done[device].store(smem_bytes, std::memory_order_release);
+    done[device].store(fn, std::memory_order_release);
 }
 
 }  // namespace sage

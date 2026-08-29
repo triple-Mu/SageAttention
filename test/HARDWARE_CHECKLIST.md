@@ -3,8 +3,9 @@
 本机(sm_86)只能运行 sm80 路径与 fused 量化 kernel 的 fp16 部分。
 **sm90 已在 H200 上全部验证完毕**(dense 2026-08-28、varlen 2026-08-29,
 见 §5),**sm120 已在 RTX PRO 6000 Blackwell 上验证完毕**(2026-08-29,
-见 §5b),**sm89 已在 L20 上验证完毕**(2026-08-29,见 §5d)。
-剩余项只差 B200/GB200 的 sm100。
+见 §5b),**sm89 已在 L20 上验证完毕**(2026-08-29,见 §5d),
+**sm100 已在 B200 上验证完毕**(2026-08-29,见 §5f)。四个 arch 的
+bitwise 对拍与 varlen 都有硬件证据了。
 sm89 与 sm120 都过了,删除过渡期
 `torch.ops.sageattention.qattn_smXX_*` 低层 op(它们是对拍工具)的条件
 已经达成,见 §7。
@@ -53,8 +54,10 @@ max_seqlen 的 dense,同数据同 API,`--csv` 存表)。
       对拍(sm120 是同一批 sm89 TU 的 `SAGEATTN_ARCH_NS=sm120` 双编译);
       公共 API 没有 backend 参数,sm89 fallback 只能从低层 `qattn_sm89_*`
       op 这一侧覆盖。数字见 §5b。
-- [ ] sm100(B200/GB200):顺序必须是 `SAGE_SM100_PV_FROM_SMEM=1` 的 SS twin
-      先验数值 → 切 TS 路径对拍 → 才谈性能。`SAGEATTN_SM100_TCGEN05=1` 开门。
+- [x] sm100(B200,2026-08-29):SS twin 与 TS 各对同一份 baseline golden
+      `--check`,两轮都是 `ok=2280 diff=0`。tcgen05 kernel 第一次上真硬件就
+      暴露了两个 launcher bug(都不在 kernel 里,见 §5f),修完才全绿。
+      数字见 §5f。
 
 ## 1b. varlen(packed cu_seqlens 布局)
 
@@ -90,6 +93,10 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       kernel 这是第一次真在硬件上执行。API 级 41 个用例(等长 `torch.equal`、
       ragged 分段 SDPA、bottom-right causal、空 KV 段、GQA + head_dim pad、
       cudagraph 换分段 replay、compile 无 graph break)全过。
+- [x] sm100(B200,2026-08-29):**设计内不支持**,只验报错可读。tcgen05 kernel
+      的 K/V 走每个 batch entry 一份 tensor map,packed 布局要另写一份,所以
+      `resolve()` 直接拒绝而不是静默降级。实机确认抛
+      `ValueError: varlen is not supported by the sm100 backend`。
 - [ ] sm89 / sm120 都缺 kernel 级 packed 用例。`test_varlen.py` 里 `fwd_varlen`
       那一组写死 `pv_accum_dtype="fp32"` + `v_layout="seq"`,所以 pin 在 sm80;
       sm90 另有 `test_varlen_sm90.py`。这两个 arch 目前只有 API 级覆盖,补
@@ -557,6 +564,147 @@ scratchpad 的 `varlen_state_table.csv`。规律与 sm120 一致:等长时打平
    要保证按 channel 的 amax 与 16-token permute 补位逐位一致。
 3. varlen 的 fp8 零填充(0.4-1.3%):理由与 sm120 那条相同(空序列不产生写入),
    没做。
+
+## 5f. sm100 —— 已完成(B200,sm_100,183 GB,单卡)
+
+2026-08-29,ComputeLab `umb-b200-237`,NGC `pytorch_26.07-py3`
+(torch 2.13.0a0 / CUDA 13.3 / nvcc 13.3)。`TORCH_CUDA_ARCH_LIST=10.0`,
+两侧同容器构建,`compiled_archs=[80, 89, 100]`,`SAGEATTN_SM100_TCGEN05=1`
+开门(baseline 与 new 同一个 env 门,baseline 走 core.py 的同名判断)。
+
+**对拍口径**:golden 只 dump 一份——baseline(0a5d2e4)的 TS 路径,2280 case。
+new 的 SS twin 和 TS 各自对这一份跑 `--check`。三者全等,同时说明
+(a) 重构没动数值,(b) TS 的 TMEM A-operand 布局与走 smem 的 SS oracle 一致。
+再 dump 一份 baseline-SS 只能回答「重构有没有动 SS twin」,而 SS 不是发布路径,
+所以没做。
+
+| 项 | 结果 |
+|---|---|
+| SS twin `--check`(vs 0a5d2e4,2280 case) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| TS `--check`(默认发布路径,同一份 golden) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| 对拍分布 | attn 1980(sm80/sm89/sm100 三族)/ e2e 60(sm100)/ quant 240 |
+| equiv 段(SS 与 TS 各一轮) | 105/105 |
+| SDPA 精度(cos_sim > 0.99、rel_l1 < 0.06) | SS 62/62、TS 62/62 |
+| pytest 全量 | 307 passed / 441 skipped,0 failed |
+| varlen 设计内拒绝 | `ValueError: varlen is not supported by the sm100 backend` |
+| `test_large_seq_batch_isolation`(batch stride > 2^32) | PASSED(183 GB 够) |
+| e2e bench(40 配置,3 轮交替中位数) | 0.995-1.128×,中位 1.051×,**零劣化** |
+
+`repeat=2` 下 `unstable=0`、`raised=0`:kernel 在硬件上是确定性的。
+精度用例是 `test_accuracy.py` 的等价改写(`pytestmark` 换 sm100、`pv` 只留
+sm100 唯一合法的 `"fp32"`、smooth_v 那个用例去掉写死的 `pv="fp16"`),
+不是新写的判据。bench 形状网格 = 官方 `bench/` 那套(batch 4、heads 32、
+head_dim 64/128、seq 1k-32k、causal 两态)加两个角:小 batch 长 seq
+(b1 s65536、b2 s49152)与大 batch 短 seq(b64 s1024、b32 s2048)。
+
+### 上机第一天暴露的两个 bug(都在 launcher,不在 kernel)
+
+两个都是重构引入的,`csrc/sageattn/launch_helpers.cuh` 的
+`set_max_dynamic_smem_once` 一个函数里。0a5d2e4 每次 launch 都无条件调
+`cudaFuncSetAttribute`,重构把它换成「≤48 KB 就跳过 + 按字节数记忆化」,
+两条捷径各自都是错的:
+
+1. **`smem_bytes <= 48 * 1024` 直接 return**。48 KB 的默认额度是把静态
+   `__shared__` 一起算的,而 sm100 kernel 有 5 个 mbarrier + 1 个 uint32。
+   head_dim=128 的动态部分正好是 49152 B = 48 KB,加上静态就超了,于是
+   **默认 TS 路径每一个 head_dim=128 的 launch 都挂**
+   `CUDA error: invalid argument`。这是发布路径,不是 debug 路径。
+2. **记忆化的 key 是 `smem_bytes`**。`KernelT` 只是函数指针**类型**,一族
+   kernel 的所有 HEAD_DIM / gran / causal / lse 实例共用同一个类型,于是共用
+   同一个 `static` 记忆槽:第一个申请到 N 字节的 kernel 把 N 写进去,后面
+   所有同样要 N 字节的**别的** kernel 都被跳过,一个都没开成。SS twin
+   (head_dim=128 要 65536 B)上表现为 16 个 hd128 用例只有先跑的那 4 个
+   (per_warp + causal=False)过,其余全挂。
+
+修法是回到 0a5d2e4 的语义:去掉 48 KB 捷径,记忆化改用 kernel 地址做 key
+(`smem_bytes` 是实例的编译期常量,地址已经唯一确定它)。为什么别的 arch
+没踩到:sm80 40960 B、sm89 32768 B、sm90 40960 B、sm100-TS 49152 B,全都
+`<= 48 KB`,永远走第一条捷径 return 掉,函数体一次都没进过——所以 sm90 /
+sm120 / sm89 三轮上机全绿,遮住了这个洞。它对今天的发布路径只影响 sm100,
+但对任何以后超过 48 KB 的 kernel 都是地雷。
+
+本机 sm_86 门禁:改动只在 host 侧,`cuobjdump -sass` 对改前改后的
+`_C.abi3.so` **逐字节相同**;golden `ok=1493 diff=0`(+48 个 varlen equiv
+extra),`pytest test/ -q` 548 passed / 138 skipped。
+
+### profiling(ncu 2026.2.1;nsys 在这个容器里起不来)
+
+nsys 的 launcher 在容器里 fork 出来就变 defunct、目标进程根本没起,换
+torch profiler(Kineto)拿全流程占比,ncu 本身硬件计数器可用,不需要降级。
+
+全流程时间占比(每次调用的 GPU 时间,b4 h32 d128):
+
+| seq / causal | attention | QuantInt8(K) | transpose_pad | QuantInt8(Q) | MeanScale | `k.mean` | 其他 |
+|---|---|---|---|---|---|---|---|
+| 1024 / 0 (d64) | 65.5% | 5.2% | 5.4% | 4.3% | 11.6% | 5.6% | 2.5% |
+| 1024 / 0 | 54.9% | 7.8% | 7.7% | 5.8% | 14.4% | 6.9% | 2.4% |
+| 4096 / 0 | 84.8% | 4.1% | 3.7% | 2.5% | 2.2% | 1.8% | 0.9% |
+| 4096 / 1 | 76.7% | 6.3% | 5.7% | 3.8% | 3.4% | 2.8% | 1.4% |
+| 16384 / 0 | 95.9% | 1.2% | 1.1% | 0.8% | 0.4% | 0.4% | 0.2% |
+| 16384 / 1 | 92.4% | 2.2% | 2.1% | 1.4% | 0.8% | 0.7% | 0.4% |
+
+seq ≥ 4096 时前后处理合计 < 15%,seq=1024 时到 45%。按用户的口径
+(占比 < 5% 的 kernel 不超过一轮),前后处理只有在短 seq 才值得动,而那正是
+sm120 / sm89 两篇已经提过的同一个提案(transpose + MeanScale 融成一趟)。
+
+attention kernel 本身(ncu,d128 seq4096 causal=0):
+
+| 指标 | 值 |
+|---|---|
+| Compute (SM) Throughput | 28.1% |
+| Memory / DRAM Throughput | 11.5% / 2.1% |
+| Achieved Occupancy | 12.2%(7.83 warp/SM) |
+| Active / Eligible warps per scheduler | 1.96 / **0.30** |
+| No Eligible | 71.4% |
+| Warp Cycles Per Issued Instruction | 6.84,其中 **37.7% 是 barrier** |
+
+既不吃带宽也不吃算力,是纯延迟问题:一个 CTA 只有 1 个 warpgroup(4 warp,
+每个 scheduler 1 个 warp),没有 warp specialization、没有多级流水,
+每个 scheduler 3.5 个 cycle 才发一条指令。这与 §5b/§5e 上 sm89/sm120 那种
+「tensor pipe 已经打满、拿寄存器换 occupancy 换不到吞吐」是**相反**的结论:
+sm100 这个 MVP kernel 离硬件上限还很远(d128 seq32768 约 634 TFLOPS)。
+
+- [ ] **C-9 主方向:warp specialization + 多级流水**。数据支持(barrier 占
+      stall 37.7%、eligible warp 0.30),但是重写级工作量,这一轮没做。
+- [ ] **TMEM 右尺寸化:测出 1.18-1.64× 但没有合入,原因见下。**
+
+### 未合入的优化:TMEM 右尺寸化(head_dim=64)
+
+`TMEM_COLS_TOTAL` 写死 512,而一个 SM 总共就 512 列,所以**一次只有一个 CTA
+能持有 TMEM**:occupancy 允许 2 个 CTA 同时驻留,第二个只能堵在
+`tcgen05.alloc` 里等第一个 dealloc。列计划实际要的是
+`S(128) + P(32) + O(head_dim)`,head_dim=64 只要 224 列,凑到 2 的幂是 256,
+两个 CTA 就都能拿到(head_dim=128 要 288,还是得进位到 512,所以只有 d64 受益)。
+
+实测(TS 路径,3 轮交替中位数,40 配置):
+
+| | 结果 |
+|---|---|
+| head_dim=64 | **1.18-1.64×**(seq 越长收益越大) |
+| head_dim=128 | 1.000×(如预期完全不变) |
+| 数值 | `ok=2280 diff=0`,精度 62/62 |
+| ncu 机理确认(d64 seq4096) | Duration 1.62 → 1.02 ms;Compute SM 31.3% → 50.4%;eligible warp/scheduler 0.33 → 0.63;No Eligible 68.8% → 51.1% |
+
+**没有合入**:同一份改动编进 SS twin 之后,`compare_reference.py --check` 的
+`attn` 段(1980 个低层 kernel 用例)**挂死**——GPU 100% 占用、进程空转,
+10 分钟不返回,可稳定复现。同一个 SS 构建单独跑都是好的:直接调
+`qattn_sm100_*` 的 fuse_v_scale 与 base 两个 launcher、hd 64/128 ×
+qo/kv {128,256,512,300/777,1024} × per_warp/per_thread × causal 两态 ×
+`return_lse` 两态 × fp16/bf16 输出、以及 4096 CTA 的大 grid,全部 0.0x 秒通过;
+`quant` / `e2e` / `equiv` 三段也都 `diff=0`。只有 attn 段整段跑才挂。
+TS 路径带这个改动跑同样的 attn 段是过的(`ok=2280 diff=0`)。
+
+假设:让两个 CTA 真正同时持有 TMEM 之后,SS 路径的 mbarrier / TMEM 交接里
+有一个只在 CTA 并发时才现形的竞争(SS 比 TS 多一段 `sP` 的 smem staging 与
+对应的 barrier)。SS twin 存在的意义就是当 TS 的 oracle,oracle 挂了就不能
+放行被它盯着的那个改动,所以这一轮把它撤回,留复现命令等下一次上机:
+
+```bash
+# 复现(容器内,new 树带 TMEM_COLS_TOTAL 右尺寸化):
+NVCC_APPEND_FLAGS=-DSAGE_SM100_PV_FROM_SMEM python setup.py build_ext --inplace
+SAGEATTN_SM100_TCGEN05=1 python compare_reference.py --check --backend new \
+    --golden-dir <golden> --section attn      # 挂在这里,TS 同命令是过的
+```
 
 ## 6. 性能决策点
 
