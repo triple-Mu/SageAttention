@@ -184,10 +184,22 @@ def sageattn_varlen(
     qk_quant_gran, pv_accum_dtype, smooth_k, smooth_v : as in
         :func:`sageattn`. smooth_k means the *per-sequence* K mean, not the
         batch's. smooth_v has no varlen kernel and is ignored (with a warning).
+        Each arch instantiates the packed kernel at its default
+        pv_accum_dtype only (sm80 "fp32", sm89 "fp32+fp16", sm90 "fp32+fp32",
+        sm120 "fp32"); another value raises rather than falling back.
 
     Returns
     -------
     out : same shape and dtype as q, plus lse when return_lse=True.
+
+    Raises
+    ------
+    NotImplementedError
+        On a device without a packed kernel. sm80/sm86, sm89, sm90 and sm120
+        have one; the sm100 tcgen05 path does not.
+    RuntimeError
+        From the op, on a build configured with ``-DSAGE_BUILD_VARLEN=OFF``
+        (which leaves out every packed kernel).
 
     Notes
     -----

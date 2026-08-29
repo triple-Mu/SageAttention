@@ -28,6 +28,8 @@ Paper: https://arxiv.org/abs/2505.11594
 + FP8 quantization for $PV$, and FP16 accumulator for FP8/FP16 $PV$.
 + Two-level accumulation strategy for $PV$ to improve accuracy in FP8 MMA and WGMMA.
 + Support `torch.compile` (fullgraph, zero graph breaks) including CUDA graphs / `mode="reduce-overhead"`, and distributed inference.
++ A packed variable-length entry point, `sageattn_varlen`, in the
+  flash-attention `cu_seqlens` layout.
 
 
 ## Project Updates
@@ -95,6 +97,11 @@ parallelism; note `MAX_JOBS x NVCC_THREADS` is the real process count),
 `SAGEATTN_PTXAS_VERBOSE=1`, `SAGEATTN_LINEINFO=1`, `DEBUG=1`,
 `SAGEATTN_CMAKE_ARGS` (extra cmake args).
 
+An installed `ccache` is picked up automatically and roughly halves a rebuild
+of this tree; a cache hit replays the object file, so a bit-exact comparison
+across two builds stays valid. Turn it off with
+`SAGEATTN_CMAKE_ARGS="-DSAGE_CCACHE=OFF"`.
+
 All kernels land in a single `sageattention/_C.abi3.so`; the operators are
 exposed as `torch.ops.sageattention.*` (TORCH_LIBRARY, no pybind11) and the
 right kernel is dispatched automatically from the GPU's compute capability,
@@ -117,12 +124,15 @@ attn_output = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
 + `is_causal` determines the use of a causal mask.
 
 ### Available APIs:
-+ `sageattn` is the single public entry point: it picks the kernel from the
++ `sageattn` is the entry point for a dense batch: it picks the kernel from the
   GPU's compute capability (sm80/sm86 -> INT8+FP16PV, sm89/sm12x -> INT8+FP8PV,
   sm90 -> Hopper wgmma path, sm100/sm110 -> tcgen05 opt-in). The per-arch
   wrapper functions of v2.x (`sageattn_qk_int8_pv_fp16_cuda`,
   `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp8_cuda_sm90`, ...)
-  and the Triton-based `sageattn_varlen` were removed.
+  were removed.
++ `sageattn_varlen` is the entry point for a packed batch of variable-length
+  sequences (see below). The Triton implementation of v2.x was replaced by the
+  CUDA kernels; the signature changed with it.
 + Advanced knobs are explicit keyword arguments of `sageattn`
   (`qk_quant_gran`, `pv_accum_dtype` — `"fp32+fp16"` is SageAttention2++ —,
   `smooth_k`, `smooth_v`); `None` keeps the per-device default. Unknown kwargs
@@ -137,6 +147,60 @@ For optimal speed and accuracy performance on custom devices and models, we stro
 > **Note:**
 Support for different sequence lengths between `q` and `k,v` and `group-query attention` is available.
 
+
+### Variable-Length (Packed) API
+
+```python
+from sageattention import sageattn_varlen
+attn_output = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                              max_seqlen_q, max_seqlen_k, is_causal=False)
+```
+
+The flash-attention varlen layout: every sequence's tokens are stored end to
+end and `cu_seqlens_*` says where each one starts. This is a separate entry
+point from `sageattn`, not a drop-in for `scaled_dot_product_attention`
+(`flash_attn_varlen_func` is not one either).
+
++ `q, k, v` are **FP16/BF16** with the packed shape `(total_tokens, head_num,
+  head_dim)` — no batch dimension. `head_dim <= 128`, GQA supported, and `q`
+  may have a different total length from `k, v`.
++ `cu_seqlens_q, cu_seqlens_k` are `(batch_size + 1,)` **int32** prefix sums on
+  the same device, starting at 0 and ending at the respective `total_tokens`.
+  An empty sequence (two equal entries) is allowed. The contents are never read
+  on the host, so a prefix sum that disagrees with `q.size(0)` / `k.size(0)`
+  reads out of bounds — nothing validates it.
++ `max_seqlen_q, max_seqlen_k` are the longest sequence in each prefix sum;
+  they size the grid.
++ `is_causal` uses flash-attention's **bottom-right** alignment: row `r` of a
+  sequence attends to keys up to `r + (kv_len - qo_len)`. A sequence with
+  `kv_len < qo_len` has leading rows that admit no key at all; they come back
+  as zeros with an lse of `-inf`.
++ `return_lse=True` returns the log-sum-exp shaped `(qo_heads, total_tokens)`.
+  Note the head-major order: it is the kernel's own layout and differs from
+  flash-attention's `(total_tokens, heads)`.
++ `qk_quant_gran`, `pv_accum_dtype` and `smooth_k` work as in `sageattn`, with
+  `smooth_k` meaning the *per-sequence* K mean. `smooth_v` has no varlen kernel
+  and is ignored (with a warning).
+
+Under CUDA graphs:
+
+1. Only the *contents* of `cu_seqlens_*` may change between replays (update a
+   resident buffer in place with `.copy_()`). `total_tokens`, `batch_size` and
+   the tensor addresses are baked into the capture.
+2. `max_seqlen_*` is baked into `grid.x` at capture time. A replay whose
+   sequences are longer than the captured maximum silently drops the tails past
+   it, so capture with the model's upper bound.
+3. The prefix-sum contract above still holds; it is never re-checked.
+
+Backends: sm80/sm86, sm89, sm90 and sm120 have a packed kernel; the sm100
+tcgen05 path does not and raises. Each arch instantiates the packed kernel at
+its default `pv_accum_dtype` only (sm80 `"fp32"`, sm89 `"fp32+fp16"`, sm90
+`"fp32+fp32"`, sm120 `"fp32"`); another value raises instead of silently
+falling back. The whole family can be left out of the build with
+`SAGEATTN_CMAKE_ARGS="-DSAGE_BUILD_VARLEN=OFF"`, after which `sageattn_varlen`
+raises at call time.
+
+`bench/bench_varlen.py` times this API against the padded batch it replaces.
 
 ### Plug-and-play Example
 

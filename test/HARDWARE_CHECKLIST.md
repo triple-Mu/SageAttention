@@ -1,8 +1,9 @@
 # 上机验证清单(sm89 / sm120 / sm100)
 
 本机(sm_86)只能运行 sm80 路径与 fused 量化 kernel 的 fp16 部分。
-**sm90 已于 2026-08-28 在 H200 上全部验证完毕**(见 §5),剩余项需要
-Ada(4090/L40S)、Blackwell consumer(5090)、B200/GB200 实机。
+**sm90 已在 H200 上全部验证完毕**(dense 2026-08-28、varlen 2026-08-29,
+见 §5),剩余项需要 Ada(4090/L40S)、Blackwell consumer(5090)、
+B200/GB200 实机。
 sm89 与 sm120 全部通过后才可以删除过渡期的
 `torch.ops.sageattention.qattn_smXX_*` 低层 op(它们是对拍工具)。
 
@@ -22,8 +23,11 @@ python compare_reference.py --dump --golden-dir <dir> --backend legacy
 # 新构建环境:
 python compare_reference.py --check --golden-dir <dir> --backend new
 # 预期 ok 全部 diff=0;equiv 段(fwd vs 低层 op 全等、quant_v_fp8 pad 下沉
-# 等价、v_fp8 尾部全零)只在 new 侧跑,不需要 baseline。
+# 等价、v_fp8 尾部全零、varlen vs dense 全等)只在 new 侧跑,不需要 baseline。
 ```
+
+varlen 的性能对照用 `python bench/bench_varlen.py`(packed vs 补齐到
+max_seqlen 的 dense,同数据同 API,`--csv` 存表)。
 
 ## 1. bitwise 对拍(剩余机器)
 
@@ -43,11 +47,8 @@ fp16 出的那一级(transpose)。sm89/sm120 的 packed attention 一行都没�
 
 sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据:
 
-- [x] sm90(H200):`pytest test/ -q` 308 passed / 319 skipped(skip 是这个
-      sm_90-only 构建里缺席的其他 arch 家族),含 65 个 sm90 packed kernel
-      用例与 29 个 `sageattn_varlen` API 用例;dense golden `ok=1488 diff=0`
-      (equiv 105/105);dense SASS 逐字节不变(纯搬家 1940 kernel、varlen
-      提交 1643 kernel,均 0 处差异)。
+- [x] sm90(H200,2026-08-29):packed kernel 与 `sageattn_varlen` API 全绿,
+      数字见 §5。
 - [x] `quant_v_fp8_varlen` 的 fp8 用例在 H200 跑通。**它在 sm_86 上是
       skip 的,第一次真跑就暴露了断言写错**:`mma_k16` 把 token 在 16 个一组
       内做了置换,跨过段长的那一组里真值和零是交错的,所以「段长之后每个字节
@@ -58,9 +59,11 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       backend」,所以在这两张卡上它跑的就是新的 fp8 packed kernel——等长
       batch 对 dense 的 `torch.equal`、ragged 的分段 SDPA 精度、
       bottom-right causal、空 KV 段、cudagraph 换分段 replay。
-- [ ] 口径提醒:sm89 的 varlen 只实例化 `pv_accum_dtype="fp32+fp16"`、
-      sm120 只实例化 `"fp32"`、sm90 只实例化 `"fp32+fp32"`(plan.cpp 的默认
-      值)。别的组合会明确报错,不会静默降级,所以对拍脚本里不要顺手换 pv。
+
+口径提醒:varlen 每个 arch 只实例化它自己的默认 `pv_accum_dtype`(sm80
+`"fp32"`、sm89 `"fp32+fp16"`、sm90 `"fp32+fp32"`、sm120 `"fp32"`,见
+plan.cpp)。别的组合会明确报错,不会静默降级,所以对拍和 bench 脚本里不要
+顺手换 pv。
 
 ## 2. A4-1 合并的性能复核(sm89/sm120)
 
@@ -95,22 +98,28 @@ SASS 逐字节相同(nvcc 已自动融合,纯 no-op)。
 - [ ] 高 tensor-core 配比卡上若 conversion 单元成为瓶颈,可重测 D-1
       (`SAGE_OPT_MAGIC_I2F`,sm80 kernel 专用)。
 
-## 5. sm90 —— 已完成(H200, 2026-08-28)
+## 5. sm90 —— 已完成(H200 GPU 5)
 
-| 项 | 结果 |
-|---|---|
-| bitwise 对拍(vs 0a5d2e4,1488 case) | diff=0 |
-| equiv 段(fwd 全等 / pad 下沉等价 / 尾部全零) | 105/105 |
-| pytest(含 compile/cudagraph) | 95 passed / 223 skipped |
-| batch stride > 2^32 隔离(`test_large_seq_batch_isolation`) | PASSED |
-| e2e bench(12 配置,3 轮交替中位数) | 全部加速 1.02-1.79×,零劣化 |
+两轮:08-28 是重构后的 dense 验证,08-29 是 varlen 提交上去之后的复验。
+
+| 项 | 结果 | 轮次 |
+|---|---|---|
+| bitwise 对拍(vs 0a5d2e4,1488 case) | diff=0 | 两轮 |
+| equiv 段(fwd 全等 / pad 下沉等价 / 尾部全零) | 105/105 | 两轮 |
+| batch stride > 2^32 隔离(`test_large_seq_batch_isolation`) | PASSED | 08-28 |
+| pytest(含 compile/cudagraph) | 95 passed / 223 skipped | 08-28 |
+| e2e bench(12 配置,3 轮交替中位数) | 全部加速 1.02-1.79×,零劣化 | 08-28 |
+| pytest(加 varlen 用例) | 308 passed / 319 skipped,含 65 个 sm90 packed kernel 用例与 29 个 `sageattn_varlen` API 用例 | 08-29 |
+| dense SASS 逐字节 | 0 处差异(纯搬家 1940 kernel、varlen 提交 1643 kernel) | 08-29 |
+
+skip 是这个 sm_90-only 构建里缺席的其他 arch 家族,不是被跳过的检查。
 
 ## 6. 性能决策点(未变)
 
 | 项 | 机器 | 命令/指标 | 决策 |
 |---|---|---|---|
 | C-8 QMMA.SF go/no-go | 5090(sm120) | `bash bench/microbench/run_microbench.sh`,看 QMMA.SF(fp32 accum)相对 f8f8f32 的比率;同时记录 f8f8f16:f8f8f32 | full-rate → 立项 sm120 v2(block-scaled mma);f8f8f16 与 f8f8f32 同速 → 退役 fp32+fp16 路径 |
-| H1/H4 sm90 wgmma 异步化 | H100/H200 | 先 `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier`,确认 tensor core 空闲主导后再投入(重写级) |
+| H1/H4 sm90 wgmma 异步化 | H100/H200 | `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier` | 确认 tensor core 空闲主导后再投入(重写级) |
 
 ## 7. 完成后的收尾
 
@@ -118,4 +127,5 @@ SASS 逐字节相同(nvcc 已自动融合,纯 no-op)。
       两处注册表 + sageattention/ops.py 的 `_QATTN_OPS`/fake + test/ 对应用例
       + tools/compare_reference.py 的 equiv fwd 映射表)
 - [ ] 按 C-8 结论处置 sm120 的 fp32+fp16 路径
-- [ ] bench/ 脚本迁移到 torch.ops.sageattention.*(bench 现在还 import 已删除的 pybind 模块)
+- [ ] bench/ 脚本迁移到 torch.ops.sageattention.*(除 `bench_varlen.py` 外,
+      其余还 import 已删除的 pybind 模块)
