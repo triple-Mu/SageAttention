@@ -89,6 +89,25 @@ void mean_scale_fuse_quant_cuda(torch::Tensor      input,
                                 int                tensor_layout,
                                 const QuantVarlen& varlen = {});
 
+// transpose_pad_v + (mean_)scale_fuse_quant in one kernel: the same fp8 output
+// and the same scale / mean, bit for bit, without the fp16 V^T buffer in
+// between. `mean` is an undefined tensor on the non-smooth_v path, `permute`
+// selects the 16-token mma order the way transpose_pad_permute_cuda does, and
+// the transposed axis is covered up to the sequence's 64-aligned length - the
+// caller owns any tail past that, exactly as with the two-kernel pair.
+void transpose_quant_v_fp8_cuda(torch::Tensor      input,
+                                torch::Tensor      output,
+                                torch::Tensor      mean,
+                                torch::Tensor      scale,
+                                float              scale_max,
+                                int                tensor_layout,
+                                bool               permute,
+                                const QuantVarlen& varlen = {});
+
+// Whether that kernel can serve this head_dim (it walks head_dim in
+// fixed-size channel chunks; everything else falls back to the two-kernel pair).
+bool transpose_quant_v_fp8_supported(int64_t head_dim);
+
 void quant_per_thread_int8_q_cuda(torch::Tensor      input,
                                   torch::Tensor      output,
                                   torch::Tensor      scale,

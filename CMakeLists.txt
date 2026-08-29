@@ -41,6 +41,11 @@ set(CMAKE_INSTALL_RPATH "")
 option(SAGE_PTXAS_VERBOSE "Pass -Xptxas=-v (per-kernel register/smem report)" OFF)
 option(SAGE_LINEINFO "Pass -lineinfo for ncu source correlation" OFF)
 option(SAGE_BUILD_VARLEN "Build the varlen (packed cu_seqlens layout) kernel TUs" ON)
+# quant_v_fp8 runs transpose + per-channel fp8 quantization as one kernel by
+# default, skipping the fp16 V^T buffer. OFF restores the two-kernel pair. The
+# two are bit-identical (the golden dumps gate that), so this switch buys back
+# the old timing, not old numbers.
+option(SAGE_FUSED_V_QUANT "quant_v_fp8: fuse the V transpose into the fp8 quantization kernel" ON)
 option(SAGE_CCACHE "Launch the compilers through ccache when one is installed" ON)
 
 # ccache halves a rebuild of this tree and is bit-exact by construction (a hit
@@ -119,6 +124,12 @@ if(SAGE_BUILD_VARLEN)
 else()
   set(SAGEATTN_BUILD_VARLEN 0)
   message(STATUS "[sageattention] varlen kernels disabled (SAGE_BUILD_VARLEN=OFF)")
+endif()
+if(SAGE_FUSED_V_QUANT)
+  set(SAGEATTN_FUSED_V_QUANT 1)
+else()
+  set(SAGEATTN_FUSED_V_QUANT 0)
+  message(STATUS "[sageattention] quant_v_fp8 uses the two-kernel V path (SAGE_FUSED_V_QUANT=OFF)")
 endif()
 # sm90 is a plain source group rather than an OBJECT library, so its varlen TU
 # joins the group the way sm80's does; it names its own namespace internally.

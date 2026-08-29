@@ -320,11 +320,11 @@ def test_opcheck_sub_mean(layout):
     opcheck(OPS.sub_mean.default, (v, vm, out, layout))
 
 
-def _transposed_v(layout, kv_len=SEQ, pad_multiple=64):
+def _transposed_v(layout, kv_len=SEQ, pad_multiple=64, head_dim=HEAD_DIM):
     padded = _cdiv(kv_len, pad_multiple) * pad_multiple
     if layout == "HND":
-        return (B, H, HEAD_DIM, padded)
-    return (B, HEAD_DIM, H, padded)
+        return (B, H, head_dim, padded)
+    return (B, head_dim, H, padded)
 
 
 @requires_cuda
@@ -403,6 +403,48 @@ def test_quant_v_fp8_pad_multiple_128(layout, v_layout, kv_len):
     assert torch.equal(ref[1], got[1])
     bound = _cdiv(kv_len, 16) * 16 if v_layout == "mma_k16" else kv_len
     assert not got[0][..., bound:].view(torch.uint8).any()
+
+
+# On and off every boundary the fused kernel has to reproduce: the ceil16
+# statistics bound, the ceil64 quantize bound, and the 2048-token round the
+# reduction leaves are laid out in.
+FUSED_V_KV = [16, 100, 320, 1000, 2048, 2049, 4096]
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
+@pytest.mark.parametrize("smooth_v", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_quant_v_fp8_matches_two_kernel_path(layout, v_layout, smooth_v, dtype):
+    """quant_v_fp8 runs the transpose and the fp8 quantization as one kernel.
+    It has to stay bit-identical to transpose_pad_v + (mean_)scale_fuse_quant,
+    which is the pair the golden dumps were taken with and which
+    SAGE_FUSED_V_QUANT=OFF falls back to."""
+    kw = dict(tensor_layout=layout, v_layout=v_layout, scale_max=448.0, smooth_v=smooth_v)
+    for head_dim in (64, 128):
+        for kv_len in FUSED_V_KV:
+            shape = _v_shape(layout, seq=kv_len, head_dim=head_dim)
+            v = torch.randn(shape, device=DEV, dtype=dtype)
+            got = OPS.quant_v_fp8(v, pad_multiple=64, **kw)
+
+            v_t = torch.empty(
+                _transposed_v(layout, kv_len, 64, head_dim), device=DEV, dtype=dtype
+            )
+            OPS.transpose_pad_v(v, v_t, layout, v_layout == "mma_k16")
+            v_fp8 = torch.zeros(v_t.shape, device=DEV, dtype=torch.float8_e4m3fn)
+            v_scale = torch.empty((B, H, head_dim), device=DEV, dtype=torch.float32)
+            v_mean = torch.empty((B, H, head_dim), device=DEV, dtype=torch.float32)
+            if smooth_v:
+                OPS.mean_scale_fuse_quant(v_t, v_fp8, v_mean, v_scale, kv_len, 448.0, layout)
+            else:
+                OPS.scale_fuse_quant(v_t, v_fp8, v_scale, kv_len, 448.0, layout)
+
+            tag = f"head_dim={head_dim} kv_len={kv_len}"
+            assert torch.equal(got[0].view(torch.uint8), v_fp8.view(torch.uint8)), tag
+            assert torch.equal(got[1], v_scale), tag
+            if smooth_v:
+                assert torch.equal(got[2], v_mean), tag
 
 
 @requires_fp8_cast

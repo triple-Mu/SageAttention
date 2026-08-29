@@ -585,6 +585,314 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
     }
 }
 
+// Channel chunk one CTA of the fused kernel below owns. 16 halves is 32 bytes:
+// a whole DRAM sector of every token row it touches, so the gathered read
+// wastes no bandwidth, while 3 * 16 float accumulators still leave the CTA two
+// resident blocks' worth of registers.
+constexpr int kVQuantChannelChunk = 16;
+
+// Block size of the fused kernel. Not a tuning knob: it is MeanScaleKernel's,
+// and with the 8-token pack it decides which transposed tokens each reduction
+// leaf holds, so changing it changes the fp8 output.
+constexpr int kVQuantThreads = 256;
+
+// One-kernel form of TransposePadPermuteKernel + MeanScaleKernel: the same fp8
+// output without the fp16 V^T buffer in between, so V's bytes are read twice
+// instead of being read, written transposed and read back (a write and a read
+// of the whole value tensor, ~28% of what the pair moves).
+//
+// The thread mapping is what makes the result bit-identical rather than merely
+// equal. The block keeps MeanScaleKernel's shape - 256 threads, thread t owning
+// the transposed token packs [i * 2048 + t * 8, +8) of its channel - so every
+// reduction leaf and every step of the blockReduce tree is the one the two-pass
+// version took, statistics still run over the ceil16 axis and the quantize pass
+// still over the ceil64 one. Only where the eight values come from changes:
+// instead of reading them contiguously out of V^T, thread t gathers them from
+// V's own layout through src_token below. What the block gives up is the coalesced
+// row - it covers chunk_size channels rather than one, so a gather is a 32-byte
+// piece of a token row (a whole DRAM sector, no waste) instead of a 128-byte
+// line.
+template<uint32_t chunk_size, uint32_t pad_size, bool sub_mean = false, bool permute = true, typename T>
+__global__ void TransposeQuantFp8Kernel(const T* __restrict__ input,
+                                        int8_t* __restrict__ output,
+                                        float* __restrict__ mean,
+                                        float* __restrict__ scale,
+                                        const float    scale_max,
+                                        const uint32_t num_tokens,
+                                        const int64_t  stride_batch_input,
+                                        const uint32_t stride_seq_input,
+                                        const int64_t  stride_h_input,
+                                        const int64_t  stride_batch_output,
+                                        const int64_t  stride_d_output,
+                                        const int64_t  stride_h_output,
+                                        const int64_t  stride_batch_mean,
+                                        const int64_t  stride_h_mean,
+                                        const int64_t  stride_batch_scale,
+                                        const int64_t  stride_h_scale,
+                                        const int32_t* __restrict__ cu_seqlens,
+                                        const uint32_t pad_tokens)
+{
+    static_assert(std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value,
+                  "Only half and bfloat16 are supported");
+
+    constexpr uint32_t pack_size = 8;  // transposed tokens per thread per round
+    constexpr uint32_t load_size = 8;  // one 16B LDG of T
+    static_assert(chunk_size % load_size == 0, "the channel chunk must be whole LDGs wide");
+    constexpr uint32_t num_loads = chunk_size / load_size;
+    using load_t                 = sage::vec_t<T, load_size>;
+
+    // Compile-time, not blockDim.x: gmem_stride is what a reduction leaf's
+    // token pack is derived from, so it belongs to the bit-exactness contract.
+    constexpr uint32_t num_threads = kVQuantThreads;
+    constexpr uint32_t gmem_stride = num_threads * pack_size;
+    constexpr uint32_t num_warps   = num_threads / 32;
+
+    // The channel chunk is grid.x, not grid.z as in MeanScaleKernel: the
+    // head_dim / chunk_size blocks of one (batch, head) each take a
+    // chunk_size-wide slice of the *same* token rows, so they have to be
+    // co-resident for the slices to add back up to whole lines in L2. Putting
+    // them next to each other in launch order is what makes that happen.
+    const uint32_t d_base    = blockIdx.x * chunk_size;
+    const uint32_t head_id   = blockIdx.y;
+    const uint32_t batch_id  = blockIdx.z;
+    const uint32_t thread_id = threadIdx.x;
+    const uint32_t lane_id   = thread_id & 31;
+    const uint32_t warp_id   = thread_id >> 5;
+
+    // Packed varlen layout (cu_seqlens != nullptr): both coordinate systems of
+    // varlen.h meet here, as they did across the two kernels this replaces. The
+    // input moves by the sequence's token base, the output by its padded-slab
+    // base, and every predicate stays in sequence-relative tokens. An empty
+    // sequence leaves (block-uniform, before any barrier), exactly as
+    // MeanScaleKernel did: its scale and mean entries stay the zeros the
+    // allocation put there and its slab stays zero fp8.
+    uint32_t seq_tokens = num_tokens;
+    int64_t  seq_base   = 0;
+    int64_t  pad_base   = 0;
+    if (cu_seqlens != nullptr) {
+        seq_tokens = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+        if (seq_tokens == 0) {
+            return;
+        }
+        seq_base = sage::seq_offset(cu_seqlens, batch_id);
+        pad_base = sage::pad_offset(cu_seqlens, batch_id, pad_tokens);
+    }
+
+    // pad the number of tokens to 16 to deal with fp8 permute
+    const uint32_t stat_padded_num_tokens = at::round_up<uint32_t>(seq_tokens, 16);
+    const uint32_t num_iters =
+        stat_padded_num_tokens / gmem_stride + ((stat_padded_num_tokens % gmem_stride) > thread_id * pack_size);
+    // the quantize pass covers all fp8 output tokens to prevent nan in random initialization
+    const uint32_t padded_num_tokens = at::round_up<uint32_t>(seq_tokens, pad_size);
+    const uint32_t num_quant_iters =
+        padded_num_tokens / gmem_stride + ((padded_num_tokens % gmem_stride) > thread_id * pack_size);
+
+    const T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
+                              + static_cast<int64_t>(head_id) * stride_h_input + seq_base * stride_seq_input
+                              + static_cast<int64_t>(d_base);
+    int8_t* output_ptr_base =
+        output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
+        + static_cast<int64_t>(d_base) * stride_d_output + pad_base + static_cast<int64_t>(thread_id * pack_size);
+
+    // Source token of transposed position (pack_base + j), for a pack that
+    // starts 8-aligned. TransposePadPermuteKernel stores input row r at output
+    // row perm[r] = {0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15} within a 16-token
+    // group; this is the inverse of that, and only its first half is tabulated
+    // because inv[8 + j] == inv[j] + 4.
+    auto src_token = [](uint32_t pack_base, uint32_t j) -> uint32_t {
+        if constexpr (permute) {
+            constexpr uint32_t inv_permute[8] = {0, 1, 8, 9, 2, 3, 10, 11};
+            return pack_base + inv_permute[j] - 4u * ((pack_base >> 3) & 1u);
+        }
+        else {
+            return pack_base + j;
+        }
+    };
+
+    float max_val[chunk_size];
+    float min_val[chunk_size];
+    float sum_val[chunk_size];
+#pragma unroll
+    for (uint32_t c = 0; c < chunk_size; c++) {
+        max_val[c] = -1000000.0f;
+        min_val[c] = 1000000.0f;
+        sum_val[c] = 0.0f;
+    }
+
+    for (uint32_t i = 0; i < num_iters; i++) {
+        const uint32_t pack_base = i * gmem_stride + thread_id * pack_size;
+#pragma unroll
+        for (uint32_t j = 0; j < pack_size; j++) {
+            const uint32_t tok   = src_token(pack_base, j);
+            const bool     valid = tok < seq_tokens;
+            load_t         x_val[num_loads];
+#pragma unroll
+            for (uint32_t l = 0; l < num_loads; l++) {
+                if (valid) {
+                    x_val[l].load_ro(input_ptr_base + static_cast<int64_t>(tok) * stride_seq_input + l * load_size);
+                }
+                else {
+#pragma unroll
+                    for (uint32_t e = 0; e < load_size; e++) {
+                        x_val[l][e] = fp_traits<T>::from_fp32(0.0f);
+                    }
+                }
+            }
+#pragma unroll
+            for (uint32_t c = 0; c < chunk_size; c++) {
+                const float x_temp = fp_traits<T>::to_fp32(x_val[c / load_size][c % load_size]);
+                max_val[c]         = fmaxf(max_val[c], x_temp);
+                min_val[c]         = fminf(min_val[c], x_temp);
+
+                if constexpr (sub_mean) {
+                    sum_val[c] += x_temp;
+                }
+            }
+        }
+    }
+
+    // The reduction blockReduceMax/Min/Sum would do, unrolled over the chunk so
+    // that the chunk_size channels share one barrier instead of taking one
+    // each. Same operations in the same order, so the same bits.
+    constexpr uint32_t sum_warps = sub_mean ? num_warps : 1;
+    __shared__ float   smem_max[chunk_size][num_warps];
+    __shared__ float   smem_min[chunk_size][num_warps];
+    __shared__ float   smem_sum[chunk_size][sum_warps];
+    __shared__ float   smem_amax[chunk_size];
+    __shared__ float   smem_mean[chunk_size];
+
+#pragma unroll
+    for (uint32_t c = 0; c < chunk_size; c++) {
+        const float v = vllm::warpReduceMax(max_val[c]);
+        if (lane_id == 0) {
+            smem_max[c][warp_id] = v;
+        }
+    }
+#pragma unroll
+    for (uint32_t c = 0; c < chunk_size; c++) {
+        const float v = vllm::warpReduceMin(min_val[c]);
+        if (lane_id == 0) {
+            smem_min[c][warp_id] = v;
+        }
+    }
+    if constexpr (sub_mean) {
+#pragma unroll
+        for (uint32_t c = 0; c < chunk_size; c++) {
+            const float v = vllm::warpReduceSum(sum_val[c]);
+            if (lane_id == 0) {
+                smem_sum[c][warp_id] = v;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+#pragma unroll
+        for (uint32_t c = 0; c < chunk_size; c++) {
+            const bool live = lane_id < num_warps;
+
+            float partial_max = -1e20f;
+            float partial_min = 1e20f;
+            float partial_sum = 0.0f;
+            if (live) {
+                partial_max = smem_max[c][lane_id];
+                partial_min = smem_min[c][lane_id];
+                if constexpr (sub_mean) {
+                    partial_sum = smem_sum[c][lane_id];
+                }
+            }
+
+            const float block_max_val = vllm::warpReduceMax(partial_max);
+            const float block_min_val = vllm::warpReduceMin(partial_min);
+            float       block_sum_val = 0.0f;
+            if constexpr (sub_mean) {
+                block_sum_val = vllm::warpReduceSum(partial_sum);
+            }
+
+            if (lane_id == 0) {
+                float amax;
+                if constexpr (sub_mean) {
+                    const float m = block_sum_val / stat_padded_num_tokens;
+                    amax          = fmaxf(fabsf(block_max_val - m), fabsf(block_min_val - m));
+                    smem_mean[c]  = m;
+                    mean[static_cast<int64_t>(batch_id) * stride_batch_mean
+                         + static_cast<int64_t>(head_id) * stride_h_mean + static_cast<int64_t>(d_base + c)] = m;
+                }
+                else {
+                    amax = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
+                }
+                smem_amax[c] = amax;
+                scale[static_cast<int64_t>(batch_id) * stride_batch_scale
+                      + static_cast<int64_t>(head_id) * stride_h_scale + static_cast<int64_t>(d_base + c)] =
+                    amax / scale_max;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    for (uint32_t i = 0; i < num_quant_iters; i++) {
+        const uint32_t pack_base = i * gmem_stride + thread_id * pack_size;
+#pragma unroll
+        for (uint32_t l = 0; l < num_loads; l++) {
+            load_t x_val[pack_size];
+#pragma unroll
+            for (uint32_t j = 0; j < pack_size; j++) {
+                const uint32_t tok = src_token(pack_base, j);
+                if (tok < seq_tokens) {
+                    x_val[j].load_ro(input_ptr_base + static_cast<int64_t>(tok) * stride_seq_input + l * load_size);
+                }
+                else {
+#pragma unroll
+                    for (uint32_t e = 0; e < load_size; e++) {
+                        x_val[j][e] = fp_traits<T>::from_fp32(0.0f);
+                    }
+                }
+            }
+#pragma unroll
+            for (uint32_t e = 0; e < load_size; e++) {
+                const uint32_t c = l * load_size + e;
+
+                float mean_val = 0.0f;
+                if constexpr (sub_mean) {
+                    mean_val = smem_mean[c];
+                }
+                // amax == 0 (an all-zero channel, or a constant channel under
+                // sub_mean) makes this division inf, and quantizing 0 * inf =
+                // NaN emits fp8 0x7f, which poisons the whole output channel
+                // through the PV mma. A subnormal amax (bf16 input) reaches inf
+                // too: ftz flushes it to zero, or without ftz the division
+                // overflows. The stored scale is (near) zero in both cases, so
+                // quantizing the channel to (signed) zero is exact.
+                float recip_scale = scale_max / smem_amax[c];
+                if (!isfinite(recip_scale)) {
+                    recip_scale = 0.0f;
+                }
+
+                float    x_val_float[8];
+                uint32_t x_val_fp8[2];
+#pragma unroll
+                for (uint32_t j = 0; j < pack_size; j++) {
+                    x_val_float[j] = fp_traits<T>::to_fp32(x_val[j][e]);
+                    if constexpr (sub_mean) {
+                        x_val_float[j] = (x_val_float[j] - mean_val) * recip_scale;
+                    }
+                    else {
+                        x_val_float[j] *= recip_scale;
+                    }
+                }
+
+                floatx4_to_e4m3x4(x_val_fp8, x_val_float, x_val_float + 2);
+                floatx4_to_e4m3x4(x_val_fp8 + 1, x_val_float + 4, x_val_float + 6);
+
+                *(uint2*)(output_ptr_base + static_cast<int64_t>(c) * stride_d_output + i * gmem_stride) =
+                    *(uint2*)(&x_val_fp8[0]);
+            }
+        }
+    }
+}
+
 void quant_per_block_int8_cuda(
     torch::Tensor input, torch::Tensor output, torch::Tensor scale, float sm_scale, int block_size, int tensor_layout)
 {
@@ -1344,3 +1652,210 @@ void mean_scale_fuse_quant_cuda(torch::Tensor      input,
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
 }
+
+bool transpose_quant_v_fp8_supported(int64_t head_dim)
+{
+    return head_dim % kVQuantChannelChunk == 0;
+}
+
+void transpose_quant_v_fp8_cuda(torch::Tensor      input,
+                                torch::Tensor      output,
+                                torch::Tensor      mean,
+                                torch::Tensor      scale,
+                                float              scale_max,
+                                int                tensor_layout,
+                                bool               permute,
+                                const QuantVarlen& varlen)
+{
+    const c10::cuda::CUDAGuard device_guard(input.device());
+
+    // The fp8 conversion (cvt.rn.satfinite.e4m3x2) requires sm_89+; on older
+    // parts the kernel guard compiles to a trap that kills the CUDA context.
+    // Fail loudly on the host instead.
+    {
+        const cudaDeviceProp* prop = at::cuda::getDeviceProperties(input.device().index());
+        TORCH_CHECK(prop->major > 8 || (prop->major == 8 && prop->minor >= 9),
+                    "fp8 per-channel V quantization requires compute capability 8.9+, got sm_",
+                    prop->major,
+                    prop->minor);
+    }
+
+    const bool sub_mean = mean.defined();
+
+    CHECK_CUDA(input);
+    CHECK_CUDA(output);
+    CHECK_CUDA(scale);
+
+    CHECK_DTYPE(scale, torch::kFloat);
+
+    CHECK_LASTDIM_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(scale);
+
+    CHECK_DIMS(scale, 3);
+    if (sub_mean) {
+        CHECK_CUDA(mean);
+        CHECK_DTYPE(mean, torch::kFloat);
+        CHECK_CONTIGUOUS(mean);
+        CHECK_DIMS(mean, 3);
+    }
+
+    // The alignment of the transposed axis the fp8 pass covers, and the block
+    // size the two-pass transpose kernel wrote in. A pad_multiple=128 buffer's
+    // [64-aligned, 128-aligned) tail stays untouched here exactly as it did
+    // there; the caller zero-fills it.
+    constexpr int CTA_TOKENS = 64;
+
+    int64_t batch_size, head_dim, num_heads, num_tokens;
+    int64_t stride_batch_input, stride_seq_input, stride_h_input;
+    int64_t stride_batch_output, stride_d_output, stride_h_output;
+
+    if (varlen.cu_seqlens != nullptr) {
+        // packed [total_tokens, heads, head_dim] -> [heads, head_dim, padded_total]
+        CHECK_DIMS(input, 3);
+
+        const VTLayout out_layout = parse_vt_varlen_layout(output, varlen);
+
+        batch_size          = varlen.batch_size;
+        num_heads           = input.size(1);
+        head_dim            = input.size(2);
+        num_tokens          = 0;  // the kernel reads each sequence's own length
+        stride_batch_input  = 0;
+        stride_seq_input    = input.stride(0);
+        stride_h_input      = input.stride(1);
+        stride_batch_output = 0;
+        stride_d_output     = out_layout.stride_d;
+        stride_h_output     = out_layout.stride_h;
+
+        TORCH_CHECK(out_layout.num_heads == num_heads && out_layout.head_dim == head_dim,
+                    "quantized value must be (heads, head_dim, padded_total) = (",
+                    num_heads,
+                    ", ",
+                    head_dim,
+                    ", n), got (",
+                    output.size(0),
+                    ", ",
+                    output.size(1),
+                    ", ",
+                    output.size(2),
+                    ")");
+        const int64_t padded_total = sage::blk_total(input.size(0), batch_size, varlen.pad_tokens) * varlen.pad_tokens;
+        TORCH_CHECK(out_layout.padded_num_tokens == padded_total,
+                    "quantized value last dim (",
+                    out_layout.padded_num_tokens,
+                    ") must be blk_total(total_tokens, batch_size, ",
+                    varlen.pad_tokens,
+                    ") * ",
+                    varlen.pad_tokens,
+                    " (",
+                    padded_total,
+                    ")");
+        TORCH_CHECK(varlen.pad_tokens % CTA_TOKENS == 0,
+                    "pad_multiple (",
+                    varlen.pad_tokens,
+                    ") must be a multiple of ",
+                    CTA_TOKENS);
+    }
+    else {
+        CHECK_DIMS(input, 4);
+        CHECK_DIMS(output, 4);
+
+        batch_size         = input.size(0);
+        head_dim           = input.size(3);
+        stride_batch_input = input.stride(0);
+
+        const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
+        stride_batch_output       = out_layout.stride_batch;
+        stride_d_output           = out_layout.stride_d;
+        stride_h_output           = out_layout.stride_h;
+
+        if (tensor_layout == 0) {
+            num_tokens       = input.size(1);
+            num_heads        = input.size(2);
+            stride_seq_input = input.stride(1);
+            stride_h_input   = input.stride(2);
+
+            CHECK_SHAPE_PADDED_SEQ(
+                output, batch_size, head_dim, num_heads, at::round_up<int64_t>(num_tokens, CTA_TOKENS));
+        }
+        else {
+            num_tokens       = input.size(2);
+            num_heads        = input.size(1);
+            stride_seq_input = input.stride(2);
+            stride_h_input   = input.stride(1);
+
+            CHECK_SHAPE_PADDED_SEQ(
+                output, batch_size, num_heads, head_dim, at::round_up<int64_t>(num_tokens, CTA_TOKENS));
+        }
+
+        CHECK_LEN_I32(num_tokens, num_tokens);
+    }
+
+    CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
+    if (sub_mean) {
+        CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
+    }
+
+    TORCH_CHECK(transpose_quant_v_fp8_supported(head_dim),
+                "the fused V transpose+quantization kernel walks head_dim in chunks of ",
+                kVQuantChannelChunk,
+                ", got head_dim ",
+                head_dim);
+
+    float*        mean_ptr          = sub_mean ? reinterpret_cast<float*>(mean.data_ptr()) : nullptr;
+    const int64_t stride_batch_mean = sub_mean ? mean.stride(0) : 0;
+    const int64_t stride_h_mean     = sub_mean ? mean.stride(1) : 0;
+
+    dim3 grid(head_dim / kVQuantChannelChunk, num_heads, batch_size);
+    dim3 block(kVQuantThreads);
+
+    auto input_dtype = input.scalar_type();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+// Preprocessor directives cannot live inside a macro argument, so the four
+// (sub_mean, permute) instantiations are spelled out here rather than in the
+// DISPATCH body below. c_type is the dispatch's, bound at the expansion site.
+#define SAGEATTN_LAUNCH_FUSED_V_QUANT(SUB_MEAN, PERMUTE)                                                               \
+    TransposeQuantFp8Kernel<kVQuantChannelChunk, CTA_TOKENS, SUB_MEAN, PERMUTE, c_type>                                \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<const c_type*>(input.data_ptr()),                                \
+                                     reinterpret_cast<int8_t*>(output.data_ptr()),                                     \
+                                     mean_ptr,                                                                         \
+                                     reinterpret_cast<float*>(scale.data_ptr()),                                       \
+                                     scale_max,                                                                        \
+                                     static_cast<uint32_t>(num_tokens),                                                \
+                                     stride_batch_input,                                                               \
+                                     static_cast<uint32_t>(stride_seq_input),                                          \
+                                     stride_h_input,                                                                   \
+                                     stride_batch_output,                                                              \
+                                     stride_d_output,                                                                  \
+                                     stride_h_output,                                                                  \
+                                     stride_batch_mean,                                                                \
+                                     stride_h_mean,                                                                    \
+                                     scale.stride(0),                                                                  \
+                                     scale.stride(1),                                                                  \
+                                     varlen.cu_seqlens,                                                                \
+                                     static_cast<uint32_t>(varlen.pad_tokens))
+
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+        if (sub_mean) {
+            if (permute) {
+                SAGEATTN_LAUNCH_FUSED_V_QUANT(true, true);
+            }
+            else {
+                SAGEATTN_LAUNCH_FUSED_V_QUANT(true, false);
+            }
+        }
+        else {
+            if (permute) {
+                SAGEATTN_LAUNCH_FUSED_V_QUANT(false, true);
+            }
+            else {
+                SAGEATTN_LAUNCH_FUSED_V_QUANT(false, false);
+            }
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+}
+
+#undef SAGEATTN_LAUNCH_FUSED_V_QUANT

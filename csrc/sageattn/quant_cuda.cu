@@ -22,6 +22,7 @@
 
 #include <optional>
 #include <tuple>
+#include <vector>
 
 #include <ATen/ceil_div.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -36,6 +37,25 @@
 
 namespace sage {
 namespace {
+
+// The fused kernel has no V^T to hold its first read in, so it reads V twice,
+// and its gather moves 32-byte pieces of a token row rather than whole lines.
+// That pays for itself only while the second pass still finds the first pass's
+// bytes in L2, which its own 2048-token round is the natural unit of. Measured
+// on sm_120 (V preparation alone, per-shape medians, b8 h16 d128): -41% at 512
+// tokens, -54% at 2048, -9% at 4096, then +10% at 5120 and +45% at 8192. Two
+// rounds is where it turns over.
+constexpr int64_t kFusedVQuantMaxTokens = 4096;
+
+// Whether the two quant_v_fp8 composites below run the transpose and the fp8
+// quantization as one kernel instead of two. Both produce the same bits (the
+// fused kernel keeps the two-pass reduction order and permute), so every term
+// here is about timing or about what the kernel can address.
+inline bool use_fused_v_quant(int64_t head_dim, int64_t padded_tokens)
+{
+    return SAGEATTN_FUSED_V_QUANT != 0 && padded_tokens <= kFusedVQuantMaxTokens
+           && transpose_quant_v_fp8_supported(head_dim);
+}
 
 // (seq_dim, nh_dim) for a rank-4 qkv tensor under the given layout.
 inline std::pair<int64_t, int64_t> seq_nh_dims(TensorLayout layout)
@@ -281,20 +301,10 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(c
     // same 64-aligned bound and the fp8 tail comes from at::zeros.
     const int64_t padded_kv_len = at::round_up<int64_t>(kv_len, pad_multiple);
 
-    at::Tensor value_t;  // [B, H, D, padded] (HND) / [B, D, H, padded] (NHD)
-    if (layout == TensorLayout::kHND) {
-        value_t = at::empty({batch_size, num_kv_heads, head_dim, padded_kv_len}, value.options());
-    }
-    else {
-        value_t = at::empty({batch_size, head_dim, num_kv_heads, padded_kv_len}, value.options());
-    }
-    const int layout_int = static_cast<int>(layout);
-    if (vl == VLayout::kMmaK16) {
-        transpose_pad_permute_cuda(value, value_t, layout_int);
-    }
-    else {
-        transpose_pad_cuda(value, value_t, layout_int);
-    }
+    // [B, H, D, padded] (HND) / [B, D, H, padded] (NHD)
+    const std::vector<int64_t> vt_sizes = layout == TensorLayout::kHND ?
+                                              std::vector<int64_t>{batch_size, num_kv_heads, head_dim, padded_kv_len} :
+                                              std::vector<int64_t>{batch_size, head_dim, num_kv_heads, padded_kv_len};
 
     // The fp8 quant kernel writes tokens up to the 64-aligned bound only. When
     // the buffer runs past it (pad_multiple=128 and a kv_len whose 128-aligned
@@ -306,18 +316,47 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(c
     // every byte and the fill is pure bandwidth: that is every sm89/sm120 call
     // (pad_multiple=64) plus any already 128-aligned kv_len.
     const bool fill_covered_by_quant = padded_kv_len == at::round_up<int64_t>(kv_len, 64);
-    const auto v_fp8_options         = value_t.options().dtype(at::kFloat8_e4m3fn);
-    at::Tensor v_fp8 =
-        fill_covered_by_quant ? at::empty(value_t.sizes(), v_fp8_options) : at::zeros(value_t.sizes(), v_fp8_options);
+    const auto v_fp8_options         = value.options().dtype(at::kFloat8_e4m3fn);
+    at::Tensor v_fp8 = fill_covered_by_quant ? at::empty(vt_sizes, v_fp8_options) : at::zeros(vt_sizes, v_fp8_options);
     at::Tensor v_scale = at::empty({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+    at::Tensor value_mean;
+    if (smooth_v) {
+        value_mean = at::empty({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+    }
+
+    const int  layout_int = static_cast<int>(layout);
+    const bool permute    = vl == VLayout::kMmaK16;
+
+    if (use_fused_v_quant(head_dim, padded_kv_len)) {
+        transpose_quant_v_fp8_cuda(
+            value, v_fp8, value_mean, v_scale, static_cast<float>(scale_max), layout_int, permute);
+    }
+    else {
+        at::Tensor value_t = at::empty(vt_sizes, value.options());
+        if (permute) {
+            transpose_pad_permute_cuda(value, value_t, layout_int);
+        }
+        else {
+            transpose_pad_cuda(value, value_t, layout_int);
+        }
+        if (smooth_v) {
+            mean_scale_fuse_quant_cuda(value_t,
+                                       v_fp8,
+                                       value_mean,
+                                       v_scale,
+                                       static_cast<int>(kv_len),
+                                       static_cast<float>(scale_max),
+                                       layout_int);
+        }
+        else {
+            scale_fuse_quant_cuda(
+                value_t, v_fp8, v_scale, static_cast<int>(kv_len), static_cast<float>(scale_max), layout_int);
+        }
+    }
 
     if (smooth_v) {
-        at::Tensor value_mean = at::empty({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
-        mean_scale_fuse_quant_cuda(
-            value_t, v_fp8, value_mean, v_scale, static_cast<int>(kv_len), static_cast<float>(scale_max), layout_int);
         return {v_fp8, v_scale, value_mean};
     }
-    scale_fuse_quant_cuda(value_t, v_fp8, v_scale, static_cast<int>(kv_len), static_cast<float>(scale_max), layout_int);
     return {v_fp8, v_scale, std::nullopt};
 }
 
@@ -354,41 +393,64 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_varlen
     const int64_t max_k        = max_seqlen_k.guard_int(__FILE__, __LINE__);
     const int64_t padded_total = sage::blk_total(total_k, batch_size, pad_multiple) * pad_multiple;
 
-    // [heads, head_dim, padded_total]. at::empty is enough: the transpose
-    // writes each sequence's slab up to its 64-aligned length and the
-    // quantization pass below reads exactly that far, so the part a
-    // pad_multiple=128 slab leaves over is never touched (the dense path makes
-    // the same trade).
-    at::Tensor        value_t = at::empty({num_kv_heads, head_dim, padded_total}, value.options());
     const QuantVarlen varlen{cu_seqlens_k.data_ptr<int32_t>(), batch_size, max_k, pad_multiple};
     // tensor_layout is unused on the varlen path (the strides carry the
     // layout); pass the HND flag so the argument still has a legal value.
-    const int layout_int = static_cast<int>(TensorLayout::kHND);
-    if (vl == VLayout::kMmaK16) {
-        transpose_pad_permute_cuda(value, value_t, layout_int, varlen);
-    }
-    else {
-        transpose_pad_cuda(value, value_t, layout_int, varlen);
-    }
+    const int  layout_int = static_cast<int>(TensorLayout::kHND);
+    const bool permute    = vl == VLayout::kMmaK16;
 
     // zeros, not empty, for the same reason as the dense path plus one more:
     // the fp8 tail of every sequence's slab (from its 64-aligned length to the
     // end of the blocks varlen.h gave it) is never written, and the attention
     // kernel reads whole 64-token tiles. A NaN-encoded garbage byte there
     // would poison PV through 0 * NaN.
-    at::Tensor v_fp8 = at::zeros(value_t.sizes(), value_t.options().dtype(at::kFloat8_e4m3fn));
+    at::Tensor v_fp8 = at::zeros({num_kv_heads, head_dim, padded_total}, value.options().dtype(at::kFloat8_e4m3fn));
     // zeros as well: an empty sequence produces no statistics at all, and an
     // uninitialized entry would make the op's output run-to-run unstable
     // (opcheck's test_aot_dispatch_dynamic compares eager against traced).
     at::Tensor v_scale = at::zeros({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+    at::Tensor value_mean;
+    if (smooth_v) {
+        value_mean = at::zeros({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+    }
+
+    // The gate takes max_seqlen: every sequence runs the same kernel, so the
+    // longest one decides which is cheaper for the batch.
+    if (use_fused_v_quant(head_dim, at::round_up<int64_t>(max_k, pad_multiple))) {
+        transpose_quant_v_fp8_cuda(
+            value, v_fp8, value_mean, v_scale, static_cast<float>(scale_max), layout_int, permute, varlen);
+    }
+    else {
+        // at::empty is enough: the transpose writes each sequence's slab up to
+        // its 64-aligned length and the quantization pass reads exactly that
+        // far, so the part a pad_multiple=128 slab leaves over is never touched
+        // (the dense path makes the same trade).
+        at::Tensor value_t = at::empty({num_kv_heads, head_dim, padded_total}, value.options());
+        if (permute) {
+            transpose_pad_permute_cuda(value, value_t, layout_int, varlen);
+        }
+        else {
+            transpose_pad_cuda(value, value_t, layout_int, varlen);
+        }
+        if (smooth_v) {
+            mean_scale_fuse_quant_cuda(value_t,
+                                       v_fp8,
+                                       value_mean,
+                                       v_scale,
+                                       /*num_tokens=*/0,
+                                       static_cast<float>(scale_max),
+                                       layout_int,
+                                       varlen);
+        }
+        else {
+            scale_fuse_quant_cuda(
+                value_t, v_fp8, v_scale, /*num_tokens=*/0, static_cast<float>(scale_max), layout_int, varlen);
+        }
+    }
 
     if (smooth_v) {
-        at::Tensor value_mean = at::zeros({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
-        mean_scale_fuse_quant_cuda(
-            value_t, v_fp8, value_mean, v_scale, /*num_tokens=*/0, static_cast<float>(scale_max), layout_int, varlen);
         return {v_fp8, v_scale, value_mean};
     }
-    scale_fuse_quant_cuda(value_t, v_fp8, v_scale, /*num_tokens=*/0, static_cast<float>(scale_max), layout_int, varlen);
     return {v_fp8, v_scale, std::nullopt};
 }
 

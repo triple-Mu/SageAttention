@@ -16,6 +16,11 @@
 // with a missing operator.
 #cmakedefine01 SAGEATTN_BUILD_VARLEN
 
+// Whether quant_v_fp8 fuses the V transpose into the fp8 quantization kernel
+// (CMake -DSAGE_FUSED_V_QUANT=OFF restores the two-kernel pair). Both produce
+// the same bits; only the kernel count and the traffic differ.
+#cmakedefine01 SAGEATTN_FUSED_V_QUANT
+
 // Arithmetic opt-ins (CMake -DSAGE_OPT_*=ON). 0 is the reference arithmetic the
 // bit-exact golden dumps were taken with. The recorded names deliberately differ
 // from the SAGE_OPT_* compile definitions the kernels guard on, so including this

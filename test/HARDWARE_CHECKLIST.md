@@ -345,13 +345,9 @@ sm89 家族的 varlen 实例(`sm89_varlen`,fp32+fp16 inst_buf)在 cc 12.0 上够
 五个都贴在 DRAM roofline 上(84-94%),单 kernel 调优没有空间,**只能删掉多余
 的字节**。dense 与 varlen 用的是同一批 kernel(只有 smooth_k 的均值不同:
 dense 走 ATen `reduce_kernel`,varlen 走 `SegmentMeanKernel`),所以这个结论
-两路通用。已落地一处(见下),还剩两处提案:
+两路通用。已落地两处(见下),还剩一处提案:
 
-1. transpose 与 MeanScale 是对 V 的两趟(读 V → 写 fp16 V^T → 读 V^T →
-   写 fp8),融成一个 kernel 后是读 V → 读 V → 写 fp8,少搬 28% 的字节,
-   n=4096 上省 ~90 µs(全流程 2.6%)。要新写 kernel,且要保证按 channel 的
-   amax 与 16-token permute 补位逐位一致。
-2. varlen 的 fp8 零填充(占 0.4-1.8%):让 `MeanScaleKernel` 对空序列写零而
+1. varlen 的 fp8 零填充(占 0.4-1.8%):让 `MeanScaleKernel` 对空序列写零而
    不是提前 return,`quant_v_fp8_varlen` 就能跟 dense 一样换成 `at::empty`。
    动的是一段有明确正确性理由的提前返回,收益又在 2% 以内,没做。
 
@@ -381,7 +377,7 @@ scratchpad 的 `varlen_state_table.txt`。等长时 packed 与 dense 打平,偏�
 偏斜列不单调(`b2 h16 n16384` 的 .1-1x 比 .25-1x 慢)是因为最长序列被钉死在
 `seq_len`、batch 只有 2,随机抽到的总 token 反而更多。
 
-### 落地的优化
+### 落地的优化一:fp8 V 缓冲的 at::zeros
 
 `quant_v_fp8` 里 fp8 V 缓冲的 `at::zeros`:量化 kernel 只写到 64 对齐边界,
 所以 `pad_multiple=128` 且 kv_len 的 128 对齐边界更大时,尾巴必须先清零。
@@ -401,6 +397,79 @@ sm89 / sm120 的 `pad_multiple` 是 64,两个边界重合,kernel 覆盖每一个
   空序列(会引入 D2H 同步,cudagraph / compile 路径不接受)
 
 一句话:这个优化只对 dense 生效,varlen 那一路的同名 memset 不是冗余的。
+
+### 落地的优化二:transpose 融进 fp8 量化(2026-08-30)
+
+`quant_v_fp8` / `quant_v_fp8_varlen` 内部改成一个 `TransposeQuantFp8Kernel`,
+中间那份 fp16 V^T 不再落地:读 V → 写 fp8,V 的字节从 7 份降到 3 份。CMake
+`-DSAGE_FUSED_V_QUANT=OFF` 退回两趟(`transpose_pad_v` + `(mean_)scale_fuse_quant`
+两个低层 op 原样保留)。
+
+**逐位一致靠 thread mapping 而不是靠对数。** block 保持 `MeanScaleKernel`
+的形状——256 线程,线程 t 拥有转置后的 token pack `[i*2048 + t*8, +8)`——所以
+每一个归约叶子、blockReduce 树的每一步、统计的 ceil16 口径与量化的 ceil64
+口径都原封不动;变的只是这 8 个值从哪来:不再从 V^T 连续读,而是按 16-token
+permute 的逆映射从 V 原布局 gather。代价是放弃整行合并访问:一个 block 只
+covers 16 个 channel,每次 gather 是 token 行里的 32 字节(一个完整 DRAM
+sector,不浪费),而不是 128 字节的整行。
+
+| 证据 | 结果 |
+|---|---|
+| `test_quant_v_fp8_matches_two_kernel_path` | 融合 vs 两趟逐位相同,224 组(layout × v_layout × smooth_v × dtype × head_dim × 7 个 seq) |
+| golden `--check`(sm120) | `ok=2578 diff=0`,equiv 265/265 |
+| pytest(sm120) | 305 passed / 397 skipped |
+| 本机 sm86 双门禁 | `ok=1493 diff=0`(extra=48 是 varlen equiv);源映射对拍 96 组全等 |
+| ptxas | 8 个实例 0 spill,64-94 寄存器 |
+
+varlen 那一路的逐位一致是接力得来的:`test_quant_v_fp8_varlen_matches_per_sequence_dense`
+已经钉死「packed 每段 == 同长度 dense」,加上上面这条「dense 融合 == dense
+两趟」,ragged batch 的每一段也就等于两趟版。
+
+**ncu**(d128 n4096,batch 4 heads 32,与上表同一组配置):
+
+| kernel | Duration | DRAM Throughput | 寄存器 | Achieved Occupancy |
+|---|---|---|---|---|
+| `TransposePadPermuteKernel` + `MeanScaleKernel` | 198.5 + 117.3 = 315.8 µs | 84.6% / 94.8% | 26 / 40 | 63.5% / 95.7% |
+| `TransposeQuantFp8Kernel` | 251.0 µs | 55.6% | 78 | 47.3% |
+
+字节少搬 57%、时间只省 20%,差额就是 gather 的效率:DRAM 从 ~90% 掉到 56%。
+**这条曲线有拐点**,所以主机侧按 padded token 数收口在 4096(两个 round),
+再长就走两趟。V 前处理单独计时(b8 h16 d128,3 轮中位数,单位 µs):
+
+| n | 两趟 | 融合 | Δ |
+|---|---|---|---|
+| 512 | 55.4 | 32.4 | −41% |
+| 1024 | 73.1 | 46.8 | −36% |
+| 2048 | 169.3 | 77.2 | −54% |
+| 3072 | 292.1 | 161.9 | −45% |
+| 4096 | 398.8 | 362.8 | −9% |
+| 5120 | 510.3 | 561.6 | +10% |
+| 8192 | 827.3 | 1202.6 | +45% |
+| 16384 | 1716.5 | 2628.7 | +53% |
+
+拐点在 4096 与 5120 之间:block 的一个 round 是 2048 个 token,两个 round
+以内时第二趟还能在 L2 里找到第一趟读过的字节,超过就是实打实的第二次 DRAM
+读,而 gather 的 DRAM 效率只有整行访问的六成,换不回来。门限之上两棵树
+逐点同速(±1%),即回退生效。
+
+**e2e 墙钟**(`sageattn`,3 轮交替中位数):
+
+| shape | 两趟 (µs) | 融合 (µs) | Δ |
+|---|---|---|---|
+| b8 h16 n512 d128 | 136.1 | 111.8 | −17.9% |
+| b8 h16 n1024 d128 | 383.1 | 347.2 | −9.4% |
+| b8 h16 n2048 d128 | 1060.0 | 1001.4 | −5.5% |
+| b8 h16 n4096 d128 | 3544.6 | 3500.0 | −1.3% |
+| b8 h32 n4096 d64 | 3963.2 | 3862.3 | −2.5% |
+| b16 h8 n2048 d64 | 573.4 | 560.1 | −2.3% |
+| b1 h24 n512 d128 | 47.6 | 43.5 | −8.7% |
+| b1 h24 n1024 d128 | 79.9 | 74.3 | −7.0% |
+| b1 h24 n2048 d128 | 192.7 | 189.0 | −1.9% |
+| b4 h16 n8192 d128 | 6228.5 | 6238.1 | +0.2% |
+| b2 h24 n16384 d128 | 17253.8 | 17291.3 | +0.2% |
+
+短 seq 过阈值(−5% ~ −18%),长 seq 走回退、留在噪声里。`smooth_v` 那一路
+同向:V 前处理 n=512 −33%、n=2048 −46%、n=4096 −41%。
 
 ## 5d. sm89 —— 已完成(L20,sm_89,92 SM,46 GB)
 
@@ -818,9 +887,11 @@ sm120 上的同款教训的 sm90 版本——d128 想要 occupancy 就得付 spi
       `mma_rate.cu`**,同速就两边一起退役,2× 就把默认改成按 SKU 选
 - [ ] bench/ 脚本迁移到 torch.ops.sageattention.*(除 `bench_varlen.py` 外,
       其余还 import 已删除的 pybind 模块)
-- [ ] 按 §5c / §5e 的 profiling 结论排下一步:transpose + MeanScale 融成一趟
-      (少搬 28% 的 V 字节,seq ≤ 2048 上值得;sm89 与 sm120 两边的占比一致)。
-      至于 attention kernel 的 softmax / mma 重叠(sm_89 上
+- [x] transpose + MeanScale 融成一趟:2026-08-30 落地(§5c「落地的优化二」),
+      sm120 上短 seq e2e −5% ~ −18%,padded token 数 > 4096 回退两趟。**还没在
+      sm89 / sm100 上量过**——两边的 kernel 占比与 sm120 一致(§5e / §5f),
+      但 4096 这个门限是按 sm120 的 L2 定的,换卡要重新扫拐点
+- [ ] attention kernel 的 softmax / mma 重叠(sm_89 上
       `math_pipe_throttle` 已占 stall 的 59%,sm120 同类):sm90 那一路已按
       实验证据关闭(§6 H1/H4 终版结论),sm89/sm120 立项前先读那三份判负
       报告——arch 不同不自动继承,但「重叠收益 < 占用代价」与「降 reg 换
