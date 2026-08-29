@@ -70,9 +70,18 @@ def fa3_fp8(
     k_scale = (k.abs().max().to(torch.float32) / 448.0).unsqueeze(-1)
     v_scale = (v.abs().max().to(torch.float32) / 448.0).unsqueeze(-1)
 
-    q_f8 = (q / q_scale).to(torch.float8_e4m3fn)
-    k_f8 = (k / k_scale).to(torch.float8_e4m3fn)
-    v_f8 = (v / v_scale).to(torch.float8_e4m3fn)
+    # scale == 0 (all-zero tensor) makes x / scale = 0 / 0 = NaN, and a
+    # subnormal scale overflows the division to inf; fp8_e4m3fn encodes both
+    # as 0x7f. Mirror MeanScaleKernel in csrc/fused/fused.cu: zero the
+    # reciprocal when it is not finite -- the descale handed to FA3 is (near)
+    # zero, so the tensor dequantizes to the correct 0.
+    q_recip = (1.0 / q_scale).nan_to_num(nan=0.0, posinf=0.0)
+    k_recip = (1.0 / k_scale).nan_to_num(nan=0.0, posinf=0.0)
+    v_recip = (1.0 / v_scale).nan_to_num(nan=0.0, posinf=0.0)
+
+    q_f8 = (q * q_recip).to(torch.float8_e4m3fn)
+    k_f8 = (k * k_recip).to(torch.float8_e4m3fn)
+    v_f8 = (v * v_recip).to(torch.float8_e4m3fn)
 
     o = flash_attn_func_v3(
         q_f8,
