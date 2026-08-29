@@ -27,7 +27,7 @@ namespace vllm {
 // functors are a plain `a > b ? a : b`, which propagates NaN differently from
 // the max()/min() builtins the Max/Min reductions below use.
 template<typename T>
-__inline__ __device__ T warpReduceSum(T val)
+__device__ __forceinline__ T warpReduceSum(T val)
 {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
@@ -37,7 +37,7 @@ __inline__ __device__ T warpReduceSum(T val)
 
 /* Calculate the sum of all elements in a block */
 template<typename T>
-__inline__ __device__ T blockReduceSum(T val)
+__device__ __forceinline__ T blockReduceSum(T val)
 {
     static __shared__ T shared[32];
     int                 lane = threadIdx.x & 0x1f;
@@ -58,7 +58,7 @@ __inline__ __device__ T blockReduceSum(T val)
 }
 
 template<typename T>
-__inline__ __device__ T warpReduceMax(T val)
+__device__ __forceinline__ T warpReduceMax(T val)
 {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
@@ -67,7 +67,7 @@ __inline__ __device__ T warpReduceMax(T val)
 }
 /* Calculate the maximum of all elements in a block */
 template<typename T>
-__inline__ __device__ T blockReduceMax(T val)
+__device__ __forceinline__ T blockReduceMax(T val)
 {
     static __shared__ T shared[32];
     int                 lane = threadIdx.x & 0x1f;  // in-warp idx
@@ -84,7 +84,7 @@ __inline__ __device__ T blockReduceMax(T val)
 }
 
 template<typename T>
-__inline__ __device__ T warpReduceMin(T val)
+__device__ __forceinline__ T warpReduceMin(T val)
 {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
@@ -93,7 +93,7 @@ __inline__ __device__ T warpReduceMin(T val)
 }
 /* Calculate the minimum of all elements in a block */
 template<typename T>
-__inline__ __device__ T blockReduceMin(T val)
+__device__ __forceinline__ T blockReduceMin(T val)
 {
     static __shared__ T shared[32];
     int                 lane = threadIdx.x & 0x1f;  // in-warp idx
