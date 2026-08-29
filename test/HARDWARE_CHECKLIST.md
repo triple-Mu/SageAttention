@@ -38,21 +38,29 @@ python compare_reference.py --check --golden-dir <dir> --backend new
 ## 1b. varlen(packed cu_seqlens 布局)
 
 本机 sm_86 只能跑 sm80 的 packed kernel,以及 fp8 V 流水里唯一 fp16 进
-fp16 出的那一级(transpose)。fp8 的 V^T 量化和 sm89/sm120 的 packed
-attention 一行都没在硬件上执行过。H200 也顶不上:sm90 resolve 到
-`kSm90F8`,还没有 packed kernel(P3 的事)。
+fp16 出的那一级(transpose)。sm89/sm120 的 packed attention 一行都没在硬件
+上执行过。
 
+sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据:
+
+- [x] sm90(H200):`pytest test/ -q` 308 passed / 319 skipped(skip 是这个
+      sm_90-only 构建里缺席的其他 arch 家族),含 65 个 sm90 packed kernel
+      用例与 29 个 `sageattn_varlen` API 用例;dense golden `ok=1488 diff=0`
+      (equiv 105/105);dense SASS 逐字节不变(纯搬家 1940 kernel、varlen
+      提交 1643 kernel,均 0 处差异)。
+- [x] `quant_v_fp8_varlen` 的 fp8 用例在 H200 跑通。**它在 sm_86 上是
+      skip 的,第一次真跑就暴露了断言写错**:`mma_k16` 把 token 在 16 个一组
+      内做了置换,跨过段长的那一组里真值和零是交错的,所以「段长之后每个字节
+      全零」对 dense 也不成立;`smooth_v=True` 时 padding 的 0 量化成
+      `(0 - v_mean) / v_scale`,本来就不是零。断言已按布局和 smooth_v 改写。
 - [ ] sm89(4090/L40S)与 sm120(5090):`pytest test/test_varlen.py -q`。
       `sageattn_varlen` 那一段的开关是「本机 resolve 到哪个 packed
       backend」,所以在这两张卡上它跑的就是新的 fp8 packed kernel——等长
       batch 对 dense 的 `torch.equal`、ragged 的分段 SDPA 精度、
       bottom-right causal、空 KV 段、cudagraph 换分段 replay。
-- [ ] 同两张卡:`quant_v_fp8_varlen` 的三个 fp8 用例(逐段对 dense 全等、
-      每段 `[n_b, 段 padded 末)` 的 fp8 字节全零、opcheck)。这条白盒不变量
-      是 sm89 V 加载能不带边界 predicate 的前提。
 - [ ] 口径提醒:sm89 的 varlen 只实例化 `pv_accum_dtype="fp32+fp16"`、
-      sm120 只实例化 `"fp32"`(plan.cpp 的默认值)。别的组合会明确报错,
-      不会静默降级,所以对拍脚本里不要顺手换 pv。
+      sm120 只实例化 `"fp32"`、sm90 只实例化 `"fp32+fp32"`(plan.cpp 的默认
+      值)。别的组合会明确报错,不会静默降级,所以对拍脚本里不要顺手换 pv。
 
 ## 2. A4-1 合并的性能复核(sm89/sm120)
 
