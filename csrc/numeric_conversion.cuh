@@ -85,7 +85,7 @@ struct fp_traits;
 
 template<>
 struct fp_traits<half> {
-    __device__ static __forceinline__ float to_fp32(half v)
+    static __device__ __forceinline__ float to_fp32(half v)
     {
         return __half2float(v);
     }
@@ -93,7 +93,7 @@ struct fp_traits<half> {
 
 template<>
 struct fp_traits<__nv_bfloat16> {
-    __device__ static __forceinline__ float to_fp32(__nv_bfloat16 v)
+    static __device__ __forceinline__ float to_fp32(__nv_bfloat16 v)
     {
         return __bfloat162float(v);
     }

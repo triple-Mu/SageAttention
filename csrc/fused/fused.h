@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <torch/types.h>
 
 void quant_per_block_int8_cuda(

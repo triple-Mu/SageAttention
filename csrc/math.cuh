@@ -37,7 +37,7 @@ constexpr float log2e = cuda::std::numbers::log2e_v<float>;
  *
  * \param x input
  */
-__forceinline__ __device__ float ptx_exp2(float x)
+__device__ __forceinline__ float ptx_exp2(float x)
 {
     float y;
     asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -48,7 +48,7 @@ __forceinline__ __device__ float ptx_exp2(float x)
  * \brief log2(x). --use_fast_math lowers __log2f to lg2.approx.ftz.f32.
  * \param x input
  */
-__forceinline__ __device__ float ptx_log2(float x)
+__device__ __forceinline__ float ptx_log2(float x)
 {
     return __log2f(x);
 }
@@ -61,7 +61,7 @@ __forceinline__ __device__ float ptx_log2(float x)
  *
  * \param x input
  */
-__forceinline__ __device__ float ptx_rcp(float x)
+__device__ __forceinline__ float ptx_rcp(float x)
 {
     float y;
     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));

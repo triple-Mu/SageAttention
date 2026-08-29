@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <torch/types.h>
 
 // sm12x (consumer Blackwell) instantiations of the qk_int8 / sv_f8 kernels.

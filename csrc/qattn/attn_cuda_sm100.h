@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <torch/types.h>
 
 // sm100/sm110 tcgen05 kernels: true fp32 PV accumulation (no _inst_buf variants).
