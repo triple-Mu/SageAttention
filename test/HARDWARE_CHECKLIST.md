@@ -64,6 +64,12 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       内做了置换,跨过段长的那一组里真值和零是交错的,所以「段长之后每个字节
       全零」对 dense 也不成立;`smooth_v=True` 时 padding 的 0 量化成
       `(0 - v_mean) / v_scale`,本来就不是零。断言已按布局和 smooth_v 改写。
+- [x] `segment_mean_varlen`(smooth_k 的分段均值 kernel,替换 ATen 的
+      repeat_interleave + index_add_ 组合)在 H200 验完(2026-08-29):
+      `pytest test/ -q` 339 passed / 319 skipped;`bench/bench_varlen.py`
+      等长 batch 对 dense 从 0.49-0.80x 回到 0.93-0.99x,ragged .1-1x
+      1.16-1.77x。kernel 在 fused 组、与 arch 无关,sm89/sm120 由下面那条
+      pytest 项顺带覆盖。
 - [ ] sm89(4090/L40S)与 sm120(5090):`pytest test/test_varlen.py -q`。
       `sageattn_varlen` 那一段的开关是「本机 resolve 到哪个 packed
       backend」,所以在这两张卡上它跑的就是新的 fp8 packed kernel——等长
