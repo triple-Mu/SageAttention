@@ -363,7 +363,7 @@ sm89 / sm120 的 `pad_multiple` 是 64,两个边界重合,kernel 覆盖每一个
 | 项 | 机器 | 命令/指标 | 决策 |
 |---|---|---|---|
 | C-8 QMMA.SF go/no-go | sm120 | `bash bench/microbench/run_microbench.sh`,看 QMMA.SF(fp32 accum)相对 f8f8f32 的比率;同时记录 f8f8f16:f8f8f32 | full-rate → 立项 sm120 v2(block-scaled mma);f8f8f16 与 f8f8f32 同速 → 退役 fp32+fp16 路径。**已采数,见下表** |
-| H1/H4 sm90 wgmma 异步化 | H100/H200 | `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier` | 确认 tensor core 空闲主导后再投入(重写级) |
+| H1/H4 sm90 wgmma 异步化 | H100/H200 | `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier` | **按实验证据关闭,见下节**。重叠四件套已在 `cutedsl-sage-sm90` 上全部实测判负;提高 occupancy 的替代方向也判负 |
 
 C-8 实测(RTX PRO 6000 Blackwell,110 SM,nvcc 13.3,2026-08-29):
 
@@ -381,6 +381,58 @@ sm120 的 `pv_accum_dtype="fp32+fp16"` 拿不到 Ada 上那 2× 的速度,只剩
 `ptxas -arch=sm_120f` 接受 `kind::mxf8f6f4`,真要做 v2 时一个
 `compute_120f` cubin 能同时覆盖 12.0 和 12.1。
 
+### H1/H4 sm90 终版结论(2026-08-29,H200 GPU 2)
+
+**现行 kernel 的地位:不动。** `qk_int8_sv_f8_attn_kernel`(CTA_Q=64、CTA_K=128、
+128 线程、167-168 reg、40 KB smem、3 CTA/SM)在已知的全部对照里是最快的一档:
+`cutedsl-sage-sm90` 那条线用 CuTe-DSL 重写同一个算法,一路优化到最后也只是
+**追平**它(d128 kernel-only 0.990-0.998×)。
+
+**重叠四件套(producer WG + setmaxnreg / CTA_Q 64→128 / 多 stage 环 +
+`warpgroup_wait<1>` / 双 consumer ping-pong)已全部实测判负**,证据在
+`cutedsl-sage-sm90`:
+
+| 判负项 | 出处 | 结论 |
+|---|---|---|
+| producer WG + CTA_Q=128 + ping-pong(384 线程,1 CTA/SM) | `921c5b6` `profile/2026-07-12-pingpong/REPORT.md` | 最优变体比 2 CTA/SM 慢 4.7-11.9%,错峰越强越慢 |
+| 多 stage 环 + `warpgroup_wait<1>`(软件流水) | `b151142` `profile/2026-07-13-softpipe/REPORT.md` | 寄存器墙;同占用下重叠真兑现也只有 +4.8~7.2%(d128)、+1.1~1.3%(d64) |
+| warp specialization 本身 | `1e87a34` | 主动**去掉** producer WG 与 setmaxnreg、退回 128 线程单 WG,才追平 CUDA |
+
+两条与直觉相反、但被实测钉死的前提:① CTA_Q=128 省下的 K/V L2 流量换不来时间
+(L2 吞吐 38.7%→17.4%,但 DRAM 只用 2%,离 memory bound 极远);② tensor pipe
+只有 ~19-23% 的 imma 占用,**不是争用瓶颈**,ping-pong 要解的「MMA 互相排队」
+在这里不存在,只剩同步开销。
+
+**替代方向 A(降寄存器换 occupancy)判定:同样判负。** 本 kernel 卡在 167 reg
+(4 CTA/SM 需 ≤128),给它加 `__launch_bounds__(NUM_THREADS, 4)`:
+
+| | 寄存器 | spill(st/ld) | stack |
+|---|---|---|---|
+| d128 基线 | 167-168 | **0 / 0** | 16 B |
+| d128 `__launch_bounds__(128, 4)` | 128 | **500 B / 456 B** | 264 B |
+| d64(两版相同,对照组) | 128 | 0 / 0 | 16 B |
+
+bench(GPU 2,`TORCH_CUDA_ARCH_LIST=9.0` 双树,4 轮交替 min-of-30,单位 µs):
+
+| seq | causal | 基线 | launch_bounds | 基线 TFLOPS | lb TFLOPS | lb/基线 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 0 | 1267.6 | 1591.7 | 867.4 | 690.8 | **1.256×** |
+| 4096 | 1 | 703.6 | 893.8 | 781.3 | 615.1 | **1.270×** |
+| 16384 | 0 | 19304.8 | 27327.5 | 911.3 | 643.8 | **1.416×** |
+| 16384 | 1 | 9704.8 | 13634.4 | 906.4 | 645.1 | **1.405×** |
+
+两道闸都判负:spill 500 B 远超 200 B 阈值,实测慢 26-42%。这正是 §5c 里 C-1 在
+sm120 上的同款教训的 sm90 版本——d128 想要 occupancy 就得付 spill,ptxas 会把
+省下的寄存器用 local memory 拼回来;d64 那一行是干净的对照,它本来就是 128 reg,
+加不加约束都不动。**这个 kernel 不是 occupancy 受限的。**
+
+**tensor pipe 的两个数字是口径差,不是矛盾。** 同一份
+`ncu_hd128_s4096_c0.ncu-rep`、同为 `pct_of_peak_sustained_active`:
+`sm__pipe_tensor_cycles_active` = **45.35%**(整条 tensor pipe),
+`sm__pipe_tensor_op_imma_cycles_active` = **22.68%**(仅 imma 子管线),
+比值正好 2.000——int8 QK 走 imma、fp8 PV 走另一半,各占一半 tensor cycles。
+判断「tensor pipe 是否饱和」该看 45.35% 这个数,结论仍是**未过半**。
+
 ## 7. 完成后的收尾
 
 - [ ] sm89 + sm120 对拍全绿后:删除 `qattn_smXX_*` 过渡 op(csrc/sageattn/ops.cpp
@@ -392,5 +444,8 @@ sm120 的 `pv_accum_dtype="fp32+fp16"` 拿不到 Ada 上那 2× 的速度,只剩
 - [ ] bench/ 脚本迁移到 torch.ops.sageattention.*(除 `bench_varlen.py` 外,
       其余还 import 已删除的 pybind 模块)
 - [ ] 按 §5c 的 profiling 结论排下一步:transpose + MeanScale 融成一趟
-      (少搬 28% 的 V 字节,seq ≤ 2048 上值得),以及 attention kernel 的
-      softmax / mma 重叠(重写级,和 sm90 H1/H4 同一类)
+      (少搬 28% 的 V 字节,seq ≤ 2048 上值得)。至于 attention kernel 的
+      softmax / mma 重叠:sm90 那一路已按实验证据关闭(§6 H1/H4 终版结论),
+      sm120 立项前先读那三份判负报告——arch 不同不自动继承,但
+      「重叠收益 < 占用代价」与「降 reg 换 occupancy 会被 spill 拼回来」
+      两条在 sm90/sm120 上各自都已实测成立
