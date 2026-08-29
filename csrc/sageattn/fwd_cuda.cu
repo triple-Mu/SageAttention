@@ -82,126 +82,255 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
     TORCH_CHECK(query.dim() == 4, "query must be 4-D");
     const int head_dim = static_cast<int>(query.size(3));
     const CC  cc       = device_cc(query.device().index());
-    Plan      p        = resolve(
+    Plan      plan     = resolve(
         cc, head_dim, std::nullopt, gran, pv, value_mean.has_value() ? std::optional<bool>(true) : std::nullopt);
-    TORCH_CHECK(p.error.empty(), "sageattention.fwd: ", p.error);
+    TORCH_CHECK(plan.error.empty(), "sageattention.fwd: ", plan.error);
     // fwd receives already-quantized inputs, so the caller must have fetched the
     // same plan; re-check the request against the resolved plan (a mismatch
     // means the tensors were prepared for a different kernel).
-    TORCH_CHECK(p.gran == gran,
+    TORCH_CHECK(plan.gran == gran,
                 "qk_quant_gran \"",
                 name(gran),
                 "\" is not what the resolved plan selected (\"",
-                name(p.gran),
+                name(plan.gran),
                 "\")");
-    TORCH_CHECK(p.pv == pv,
+    TORCH_CHECK(plan.pv == pv,
                 "pv_accum_dtype \"",
                 name(pv),
                 "\" is not supported for sm_",
                 cc.major,
                 cc.minor,
                 " (resolved plan uses \"",
-                name(p.pv),
+                name(plan.pv),
                 "\")");
     // The most dangerous silent failure: mma_k16-permuted vs linear V layouts
     // share shape and dtype. Validate intent against the selected kernel.
-    TORCH_CHECK(p.v_layout == vl,
+    TORCH_CHECK(plan.v_layout == vl,
                 "value was prepared with v_layout=\"",
                 v_layout,
                 "\" but the kernel selected for sm_",
                 cc.major,
                 cc.minor,
                 " (",
-                name(p.backend),
+                name(plan.backend),
                 ") requires \"",
-                name(p.v_layout),
+                name(plan.v_layout),
                 "\"");
-    TORCH_CHECK(p.need_value_scale == value_scale.has_value(),
-                p.need_value_scale ? "this backend/config requires value_scale (fp8 PV path)" :
-                                     "value_scale was passed but the selected kernel does not take it");
-    TORCH_CHECK(p.need_value_mean == value_mean.has_value(),
-                p.need_value_mean ? "smooth_v requires value_mean" :
-                                    "value_mean was passed but the resolved plan has smooth_v off");
+    TORCH_CHECK(plan.need_value_scale == value_scale.has_value(),
+                plan.need_value_scale ? "this backend/config requires value_scale (fp8 PV path)" :
+                                        "value_scale was passed but the selected kernel does not take it");
+    TORCH_CHECK(plan.need_value_mean == value_mean.has_value(),
+                plan.need_value_mean ? "smooth_v requires value_mean" :
+                                       "value_mean was passed but the resolved plan has smooth_v off");
 
     at::Tensor out = at::empty(query.sizes(), query.options().dtype(out_dtype));
 
-    const int   lf = static_cast<int>(layout);
-    const int   cf = is_causal ? 1 : 0;
-    const int   gf = static_cast<int>(p.gran);
-    const float ss = static_cast<float>(sm_scale);
-    const int   rl = return_lse ? 1 : 0;
+    const int   layout_int     = static_cast<int>(layout);
+    const int   causal_int     = is_causal ? 1 : 0;
+    const int   gran_int       = static_cast<int>(plan.gran);
+    const float sm_scale_f32   = static_cast<float>(sm_scale);
+    const int   return_lse_int = return_lse ? 1 : 0;
 
     at::Tensor lse;
-    switch (p.backend) {
+    switch (plan.backend) {
 #if SAGEATTN_BUILD_SM80
         case Backend::kSm80F16: {
-            if (p.smooth_v) {  // (fp16, smooth_v)
-                lse = sm80::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
-                    query, key, value, out, query_scale, key_scale, *value_mean, lf, cf, gf, ss, rl);
+            if (plan.smooth_v) {  // (fp16, smooth_v)
+                lse = sm80::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(query,
+                                                                      key,
+                                                                      value,
+                                                                      out,
+                                                                      query_scale,
+                                                                      key_scale,
+                                                                      *value_mean,
+                                                                      layout_int,
+                                                                      causal_int,
+                                                                      gran_int,
+                                                                      sm_scale_f32,
+                                                                      return_lse_int);
             }
-            else if (p.pv == PVAccum::kFp32) {
-                lse = sm80::qk_int8_sv_f16_accum_f32_attn(
-                    query, key, value, out, query_scale, key_scale, lf, cf, gf, ss, rl);
+            else if (plan.pv == PVAccum::kFp32) {
+                lse = sm80::qk_int8_sv_f16_accum_f32_attn(query,
+                                                          key,
+                                                          value,
+                                                          out,
+                                                          query_scale,
+                                                          key_scale,
+                                                          layout_int,
+                                                          causal_int,
+                                                          gran_int,
+                                                          sm_scale_f32,
+                                                          return_lse_int);
             }
-            else if (p.pv == PVAccum::kFp16) {
-                lse = sm80::qk_int8_sv_f16_accum_f16_attn(
-                    query, key, value, out, query_scale, key_scale, lf, cf, gf, ss, rl);
+            else if (plan.pv == PVAccum::kFp16) {
+                lse = sm80::qk_int8_sv_f16_accum_f16_attn(query,
+                                                          key,
+                                                          value,
+                                                          out,
+                                                          query_scale,
+                                                          key_scale,
+                                                          layout_int,
+                                                          causal_int,
+                                                          gran_int,
+                                                          sm_scale_f32,
+                                                          return_lse_int);
             }
             else {  // kFp16Fp32
-                lse = sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf(
-                    query, key, value, out, query_scale, key_scale, lf, cf, gf, ss, rl);
+                lse = sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf(query,
+                                                                   key,
+                                                                   value,
+                                                                   out,
+                                                                   query_scale,
+                                                                   key_scale,
+                                                                   layout_int,
+                                                                   causal_int,
+                                                                   gran_int,
+                                                                   sm_scale_f32,
+                                                                   return_lse_int);
             }
             break;
         }
 #endif
 #if SAGEATTN_BUILD_SM89
         case Backend::kSm89F8: {
-            if (p.smooth_v) {  // (fp32, smooth_v)
-                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(
-                    query, key, value, out, query_scale, key_scale, *value_scale, *value_mean, lf, cf, gf, ss, rl);
+            if (plan.smooth_v) {  // (fp32, smooth_v)
+                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(query,
+                                                                                  key,
+                                                                                  value,
+                                                                                  out,
+                                                                                  query_scale,
+                                                                                  key_scale,
+                                                                                  *value_scale,
+                                                                                  *value_mean,
+                                                                                  layout_int,
+                                                                                  causal_int,
+                                                                                  gran_int,
+                                                                                  sm_scale_f32,
+                                                                                  return_lse_int);
             }
-            else if (p.pv == PVAccum::kFp32) {
-                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
-                    query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+            else if (plan.pv == PVAccum::kFp32) {
+                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(query,
+                                                                      key,
+                                                                      value,
+                                                                      out,
+                                                                      query_scale,
+                                                                      key_scale,
+                                                                      *value_scale,
+                                                                      layout_int,
+                                                                      causal_int,
+                                                                      gran_int,
+                                                                      sm_scale_f32,
+                                                                      return_lse_int);
             }
-            else if (p.pv == PVAccum::kFp32Fp32) {
-                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
-                    query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+            else if (plan.pv == PVAccum::kFp32Fp32) {
+                lse = sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(query,
+                                                                               key,
+                                                                               value,
+                                                                               out,
+                                                                               query_scale,
+                                                                               key_scale,
+                                                                               *value_scale,
+                                                                               layout_int,
+                                                                               causal_int,
+                                                                               gran_int,
+                                                                               sm_scale_f32,
+                                                                               return_lse_int);
             }
             else {  // kFp32Fp16
-                lse = sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
-                    query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+                lse = sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(query,
+                                                                               key,
+                                                                               value,
+                                                                               out,
+                                                                               query_scale,
+                                                                               key_scale,
+                                                                               *value_scale,
+                                                                               layout_int,
+                                                                               causal_int,
+                                                                               gran_int,
+                                                                               sm_scale_f32,
+                                                                               return_lse_int);
             }
             break;
         }
 #endif
 #if SAGEATTN_BUILD_SM90
         case Backend::kSm90F8: {  // (fp32+fp32) only
-            lse = sm90::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
-                query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+            lse = sm90::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(query,
+                                                                           key,
+                                                                           value,
+                                                                           out,
+                                                                           query_scale,
+                                                                           key_scale,
+                                                                           *value_scale,
+                                                                           layout_int,
+                                                                           causal_int,
+                                                                           gran_int,
+                                                                           sm_scale_f32,
+                                                                           return_lse_int);
             break;
         }
 #endif
 #if SAGEATTN_BUILD_SM100
         case Backend::kSm100F8: {  // (fp32) only
-            lse = sm100::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
-                query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+            lse = sm100::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(query,
+                                                                   key,
+                                                                   value,
+                                                                   out,
+                                                                   query_scale,
+                                                                   key_scale,
+                                                                   *value_scale,
+                                                                   layout_int,
+                                                                   causal_int,
+                                                                   gran_int,
+                                                                   sm_scale_f32,
+                                                                   return_lse_int);
             break;
         }
 #endif
 #if SAGEATTN_BUILD_SM120
         case Backend::kSm120F8: {
-            if (p.smooth_v) {  // (fp32, smooth_v)
-                lse = sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(
-                    query, key, value, out, query_scale, key_scale, *value_scale, *value_mean, lf, cf, gf, ss, rl);
+            if (plan.smooth_v) {  // (fp32, smooth_v)
+                lse = sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(query,
+                                                                                   key,
+                                                                                   value,
+                                                                                   out,
+                                                                                   query_scale,
+                                                                                   key_scale,
+                                                                                   *value_scale,
+                                                                                   *value_mean,
+                                                                                   layout_int,
+                                                                                   causal_int,
+                                                                                   gran_int,
+                                                                                   sm_scale_f32,
+                                                                                   return_lse_int);
             }
-            else if (p.pv == PVAccum::kFp32) {
-                lse = sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
-                    query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+            else if (plan.pv == PVAccum::kFp32) {
+                lse = sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(query,
+                                                                       key,
+                                                                       value,
+                                                                       out,
+                                                                       query_scale,
+                                                                       key_scale,
+                                                                       *value_scale,
+                                                                       layout_int,
+                                                                       causal_int,
+                                                                       gran_int,
+                                                                       sm_scale_f32,
+                                                                       return_lse_int);
             }
             else {  // kFp32Fp16
-                lse = sm120::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
-                    query, key, value, out, query_scale, key_scale, *value_scale, lf, cf, gf, ss, rl);
+                lse = sm120::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(query,
+                                                                                key,
+                                                                                value,
+                                                                                out,
+                                                                                query_scale,
+                                                                                key_scale,
+                                                                                *value_scale,
+                                                                                layout_int,
+                                                                                causal_int,
+                                                                                gran_int,
+                                                                                sm_scale_f32,
+                                                                                return_lse_int);
             }
             break;
         }
@@ -209,7 +338,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
         default:
             TORCH_CHECK(false,
                         "unreachable: resolve() returned backend ",
-                        name(p.backend),
+                        name(plan.backend),
                         " which is not compiled into this build");
     }
 

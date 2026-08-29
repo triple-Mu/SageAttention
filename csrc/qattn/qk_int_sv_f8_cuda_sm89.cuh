@@ -235,17 +235,17 @@ __global__ void qk_int_sv_f8_attn_kernel(const int8_t* __restrict__ Q,
         }
     }
 
-    constexpr uint32_t K_smem_idx_offset = CTA_Q;
-    constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
+    constexpr uint32_t K_smem_row_offset = CTA_Q;
+    constexpr uint32_t V_smem_row_offset = CTA_Q + CTA_K;
 
     constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B :
                                             (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B :
                                                                      SwizzleMode::k128B;
     smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
-    smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_idx_offset * QK_SMEM_STRIDE);
+    smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_row_offset * QK_SMEM_STRIDE);
     //                                             for fp16: 32
     constexpr SwizzleMode swizzle_mode_V = (V_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
-    smem_t<swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V> smem_V(smem + V_smem_idx_offset * QK_SMEM_STRIDE);
+    smem_t<swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V> smem_V(smem + V_smem_row_offset * QK_SMEM_STRIDE);
     constexpr SwizzleMode swizzle_mode_O = (O_SMEM_STRIDE == 32) ? SwizzleMode::k64B : SwizzleMode::k128B;
     smem_t<swizzle_mode_O, O_SMEM_STRIDE / PACK_SIZE_O> smem_O(smem);
 

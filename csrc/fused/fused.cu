@@ -29,11 +29,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-enum class QuantType {
-    kInt8,
-    kInt4,
-};
-
 template<uint32_t head_dim,
          uint32_t CTA_TOKENS,
          uint32_t num_pack_per_thread = 1,
@@ -72,12 +67,12 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
     float x_val_float[num_pack_per_thread][8];
     float mean_val_float[8];
 
-    uint32_t bx        = blockIdx.x;
-    uint32_t head_id   = blockIdx.y;
-    uint32_t batch_id  = blockIdx.z;
-    uint32_t thread_id = threadIdx.x;
+    uint32_t token_cta_idx = blockIdx.x;
+    uint32_t head_id       = blockIdx.y;
+    uint32_t batch_id      = blockIdx.z;
+    uint32_t thread_id     = threadIdx.x;
 
-    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
+    uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
     T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
@@ -90,7 +85,7 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
                               + static_cast<int64_t>(thread_base_token) * stride_seq_output
                               + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
     float* scale_ptr_base = scale + static_cast<int64_t>(batch_id) * stride_batch_scale
-                            + static_cast<int64_t>(head_id) * stride_h_scale + static_cast<int64_t>(bx);
+                            + static_cast<int64_t>(head_id) * stride_h_scale + static_cast<int64_t>(token_cta_idx);
 
     if constexpr (sub_mean) {
         *(float4*)(&mean_val[0]) = *(float4*)(mean_ptr_base);
@@ -134,26 +129,26 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
         }
     }
 
-    float amax_val = 0.0000001f;  // prevent from dividing by zero
+    float amax = 0.0000001f;  // prevent from dividing by zero
 
 #pragma unroll
     for (uint32_t i = 0; i < num_pack_per_thread; i++) {
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) {
-            amax_val = fmaxf(amax_val, fabsf(x_val_float[i][j]));
+            amax = fmaxf(amax, fabsf(x_val_float[i][j]));
         }
     }
 
-    __shared__ float s_amax;
-    const float      block_amax_val = vllm::blockReduceMax(amax_val);
+    __shared__ float smem_amax;
+    const float      block_amax_val = vllm::blockReduceMax(amax);
     if (thread_id == 0) {
-        s_amax            = block_amax_val;
-        scale_ptr_base[0] = s_amax / 127.0f;
+        smem_amax         = block_amax_val;
+        scale_ptr_base[0] = smem_amax / 127.0f;
     }
 
     __syncthreads();
 
-    float tmp_scale = 127.0f / s_amax;
+    float recip_scale = 127.0f / smem_amax;
 
     char4 o_val[num_pack_per_thread][2];
 
@@ -161,10 +156,10 @@ __global__ void QuantInt8Kernel(T* __restrict__ input,
     for (uint32_t i = 0; i < num_pack_per_thread; i++) {
 #pragma unroll
         for (uint32_t j = 0; j < 2; j += 1) {
-            o_val[i][j] = make_char4(float_to_int8_rn(x_val_float[i][j * 4 + 0] * tmp_scale),
-                                     float_to_int8_rn(x_val_float[i][j * 4 + 1] * tmp_scale),
-                                     float_to_int8_rn(x_val_float[i][j * 4 + 2] * tmp_scale),
-                                     float_to_int8_rn(x_val_float[i][j * 4 + 3] * tmp_scale));
+            o_val[i][j] = make_char4(float_to_int8_rn(x_val_float[i][j * 4 + 0] * recip_scale),
+                                     float_to_int8_rn(x_val_float[i][j * 4 + 1] * recip_scale),
+                                     float_to_int8_rn(x_val_float[i][j * 4 + 2] * recip_scale),
+                                     float_to_int8_rn(x_val_float[i][j * 4 + 3] * recip_scale));
         }
     }
 
@@ -208,12 +203,12 @@ __global__ void SubMeanKernel(T* __restrict__ input,
     T2 x_val[num_pack_per_thread][4];
     T2 mean_val[4];
 
-    uint32_t bx        = blockIdx.x;
-    uint32_t head_id   = blockIdx.y;
-    uint32_t batch_id  = blockIdx.z;
-    uint32_t thread_id = threadIdx.x;
+    uint32_t token_cta_idx = blockIdx.x;
+    uint32_t head_id       = blockIdx.y;
+    uint32_t batch_id      = blockIdx.z;
+    uint32_t thread_id     = threadIdx.x;
 
-    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
+    uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
     T*       input_ptr_base    = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
@@ -274,19 +269,20 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
     uint32_t           num_threads_per_token = head_dim / pack_size;
     uint32_t           num_threads_per_cta   = CTA_TOKENS / pack_size;
 
-    uint32_t bx        = blockIdx.x;
-    uint32_t head_id   = blockIdx.y;
-    uint32_t batch_id  = blockIdx.z;
-    uint32_t thread_id = threadIdx.x;
+    uint32_t token_cta_idx = blockIdx.x;
+    uint32_t head_id       = blockIdx.y;
+    uint32_t batch_id      = blockIdx.z;
+    uint32_t thread_id     = threadIdx.x;
 
-    uint32_t thread_base_token = bx * CTA_TOKENS + thread_id / num_threads_per_token;
+    uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
 
     T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
                         + static_cast<int64_t>(thread_base_token) * stride_seq_input
                         + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
     T* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
-                         + static_cast<int64_t>(head_id) * stride_h_output + static_cast<int64_t>(bx * CTA_TOKENS)
+                         + static_cast<int64_t>(head_id) * stride_h_output
+                         + static_cast<int64_t>(token_cta_idx * CTA_TOKENS)
                          + static_cast<int64_t>(thread_id % num_threads_per_cta * pack_size)
                          + static_cast<int64_t>(thread_id / num_threads_per_cta) * stride_d_output;
 
@@ -383,9 +379,9 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
     uint32_t num_threads = blockDim.x;
     uint32_t gmem_stride = num_threads * pack_size;
     // pad the number of tokens to 16 to deal with fp8 permute in previous kernel
-    uint32_t fp8_padded_num_tokens = at::round_up<uint32_t>(num_tokens, 16);
+    uint32_t stat_padded_num_tokens = at::round_up<uint32_t>(num_tokens, 16);
     uint32_t num_iters =
-        fp8_padded_num_tokens / gmem_stride + ((fp8_padded_num_tokens % gmem_stride) > thread_id * pack_size);
+        stat_padded_num_tokens / gmem_stride + ((stat_padded_num_tokens % gmem_stride) > thread_id * pack_size);
     // the quantize pass covers all fp8 output tokens to prevent nan in random initialization
     uint32_t padded_num_tokens = at::round_up<uint32_t>(num_tokens, pad_size);
     uint32_t num_quant_iters =
@@ -438,8 +434,8 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
     }
 
     // reduce
-    __shared__ float s_amax_val;
-    __shared__ float s_mean_val;
+    __shared__ float smem_amax;
+    __shared__ float smem_mean;
 
     float block_max_val = vllm::blockReduceMax(max_val);
     float block_min_val = vllm::blockReduceMin(min_val);
@@ -450,30 +446,30 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
     }
 
     if (thread_id == 0) {
-        // s_mean_val is only defined (and only consumed) on the sub_mean path;
+        // smem_mean is only defined (and only consumed) on the sub_mean path;
         // computing it unconditionally used to read the uninitialized
         // block_sum_val (UB, harmless in practice but wrong).
         if constexpr (sub_mean) {
-            s_mean_val = block_sum_val / fp8_padded_num_tokens;
-            s_amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
+            smem_mean = block_sum_val / stat_padded_num_tokens;
+            smem_amax = fmaxf(fabsf(block_max_val - smem_mean), fabsf(block_min_val - smem_mean));
             mean[static_cast<int64_t>(batch_id) * stride_batch_mean + static_cast<int64_t>(head_id) * stride_h_mean
-                 + static_cast<int64_t>(d_id)] = s_mean_val;
+                 + static_cast<int64_t>(d_id)] = smem_mean;
         }
         else {
-            s_amax_val = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
+            smem_amax = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
         }
 
         scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
-              + static_cast<int64_t>(d_id)] = s_amax_val / scale_max;
+              + static_cast<int64_t>(d_id)] = smem_amax / scale_max;
     }
 
     __syncthreads();
 
     float mean_val = 0.0f;
     if constexpr (sub_mean) {
-        mean_val = s_mean_val;
+        mean_val = smem_mean;
     }
-    float recp_scale = scale_max / s_amax_val;
+    float recip_scale = scale_max / smem_amax;
 
     auto quantize_store = [&](const pack_t& x_val, uint32_t i) {
         float    x_val_float[8];
@@ -482,10 +478,10 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
         for (uint32_t j = 0; j < 8; j++) {
             x_val_float[j] = fp_traits<T>::to_fp32(x_val[j]);
             if constexpr (sub_mean) {
-                x_val_float[j] = (x_val_float[j] - mean_val) * recp_scale;
+                x_val_float[j] = (x_val_float[j] - mean_val) * recip_scale;
             }
             else {
-                x_val_float[j] *= recp_scale;
+                x_val_float[j] *= recip_scale;
             }
         }
 
@@ -517,8 +513,8 @@ void quant_per_block_int8_cuda(
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
-    SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
+    QuantLayout layout = parse_quant_layout(input, output, scale, tensor_layout);
+    SAGEATTN_QUANT_LAYOUT_LOCALS(layout);
 
     auto input_dtype = input.scalar_type();
 
@@ -564,8 +560,8 @@ void quant_per_block_int8_cuda(
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
-    SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
+    QuantLayout layout = parse_quant_layout(input, output, scale, tensor_layout);
+    SAGEATTN_QUANT_LAYOUT_LOCALS(layout);
 
     auto input_dtype = input.scalar_type();
 
@@ -615,8 +611,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor input,
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout, &mean);
-    SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
+    QuantLayout layout = parse_quant_layout(input, output, scale, tensor_layout, &mean);
+    SAGEATTN_QUANT_LAYOUT_LOCALS(layout);
 
     auto input_dtype = input.scalar_type();
     auto mean_dtype  = mean.scalar_type();
@@ -671,8 +667,8 @@ void quant_per_warp_int8_cuda(torch::Tensor input,
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout ql = parse_quant_layout(input, output, scale, tensor_layout);
-    SAGEATTN_QUANT_LAYOUT_LOCALS(ql);
+    QuantLayout layout = parse_quant_layout(input, output, scale, tensor_layout);
+    SAGEATTN_QUANT_LAYOUT_LOCALS(layout);
 
     auto input_dtype = input.scalar_type();
 
@@ -847,10 +843,10 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
     // The output is the transposed-value layout. Only its strides come from the
     // parsed layout: its sizes are what the CHECK_SHAPE below validates against
     // the input-derived ones, so they must stay input-derived.
-    const VTLayout ol                  = parse_vt_layout(output, tensor_layout);
-    const int64_t  stride_batch_output = ol.stride_batch;
-    const int64_t  stride_d_output     = ol.stride_d;
-    const int64_t  stride_h_output     = ol.stride_h;
+    const VTLayout out_layout          = parse_vt_layout(output, tensor_layout);
+    const int64_t  stride_batch_output = out_layout.stride_batch;
+    const int64_t  stride_d_output     = out_layout.stride_d;
+    const int64_t  stride_h_output     = out_layout.stride_h;
 
     int64_t num_tokens, padded_num_tokens, num_heads;
     int64_t stride_seq_input, stride_h_input;
@@ -961,20 +957,20 @@ void scale_fuse_quant_cuda(
     CHECK_DIMS(output, 4);
     CHECK_DIMS(scale, 3);
 
-    const VTLayout il = parse_vt_layout(input, tensor_layout);
-    const VTLayout ol = parse_vt_layout(output, tensor_layout);
+    const VTLayout in_layout  = parse_vt_layout(input, tensor_layout);
+    const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
 
-    const int64_t batch_size = il.batch_size;
-    const int64_t num_heads  = il.num_heads;
-    const int64_t head_dim   = il.head_dim;
+    const int64_t batch_size = in_layout.batch_size;
+    const int64_t num_heads  = in_layout.num_heads;
+    const int64_t head_dim   = in_layout.head_dim;
 
-    const int64_t stride_batch_input = il.stride_batch;
-    const int64_t stride_d_input     = il.stride_d;
-    const int64_t stride_h_input     = il.stride_h;
+    const int64_t stride_batch_input = in_layout.stride_batch;
+    const int64_t stride_d_input     = in_layout.stride_d;
+    const int64_t stride_h_input     = in_layout.stride_h;
 
-    const int64_t stride_batch_output = ol.stride_batch;
-    const int64_t stride_d_output     = ol.stride_d;
-    const int64_t stride_h_output     = ol.stride_h;
+    const int64_t stride_batch_output = out_layout.stride_batch;
+    const int64_t stride_d_output     = out_layout.stride_d;
+    const int64_t stride_h_output     = out_layout.stride_h;
 
     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
@@ -1049,20 +1045,20 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
     CHECK_DIMS(mean, 3);
     CHECK_DIMS(scale, 3);
 
-    const VTLayout il = parse_vt_layout(input, tensor_layout);
-    const VTLayout ol = parse_vt_layout(output, tensor_layout);
+    const VTLayout in_layout  = parse_vt_layout(input, tensor_layout);
+    const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
 
-    const int64_t batch_size = il.batch_size;
-    const int64_t num_heads  = il.num_heads;
-    const int64_t head_dim   = il.head_dim;
+    const int64_t batch_size = in_layout.batch_size;
+    const int64_t num_heads  = in_layout.num_heads;
+    const int64_t head_dim   = in_layout.head_dim;
 
-    const int64_t stride_batch_input = il.stride_batch;
-    const int64_t stride_d_input     = il.stride_d;
-    const int64_t stride_h_input     = il.stride_h;
+    const int64_t stride_batch_input = in_layout.stride_batch;
+    const int64_t stride_d_input     = in_layout.stride_d;
+    const int64_t stride_h_input     = in_layout.stride_h;
 
-    const int64_t stride_batch_output = ol.stride_batch;
-    const int64_t stride_d_output     = ol.stride_d;
-    const int64_t stride_h_output     = ol.stride_h;
+    const int64_t stride_batch_output = out_layout.stride_batch;
+    const int64_t stride_d_output     = out_layout.stride_d;
+    const int64_t stride_h_output     = out_layout.stride_h;
 
     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(mean, batch_size, num_heads, head_dim);

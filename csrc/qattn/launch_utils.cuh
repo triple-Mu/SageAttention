@@ -140,7 +140,7 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
             CHECK_DTYPE(value_mean, torch::kFloat32);
         }
         // kSVF16 instead checks value_mean's dtype against the output dtype at
-        // the launcher (TORCH_CHECK(value_mean_dtype == output_dtype, ...)).
+        // the launcher (TORCH_CHECK(value_mean_dtype == out_dtype, ...)).
     }
 
     CHECK_DIMS(query, 4);

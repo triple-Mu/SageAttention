@@ -83,19 +83,19 @@ void quant_per_block_int8(const at::Tensor&                input,
                           int64_t                          block_size,
                           c10::string_view                 tensor_layout)
 {
-    const int lf = layout_flag(tensor_layout);
+    const int layout_int = layout_flag(tensor_layout);
     if (mean.has_value()) {
         TORCH_CHECK(!sm_scale.has_value(),
                     "quant_per_block_int8: sm_scale and mean are mutually exclusive "
                     "(the fused sub-mean path has no sm_scale)");
-        quant_per_block_int8_fuse_sub_mean_cuda(input, *mean, output, scale, static_cast<int>(block_size), lf);
+        quant_per_block_int8_fuse_sub_mean_cuda(input, *mean, output, scale, static_cast<int>(block_size), layout_int);
     }
     else if (sm_scale.has_value()) {
         quant_per_block_int8_cuda(
-            input, output, scale, static_cast<float>(*sm_scale), static_cast<int>(block_size), lf);
+            input, output, scale, static_cast<float>(*sm_scale), static_cast<int>(block_size), layout_int);
     }
     else {
-        quant_per_block_int8_cuda(input, output, scale, static_cast<int>(block_size), lf);
+        quant_per_block_int8_cuda(input, output, scale, static_cast<int>(block_size), layout_int);
     }
 }
 
@@ -137,14 +137,14 @@ void quant_per_thread_int8_k(const at::Tensor&                input,
                              int64_t                          warp_block_size,
                              c10::string_view                 tensor_layout)
 {
-    const int lf = layout_flag(tensor_layout);
+    const int layout_int = layout_flag(tensor_layout);
     if (mean.has_value()) {
         quant_per_thread_int8_k_fuse_sub_mean_cuda(
-            input, *mean, output, scale, static_cast<int>(block_size), static_cast<int>(warp_block_size), lf);
+            input, *mean, output, scale, static_cast<int>(block_size), static_cast<int>(warp_block_size), layout_int);
     }
     else {
         quant_per_thread_int8_k_cuda(
-            input, output, scale, static_cast<int>(block_size), static_cast<int>(warp_block_size), lf);
+            input, output, scale, static_cast<int>(block_size), static_cast<int>(warp_block_size), layout_int);
     }
 }
 
@@ -320,23 +320,23 @@ at::Tensor qattn_extra2(const at::Tensor& query,
 
 std::vector<int64_t> compiled_archs()
 {
-    std::vector<int64_t> out;
+    std::vector<int64_t> archs;
 #if SAGEATTN_BUILD_SM80
-    out.push_back(80);
+    archs.push_back(80);
 #endif
 #if SAGEATTN_BUILD_SM89
-    out.push_back(89);
+    archs.push_back(89);
 #endif
 #if SAGEATTN_BUILD_SM90
-    out.push_back(90);
+    archs.push_back(90);
 #endif
 #if SAGEATTN_BUILD_SM100
-    out.push_back(100);
+    archs.push_back(100);
 #endif
 #if SAGEATTN_BUILD_SM120
-    out.push_back(120);
+    archs.push_back(120);
 #endif
-    return out;
+    return archs;
 }
 
 // Full dispatch decision for one (cc, head_dim, requests) tuple. Pure host —

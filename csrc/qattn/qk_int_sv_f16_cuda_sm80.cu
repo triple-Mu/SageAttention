@@ -234,16 +234,16 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         }
     }
 
-    constexpr uint32_t K_smem_idx_offset = CTA_Q;
-    constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
+    constexpr uint32_t K_smem_row_offset = CTA_Q;
+    constexpr uint32_t V_smem_row_offset = CTA_Q + CTA_K;
 
     constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B :
                                             (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B :
                                                                      SwizzleMode::k128B;
     smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
-    smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_idx_offset * QK_SMEM_STRIDE);
+    smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_row_offset * QK_SMEM_STRIDE);
     constexpr SwizzleMode swizzle_mode_V = (V_SMEM_STRIDE == 32) ? SwizzleMode::k64B : SwizzleMode::k128B;
-    smem_t<swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V> smem_V(smem + V_smem_idx_offset * QK_SMEM_STRIDE);
+    smem_t<swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V> smem_V(smem + V_smem_row_offset * QK_SMEM_STRIDE);
     constexpr SwizzleMode swizzle_mode_O = (O_SMEM_STRIDE == 32) ? SwizzleMode::k64B : SwizzleMode::k128B;
     smem_t<swizzle_mode_O, O_SMEM_STRIDE / PACK_SIZE_O> smem_O(smem);
 
@@ -753,14 +753,14 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
                                                         return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
-    auto         output_dtype = output.scalar_type();
-    cudaStream_t stream       = at::cuda::getCurrentCUDAStream();
+    auto         out_dtype = output.scalar_type();
+    cudaStream_t stream    = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q  = 128;
                         constexpr int CTA_K  = 64;
                         constexpr int WARP_Q = 32;
@@ -874,14 +874,14 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
                                                         return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
-    auto         output_dtype = output.scalar_type();
-    cudaStream_t stream       = at::cuda::getCurrentCUDAStream();
+    auto         out_dtype = output.scalar_type();
+    cudaStream_t stream    = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q  = 128;
                         constexpr int CTA_K  = 64;
                         constexpr int WARP_Q = 32;
@@ -995,14 +995,14 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
                                                         return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
-    auto         output_dtype = output.scalar_type();
-    cudaStream_t stream       = at::cuda::getCurrentCUDAStream();
+    auto         out_dtype = output.scalar_type();
+    cudaStream_t stream    = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q  = 128;
                         constexpr int CTA_K  = 64;
                         constexpr int WARP_Q = (HEAD_DIM == 64) ? 32 : 16;
@@ -1117,17 +1117,17 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
                                                         return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_F16(qkv);
 
-    auto         output_dtype     = output.scalar_type();
+    auto         out_dtype        = output.scalar_type();
     cudaStream_t stream           = at::cuda::getCurrentCUDAStream();
     auto         value_mean_dtype = value_mean.scalar_type();
 
-    TORCH_CHECK(value_mean_dtype == output_dtype, "value_mean and output must have the same dtype");
+    TORCH_CHECK(value_mean_dtype == out_dtype, "value_mean and output must have the same dtype");
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q  = 128;
                         constexpr int CTA_K  = 64;
                         constexpr int WARP_Q = 32;

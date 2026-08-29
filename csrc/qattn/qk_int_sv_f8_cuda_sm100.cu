@@ -25,7 +25,7 @@
 // warpgroup, no warp specialization). Thread t owns S/O row t == TMEM lane t.
 // TMA + mbarrier pipeline carried over from qk_int_sv_f8_cuda_sm90.cu;
 // wgmma sync (commit_batch/wait_group) replaced by tcgen05.commit + mbarrier
-// parity waits (bar_S_done / bar_O_done).
+// parity waits (barrier_S_done / barrier_O_done).
 //
 // TMEM column plan (128 lanes x 512 cols x 32b, one alloc of all 512 cols):
 //   S [0,128)          128x128 s32 QK accumulator (1 col = 1 s32 per lane)
@@ -161,10 +161,10 @@ __global__ void __launch_bounds__(NUM_THREADS)
                   "TMEM regions must not overlap");
 
     // --- derived tile counts ---
-    constexpr uint32_t num_k_steps_qk = head_dim / 32;  // K=32 elems per kind::i8 step
-    constexpr uint32_t num_k_steps_pv = CTA_K / 32;     // K=32 elems per kind::f8f6f4 step
-    constexpr uint32_t num_chunks_s   = CTA_K / 32;     // 32x32b.x32 loads per S row
-    constexpr uint32_t num_chunks_o   = head_dim / 32;  // 32x32b.x32 loads per O row
+    constexpr uint32_t num_tiles_qk_inner = head_dim / 32;  // K=32 elems per kind::i8 step
+    constexpr uint32_t num_tiles_pv_inner = CTA_K / 32;     // K=32 elems per kind::f8f6f4 step
+    constexpr uint32_t num_tiles_s        = CTA_K / 32;     // 32x32b.x32 loads per S row
+    constexpr uint32_t num_tiles_o        = head_dim / 32;  // 32x32b.x32 loads per O row
 
     // --- smem plan (mirrors the launcher's smem_bytes computation) ---
     constexpr uint32_t SMEM_Q_BYTES = CTA_Q * head_dim;
@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                                                            /*BMajorK=*/true>();
 
     const uint32_t warp_idx = threadIdx.x / 32;
-    const uint32_t row      = threadIdx.x;  // S/O row owned by this thread == TMEM lane
+    const uint32_t row_id   = threadIdx.x;  // S/O row owned by this thread == TMEM lane
 
     const uint32_t batch_id     = blockIdx.z;
     const uint32_t cta_idx_q    = blockIdx.x;
@@ -231,14 +231,14 @@ __global__ void __launch_bounds__(NUM_THREADS)
         // per_warp_int8_cuda(BLKQ=128, WARPQ=32): 4 scales per block, one per 32 rows
         const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
         q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
-                      + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * (CTA_Q / 32) + row / 32;
+                      + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * (CTA_Q / 32) + row_id / 32;
     }
     else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
-        // per_thread quant (WARPQ=32): 8 scales per 32-row group, class = row % 8
+        // per_thread quant (WARPQ=32): 8 scales per 32-row group, class = row_id % 8
         const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
         q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
                       + static_cast<int64_t>(head_id) * (num_warp_tiles_q * 8) + cta_idx_q * ((CTA_Q / 32) * 8)
-                      + (row / 32) * 8 + (row % 8);
+                      + (row_id / 32) * 8 + (row_id % 8);
     }
 
     if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
@@ -311,7 +311,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint32_t num_iterations =
         div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
 
-    const uint32_t q_idx = cta_idx_q * CTA_Q + row;
+    const uint32_t q_idx = cta_idx_q * CTA_Q + row_id;
 
     // mbarrier phase bits (all barriers complete exactly once per KV tile;
     // see docs/barrier_ledger.md)
@@ -331,7 +331,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
         if (warp_idx == 0 && tcgen05::elect_one()) {
 #pragma unroll
-            for (uint32_t k_it = 0; k_it < num_k_steps_qk; k_it++) {
+            for (uint32_t k_it = 0; k_it < num_tiles_qk_inner; k_it++) {
                 const uint64_t desc_q =
                     tcgen05::make_smem_desc_sm100<QK_SWIZZLE, tcgen05::kKMajorLBO, QK_SBO>(&sQ[k_it * 32]);
                 const uint64_t desc_k =
@@ -355,35 +355,35 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
         // ---- softmax: pull this thread's full S row out of TMEM ----
         // K-scale(s) for this tile (per-thread K: 4 scales, column class (j%8)/2)
-        float dq[(K_GRAN == QuantGranularity::kPerThread) ? 4 : 1];
+        float dequant_scale[(K_GRAN == QuantGranularity::kPerThread) ? 4 : 1];
         if constexpr (K_GRAN == QuantGranularity::kPerThread) {
 #pragma unroll
             for (uint32_t cls = 0; cls < 4; cls++) {
-                dq[cls] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset + cls];
+                dequant_scale[cls] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset + cls];
             }
         }
         else {
-            dq[0] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset];
+            dequant_scale[0] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset];
         }
 
-        float s_f32[CTA_K];
+        float RS_f32[CTA_K];
         float m_local = -5000000.0f;
 #pragma unroll
-        for (uint32_t c = 0; c < num_chunks_s; c++) {
-            uint32_t s_u32[32];
-            tcgen05::tmem_ld_32x32b_x32(s_u32, tmem_row_base + TMEM_COL_S + c * 32);
+        for (uint32_t c = 0; c < num_tiles_s; c++) {
+            uint32_t RS_u32[32];
+            tcgen05::tmem_ld_32x32b_x32(RS_u32, tmem_row_base + TMEM_COL_S + c * 32);
             tcgen05::tmem_ld_wait();
 #pragma unroll
             for (uint32_t jj = 0; jj < 32; jj++) {
                 const uint32_t j = c * 32 + jj;
-                float          dq_j;
+                float          dequant_scale_j;
                 if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-                    dq_j = dq[(j % 8) / 2];
+                    dequant_scale_j = dequant_scale[(j % 8) / 2];
                 }
                 else {
-                    dq_j = dq[0];
+                    dequant_scale_j = dequant_scale[0];
                 }
-                float s = __int2float_rz(static_cast<int32_t>(s_u32[jj])) * dq_j;
+                float s = __int2float_rz(static_cast<int32_t>(RS_u32[jj])) * dequant_scale_j;
 
                 if constexpr (is_last) {
                     // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
@@ -400,49 +400,49 @@ __global__ void __launch_bounds__(NUM_THREADS)
                     }
                 }
 
-                m_local  = max(m_local, s);
-                s_f32[j] = s;
+                m_local   = max(m_local, s);
+                RS_f32[j] = s;
             }
         }
 
         // ---- online softmax update (thread-local; no shuffles) ----
         // row_max folds sm_scale (already x log2e) and the e4m3-saturation offset:
         // p[j] = exp2(s[j]*sm_scale - row_max) = exp2(s' - max' + S_FP8_OFFSET) in (0, 448]
-        const float m_prev = row_max;
-        row_max            = max(row_max, fmaf(m_local, sm_scale, -S_FP8_OFFSET));
-        const float alpha  = math::ptx_exp2(m_prev - row_max);  // o_scale
-        denom *= alpha;
+        const float m_prev  = row_max;
+        row_max             = max(row_max, fmaf(m_local, sm_scale, -S_FP8_OFFSET));
+        const float o_scale = math::ptx_exp2(m_prev - row_max);
+        denom *= o_scale;
         const float neg_row_max = -row_max;
         float       d_sum       = 0.0f;
 #pragma unroll
         for (uint32_t j = 0; j < CTA_K; j++) {
-            const float p = math::ptx_exp2(fmaf(s_f32[j], sm_scale, neg_row_max));
-            s_f32[j]      = p;
+            const float p = math::ptx_exp2(fmaf(RS_f32[j], sm_scale, neg_row_max));
+            RS_f32[j]     = p;
             d_sum += p;
         }
         denom += d_sum;
 
         // ---- P re-quant: pack e4m3 in LINEAR row order (word c = K elems
         //      4c..4c+3, byte b = elem 4c+b) - the TS A-operand TMEM layout ----
-        uint32_t p_u32[CTA_K / 4];
+        uint32_t RP_u32[CTA_K / 4];
 #pragma unroll
         for (uint32_t w = 0; w < CTA_K / 4; w++) {
-            floatx4_to_e4m3x4(&p_u32[w], &s_f32[4 * w], &s_f32[4 * w + 2]);
+            floatx4_to_e4m3x4(&RP_u32[w], &RS_f32[4 * w], &RS_f32[4 * w + 2]);
         }
 
-        // ---- O correction: O *= alpha (skip on first tile: O uninitialized;
+        // ---- O correction: O *= o_scale (skip on first tile: O uninitialized;
         //      `iter > 0` is uniform across the CTA) ----
         if (iter > 0) {
 #pragma unroll
-            for (uint32_t c = 0; c < num_chunks_o; c++) {
-                uint32_t o_u32[32];
-                tcgen05::tmem_ld_32x32b_x32(o_u32, tmem_row_base + TMEM_COL_O + c * 32);
+            for (uint32_t c = 0; c < num_tiles_o; c++) {
+                uint32_t RO_u32[32];
+                tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_row_base + TMEM_COL_O + c * 32);
                 tcgen05::tmem_ld_wait();
 #pragma unroll
                 for (uint32_t jj = 0; jj < 32; jj++) {
-                    o_u32[jj] = __float_as_uint(__uint_as_float(o_u32[jj]) * alpha);
+                    RO_u32[jj] = __float_as_uint(__uint_as_float(RO_u32[jj]) * o_scale);
                 }
-                tcgen05::tmem_st_32x32b_x32(tmem_row_base + TMEM_COL_O + c * 32, o_u32);
+                tcgen05::tmem_st_32x32b_x32(tmem_row_base + TMEM_COL_O + c * 32, RO_u32);
             }
             tcgen05::tmem_st_wait();
         }
@@ -450,17 +450,17 @@ __global__ void __launch_bounds__(NUM_THREADS)
         // ---- feed P to the PV MMA ----
         if constexpr (!PV_FROM_SMEM) {
             // TS path: store P into TMEM (32 cols, one warp-collective st)
-            tcgen05::tmem_st_32x32b_x32(tmem_row_base + TMEM_COL_P, p_u32);
+            tcgen05::tmem_st_32x32b_x32(tmem_row_base + TMEM_COL_P, RP_u32);
             tcgen05::tmem_st_wait();
         }
         else {
             // SS twin (on-device oracle for the TS TMEM layout, risk R1): stage P
             // through smem in the same 128B-swizzled K-major layout TMA produces
             // for sK/sV: word w of row r lands at word ((w/4 ^ r%8)*4 + w%4).
-            uint32_t* sP_row = reinterpret_cast<uint32_t*>(sP + row * CTA_K);
+            uint32_t* sP_row = reinterpret_cast<uint32_t*>(sP + row_id * CTA_K);
 #pragma unroll
             for (uint32_t w = 0; w < CTA_K / 4; w++) {
-                sP_row[(((w >> 2) ^ (row & 7)) << 2) | (w & 3)] = p_u32[w];
+                sP_row[(((w >> 2) ^ (row_id & 7)) << 2) | (w & 3)] = RP_u32[w];
             }
         }
 
@@ -475,7 +475,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
         if (warp_idx == 0 && tcgen05::elect_one()) {
 #pragma unroll
-            for (uint32_t v_it = 0; v_it < num_k_steps_pv; v_it++) {
+            for (uint32_t v_it = 0; v_it < num_tiles_pv_inner; v_it++) {
                 const uint64_t desc_v =
                     tcgen05::make_smem_desc_sm100<V_SWIZZLE, tcgen05::kKMajorLBO, V_SBO>(&sV[v_it * 32]);
                 // enable_D = 0 only on (first KV tile, first K step): O zero-init
@@ -515,39 +515,39 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // Epilogue: O = O * v_scale / denom, cvt to fp16/bf16, direct global stores
     // (thread = row; MVP keeps the sm90-style register->global epilogue).
     // -------------------------------------------------------------------------
-    const float d_rcp     = math::ptx_rcp(denom);
-    const bool  row_valid = q_idx < qo_len;
-    DTypeOut*   O_row_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
-                          + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
-    const float* V_scale_ptr = fuse_v_scale ?
-                                   V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
-                                       + static_cast<int64_t>(kv_head_id) * head_dim :
-                                   nullptr;
+    const float d_rcp      = math::ptx_rcp(denom);
+    const bool  row_valid  = q_idx < qo_len;
+    DTypeOut*   O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
+                           + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
+    const float* V_scale_base_ptr =
+        fuse_v_scale ? V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
+                           + static_cast<int64_t>(kv_head_id) * head_dim :
+                       nullptr;
 
 #pragma unroll
-    for (uint32_t c = 0; c < num_chunks_o; c++) {
-        uint32_t o_u32[32];
-        tcgen05::tmem_ld_32x32b_x32(o_u32, tmem_row_base + TMEM_COL_O + c * 32);
+    for (uint32_t c = 0; c < num_tiles_o; c++) {
+        uint32_t RO_u32[32];
+        tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_row_base + TMEM_COL_O + c * 32);
         tcgen05::tmem_ld_wait();
 
-        float o_f32[32];
+        float RO_f32[32];
 #pragma unroll
         for (uint32_t jj = 0; jj < 32; jj++) {
-            o_f32[jj] = __uint_as_float(o_u32[jj]) * d_rcp;
+            RO_f32[jj] = __uint_as_float(RO_u32[jj]) * d_rcp;
             if constexpr (fuse_v_scale) {
-                o_f32[jj] *= __ldg(V_scale_ptr + c * 32 + jj);  // per-channel v_scale
+                RO_f32[jj] *= __ldg(V_scale_base_ptr + c * 32 + jj);  // per-channel v_scale
             }
         }
 
         if (row_valid) {
 #pragma unroll
             for (uint32_t jj = 0; jj < 16; jj++) {
-                const float2 o2 = make_float2(o_f32[2 * jj], o_f32[2 * jj + 1]);
+                const float2 o2 = make_float2(RO_f32[2 * jj], RO_f32[2 * jj + 1]);
                 if constexpr (std::is_same<DTypeOut, half>::value) {
-                    ((half2*)(O_row_ptr + c * 32 + 2 * jj))[0] = __float22half2_rn(o2);
+                    ((half2*)(O_lane_ptr + c * 32 + 2 * jj))[0] = __float22half2_rn(o2);
                 }
                 else {
-                    ((nv_bfloat162*)(O_row_ptr + c * 32 + 2 * jj))[0] = __float22bfloat162_rn(o2);
+                    ((nv_bfloat162*)(O_lane_ptr + c * 32 + 2 * jj))[0] = __float22bfloat162_rn(o2);
                 }
             }
         }
@@ -612,13 +612,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                                                           return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_FP8(qkv);
 
-    auto output_type = output.scalar_type();
+    auto out_dtype = output.scalar_type();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_type, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q       = 128;
                         constexpr int CTA_K       = 128;
                         constexpr int NUM_THREADS = 128;
@@ -747,13 +747,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                           return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_FP8(qkv);
 
-    auto output_dtype = output.scalar_type();
+    auto out_dtype = output.scalar_type();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q       = 128;
                         constexpr int CTA_K       = 128;
                         constexpr int NUM_THREADS = 128;

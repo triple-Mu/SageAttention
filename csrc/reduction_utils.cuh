@@ -40,19 +40,19 @@ template<typename T>
 __device__ __forceinline__ T blockReduceSum(T val)
 {
     static __shared__ T smem_partial[32];
-    int                 lane = threadIdx.x & 0x1f;
-    int                 wid  = threadIdx.x >> 5;
+    int                 lane_id = threadIdx.x & 0x1f;
+    int                 warp_id = threadIdx.x >> 5;
 
     val = warpReduceSum<T>(val);
 
-    if (lane == 0)
-        smem_partial[wid] = val;
+    if (lane_id == 0)
+        smem_partial[warp_id] = val;
 
     __syncthreads();
 
     // Modify from blockDim.x << 5 to blockDim.x / 32. to prevent
     // blockDim.x is not divided by 32
-    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane] : (T)(0.0f);
+    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane_id] : (T)(0.0f);
     val = warpReduceSum<T>(val);
     return val;
 }
@@ -70,15 +70,15 @@ template<typename T>
 __device__ __forceinline__ T blockReduceMax(T val)
 {
     static __shared__ T smem_partial[32];
-    int                 lane = threadIdx.x & 0x1f;  // in-warp idx
-    int                 wid  = threadIdx.x >> 5;    // warp idx
-    val                      = warpReduceMax(val);  // get maxx in each warp
-    if (lane == 0)                                  // record in-warp maxx by warp Idx
-        smem_partial[wid] = val;
+    int                 lane_id = threadIdx.x & 0x1f;  // in-warp idx
+    int                 warp_id = threadIdx.x >> 5;    // warp idx
+    val                         = warpReduceMax(val);  // get maxx in each warp
+    if (lane_id == 0)                                  // record in-warp maxx by warp Idx
+        smem_partial[warp_id] = val;
     __syncthreads();
     // Modify from blockDim.x << 5 to blockDim.x / 32. to prevent
     // blockDim.x is not divided by 32
-    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane] : -1e20f;
+    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane_id] : -1e20f;
     val = warpReduceMax(val);
     return val;
 }
@@ -96,15 +96,15 @@ template<typename T>
 __device__ __forceinline__ T blockReduceMin(T val)
 {
     static __shared__ T smem_partial[32];
-    int                 lane = threadIdx.x & 0x1f;  // in-warp idx
-    int                 wid  = threadIdx.x >> 5;    // warp idx
-    val                      = warpReduceMin(val);  // get minx in each warp
-    if (lane == 0)                                  // record in-warp minx by warp Idx
-        smem_partial[wid] = val;
+    int                 lane_id = threadIdx.x & 0x1f;  // in-warp idx
+    int                 warp_id = threadIdx.x >> 5;    // warp idx
+    val                         = warpReduceMin(val);  // get minx in each warp
+    if (lane_id == 0)                                  // record in-warp minx by warp Idx
+        smem_partial[warp_id] = val;
     __syncthreads();
     // Modify from blockDim.x << 5 to blockDim.x / 32. to prevent
     // blockDim.x is not divided by 32
-    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane] : 1e20f;
+    val = (threadIdx.x < (blockDim.x / 32.f)) ? smem_partial[lane_id] : 1e20f;
     val = warpReduceMin(val);
     return val;
 }

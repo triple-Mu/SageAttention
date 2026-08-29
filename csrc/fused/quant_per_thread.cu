@@ -77,8 +77,9 @@ struct PerThreadVec {
 constexpr uint32_t kQuantCacheBytes = 128;
 constexpr uint32_t kQuantCacheRows  = 16;
 
-// Query: warp tld of a WARP_BLOCK-token slab owns rows {slab*WARP_BLOCK + r*8 + tld},
-// r in [0, WARP_BLOCK/8); one scale over all of them, stored at [slab*8 + tld].
+// Query: warp warp_id of a WARP_TOKENS-token warp tile owns the rows
+// {tile*WARP_TOKENS + r*8 + warp_id}, r in [0, WARP_TOKENS/8); one scale over
+// all of them, stored at [tile*8 + warp_id].
 template<uint32_t head_dim, uint32_t WARP_TOKENS, typename T>
 __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
                                           int8_t* __restrict__ output,
@@ -103,30 +104,30 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
     // indices; unrolling the reload form as well just inflates the live ranges
     constexpr uint32_t kUnroll = kCache ? rows_per_group : 4;
 
-    const uint32_t slab_id         = blockIdx.x;
-    const uint32_t head_id         = blockIdx.y;
-    const uint32_t batch_id        = blockIdx.z;
-    const uint32_t tld             = threadIdx.y;
-    const uint32_t lane_id         = threadIdx.x;
-    const uint32_t col             = lane_id * pack_size;
-    const uint32_t slab_base_token = slab_id * WARP_TOKENS;
+    const uint32_t warp_tile_id         = blockIdx.x;
+    const uint32_t head_id              = blockIdx.y;
+    const uint32_t batch_id             = blockIdx.z;
+    const uint32_t warp_id              = threadIdx.y;
+    const uint32_t lane_id              = threadIdx.x;
+    const uint32_t col                  = lane_id * pack_size;
+    const uint32_t warp_tile_base_token = warp_tile_id * WARP_TOKENS;
 
-    // The slab base is the only offset that can reach the n*h*hd range, so it is
-    // computed in 64-bit once; the in-slab row offsets stay 32-bit.
-    const T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
-                              + static_cast<int64_t>(head_id) * stride_h_input
-                              + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
-    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
-                              + static_cast<int64_t>(head_id) * stride_h_output
-                              + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
+    // The warp-tile base is the only offset that can reach the n*h*hd range, so
+    // it is computed in 64-bit once; the in-tile row offsets stay 32-bit.
+    const T* input_ptr_base =
+        input + static_cast<int64_t>(batch_id) * stride_batch_input + static_cast<int64_t>(head_id) * stride_h_input
+        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_input + static_cast<int64_t>(col);
+    int8_t* output_ptr_base =
+        output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
+        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t x_cache[kCache ? rows_per_group : 1];
 
     float amax = 0.0f;
 #pragma unroll kUnroll
     for (uint32_t r = 0; r < rows_per_group; r++) {
-        const uint32_t local = r * 8 + tld;
-        const uint32_t token = slab_base_token + local;
+        const uint32_t local = r * 8 + warp_id;
+        const uint32_t token = warp_tile_base_token + local;
         if (token < num_tokens) {
             pack_t x_val;
             x_val.load_ro(input_ptr_base + local * stride_seq_input);
@@ -145,8 +146,8 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 
 #pragma unroll kUnroll
     for (uint32_t r = 0; r < rows_per_group; r++) {
-        const uint32_t local = r * 8 + tld;
-        const uint32_t token = slab_base_token + local;
+        const uint32_t local = r * 8 + warp_id;
+        const uint32_t token = warp_tile_base_token + local;
         if (token < num_tokens) {
             pack_t x_val;
             if constexpr (kCache) {
@@ -166,15 +167,15 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 
     if (lane_id == 0) {
         scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
-              + slab_id * 8 + tld] = group_scale;
+              + warp_tile_id * 8 + warp_id] = group_scale;
     }
 }
 
-// Key: warp tld of a WARP_BLOCK-token slab owns row pairs
-// {slab*WARP_BLOCK + r*8 + 2*tld, +1}, r in [0, WARP_BLOCK/8); one scale over
-// all of them, stored at [slab*4 + tld]. Optionally fuses the k - km
-// smoothing subtraction (done in the input dtype, matching the torch sub the
-// Triton path performs beforehand).
+// Key: warp warp_id of a WARP_TOKENS-token warp tile owns the row pairs
+// {tile*WARP_TOKENS + r*8 + 2*warp_id, +1}, r in [0, WARP_TOKENS/8); one scale
+// over all of them, stored at [tile*4 + warp_id]. Optionally fuses the
+// key - key_mean smoothing subtraction (done in the input dtype, matching the
+// torch sub the Triton path performs beforehand).
 template<uint32_t head_dim, uint32_t WARP_TOKENS, bool sub_mean, typename T>
 __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
                                           T* __restrict__ mean,
@@ -203,22 +204,22 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     // indices; unrolling the reload form as well just inflates the live ranges
     constexpr uint32_t kUnroll = kCache ? pairs_per_group : 4;
 
-    const uint32_t slab_id         = blockIdx.x;
-    const uint32_t head_id         = blockIdx.y;
-    const uint32_t batch_id        = blockIdx.z;
-    const uint32_t tld             = threadIdx.y;
-    const uint32_t lane_id         = threadIdx.x;
-    const uint32_t col             = lane_id * pack_size;
-    const uint32_t slab_base_token = slab_id * WARP_TOKENS;
+    const uint32_t warp_tile_id         = blockIdx.x;
+    const uint32_t head_id              = blockIdx.y;
+    const uint32_t batch_id             = blockIdx.z;
+    const uint32_t warp_id              = threadIdx.y;
+    const uint32_t lane_id              = threadIdx.x;
+    const uint32_t col                  = lane_id * pack_size;
+    const uint32_t warp_tile_base_token = warp_tile_id * WARP_TOKENS;
 
-    // The slab base is the only offset that can reach the n*h*hd range, so it is
-    // computed in 64-bit once; the in-slab row offsets stay 32-bit.
-    const T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
-                              + static_cast<int64_t>(head_id) * stride_h_input
-                              + static_cast<int64_t>(slab_base_token) * stride_seq_input + static_cast<int64_t>(col);
-    int8_t* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
-                              + static_cast<int64_t>(head_id) * stride_h_output
-                              + static_cast<int64_t>(slab_base_token) * stride_seq_output + static_cast<int64_t>(col);
+    // The warp-tile base is the only offset that can reach the n*h*hd range, so
+    // it is computed in 64-bit once; the in-tile row offsets stay 32-bit.
+    const T* input_ptr_base =
+        input + static_cast<int64_t>(batch_id) * stride_batch_input + static_cast<int64_t>(head_id) * stride_h_input
+        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_input + static_cast<int64_t>(col);
+    int8_t* output_ptr_base =
+        output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
+        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t mean_val;
     if constexpr (sub_mean) {
@@ -247,8 +248,8 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     for (uint32_t r = 0; r < pairs_per_group; r++) {
 #pragma unroll
         for (uint32_t p = 0; p < 2; p++) {
-            const uint32_t local = r * 8 + tld * 2 + p;
-            const uint32_t token = slab_base_token + local;
+            const uint32_t local = r * 8 + warp_id * 2 + p;
+            const uint32_t token = warp_tile_base_token + local;
             if (token < num_tokens) {
                 pack_t x_val = load_row(local);
                 if constexpr (kCache) {
@@ -269,8 +270,8 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     for (uint32_t r = 0; r < pairs_per_group; r++) {
 #pragma unroll
         for (uint32_t p = 0; p < 2; p++) {
-            const uint32_t local = r * 8 + tld * 2 + p;
-            const uint32_t token = slab_base_token + local;
+            const uint32_t local = r * 8 + warp_id * 2 + p;
+            const uint32_t token = warp_tile_base_token + local;
             if (token < num_tokens) {
                 pack_t x_val;
                 if constexpr (kCache) {
@@ -291,7 +292,7 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
 
     if (lane_id == 0) {
         scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
-              + slab_id * 4 + tld] = group_scale;
+              + warp_tile_id * 4 + warp_id] = group_scale;
     }
 }
 
@@ -306,34 +307,34 @@ void quant_per_thread_int8_q_cuda(torch::Tensor input,
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout l = check_quant_layout(input, output, scale, tensor_layout);
+    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
-    const int num_slabs =
-        static_cast<int>(at::ceil_div<int64_t>(l.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, l.batch_size, l.num_heads, num_slabs * 8);
+    const int num_warp_tiles =
+        static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
+    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 8);
 
     auto input_dtype = input.scalar_type();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
+        DISPATCH_HEAD_DIM(layout.head_dim, HEAD_DIM, {
             DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_TOKENS, {
-                dim3 grid(num_slabs, l.num_heads, l.batch_size);
+                dim3 grid(num_warp_tiles, layout.num_heads, layout.batch_size);
                 dim3 block(32, 8);
                 QuantPerThreadQInt8Kernel<HEAD_DIM, WARP_TOKENS, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
-                                                 l.num_tokens,
-                                                 l.stride_batch_input,
-                                                 l.stride_seq_input,
-                                                 l.stride_h_input,
-                                                 l.stride_batch_output,
-                                                 l.stride_seq_output,
-                                                 l.stride_h_output,
+                                                 layout.num_tokens,
+                                                 layout.stride_batch_input,
+                                                 layout.stride_seq_input,
+                                                 layout.stride_h_input,
+                                                 layout.stride_batch_output,
+                                                 layout.stride_seq_output,
+                                                 layout.stride_h_output,
                                                  scale.stride(0),
                                                  scale.stride(1));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -351,37 +352,37 @@ void quant_per_thread_int8_k_cuda(torch::Tensor input,
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout l = check_quant_layout(input, output, scale, tensor_layout);
+    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
-    const int num_slabs =
-        static_cast<int>(at::ceil_div<int64_t>(l.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, l.batch_size, l.num_heads, num_slabs * 4);
+    const int num_warp_tiles =
+        static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
+    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
 
     auto input_dtype = input.scalar_type();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
+        DISPATCH_HEAD_DIM(layout.head_dim, HEAD_DIM, {
             DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
-                dim3 grid(num_slabs, l.num_heads, l.batch_size);
+                dim3 grid(num_warp_tiles, layout.num_heads, layout.batch_size);
                 dim3 block(32, 4);
                 QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, false, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  nullptr,
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
-                                                 l.num_tokens,
-                                                 l.stride_batch_input,
-                                                 l.stride_seq_input,
-                                                 l.stride_h_input,
+                                                 layout.num_tokens,
+                                                 layout.stride_batch_input,
+                                                 layout.stride_seq_input,
+                                                 layout.stride_h_input,
                                                  0,
                                                  0,
-                                                 l.stride_batch_output,
-                                                 l.stride_seq_output,
-                                                 l.stride_h_output,
+                                                 layout.stride_batch_output,
+                                                 layout.stride_seq_output,
+                                                 layout.stride_h_output,
                                                  scale.stride(0),
                                                  scale.stride(1));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -400,43 +401,43 @@ void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor input,
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout l = check_quant_layout(input, output, scale, tensor_layout);
+    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
     CHECK_CUDA(mean);
     CHECK_LASTDIM_CONTIGUOUS(mean);
     CHECK_DIMS(mean, 3);
-    CHECK_SHAPE(mean, l.batch_size, l.num_heads, l.head_dim);
+    CHECK_SHAPE(mean, layout.batch_size, layout.num_heads, layout.head_dim);
     TORCH_CHECK(input.scalar_type() == mean.scalar_type(), "Input and mean must have the same data type");
 
-    const int num_slabs =
-        static_cast<int>(at::ceil_div<int64_t>(l.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, l.batch_size, l.num_heads, num_slabs * 4);
+    const int num_warp_tiles =
+        static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
+    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
 
     auto input_dtype = input.scalar_type();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_HEAD_DIM(l.head_dim, HEAD_DIM, {
+        DISPATCH_HEAD_DIM(layout.head_dim, HEAD_DIM, {
             DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
-                dim3 grid(num_slabs, l.num_heads, l.batch_size);
+                dim3 grid(num_warp_tiles, layout.num_heads, layout.batch_size);
                 dim3 block(32, 4);
                 QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, true, c_type>
                     <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
-                                                 l.num_tokens,
-                                                 l.stride_batch_input,
-                                                 l.stride_seq_input,
-                                                 l.stride_h_input,
+                                                 layout.num_tokens,
+                                                 layout.stride_batch_input,
+                                                 layout.stride_seq_input,
+                                                 layout.stride_h_input,
                                                  mean.stride(0),
                                                  mean.stride(1),
-                                                 l.stride_batch_output,
-                                                 l.stride_seq_output,
-                                                 l.stride_h_output,
+                                                 layout.stride_batch_output,
+                                                 layout.stride_seq_output,
+                                                 layout.stride_h_output,
                                                  scale.stride(0),
                                                  scale.stride(1));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();

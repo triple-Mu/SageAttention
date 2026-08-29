@@ -31,20 +31,6 @@
 
 namespace sage {
 
-// Block-level base offset in one 64-bit expression. __host__ __device__ so a
-// host-side unit test can sweep the 2^32 boundary without touching a GPU.
-__host__ __device__ __forceinline__ int64_t gmem_base_offset(uint32_t batch_id,
-                                                             int64_t  stride_batch,
-                                                             uint32_t head_id,
-                                                             int64_t  stride_h,
-                                                             uint32_t seq_idx,
-                                                             uint32_t stride_seq,
-                                                             uint32_t lane_off)
-{
-    return static_cast<int64_t>(batch_id) * stride_batch + static_cast<int64_t>(head_id) * stride_h
-           + static_cast<int64_t>(seq_idx) * stride_seq + static_cast<int64_t>(lane_off);
-}
-
 template<int BYTES>
 struct vec_storage;
 template<>
@@ -89,10 +75,6 @@ struct alignas(pack_size * sizeof(T)) vec_t {
     // no well-typed spelling), and doing so perturbed MeanScaleKernel's SASS
     // (same instruction count and registers, different NOP/SHF/LOP3 mix) for no
     // aliasing gain.
-    __device__ __forceinline__ void load(const T* p)
-    {
-        *reinterpret_cast<storage_t*>(data) = *reinterpret_cast<const storage_t*>(p);
-    }
     // Read-only path (ld.global.nc): the quant kernels take non-const
     // T* __restrict__ inputs, so nvcc cannot prove read-only on its own.
     __device__ __forceinline__ void load_ro(const T* p)

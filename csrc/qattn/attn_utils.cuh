@@ -889,7 +889,7 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<
     // (get_lane_id_2d() / 8) % 2;
     uint32_t smem_V_col_base = (get_lane_id_2d() / 8) % 2;
 
-    uint32_t RO_int32[num_tiles_q][num_tiles_v][4];
+    uint32_t RO_i32[num_tiles_q][num_tiles_v][4];
 
 #pragma unroll
     for (uint32_t fk = 0; fk < 1; fk++) {
@@ -905,7 +905,7 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<
                 if constexpr (std::is_same<DTypeSVAccum, float>::value) {
                     // mma::mma_sync_m16n16k32_row_col_f8f8f32<mma::MMAMode::kInit>(RO_inst_buf[fq][fv], RS_f8[fq][fk],
                     // RV);
-                    mma::mma_sync_m16n16k32_row_col_f8f8f16<mma::MMAMode::kInit>(RO_int32[fq][fv], RS_f8[fq][fk], RV);
+                    mma::mma_sync_m16n16k32_row_col_f8f8f16<mma::MMAMode::kInit>(RO_i32[fq][fv], RS_f8[fq][fk], RV);
                 }
                 else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
                     // ! Not Implemented
@@ -930,7 +930,7 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<
                     // mma::mma_sync_m16n16k32_row_col_f8f8f32<mma::MMAMode::kInplaceUpdate>(RO_inst_buf[fq][fv],
                     // RS_f8[fq][fk], RV);
                     mma::mma_sync_m16n16k32_row_col_f8f8f16<mma::MMAMode::kInplaceUpdate>(
-                        RO_int32[fq][fv], RS_f8[fq][fk], RV);
+                        RO_i32[fq][fv], RS_f8[fq][fk], RV);
                 }
                 else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
                     // ! Not Implemented
@@ -939,16 +939,16 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<
             offset_V = smem_V.advance_offset_by_row<16>(offset_V);
         }
     }
-    float RO_tmp_float[2];
+    float RO_tmp_f32[2];
 #pragma unroll
-    for (int i = 0; i < num_tiles_q; i++) {
+    for (int fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-        for (int j = 0; j < num_tiles_v; j++) {
+        for (int fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
             for (int e = 0; e < 4; e++) {
-                unpack_half2_from_uint32_to_float(RO_tmp_float, RO_int32[i][j][e]);
-                RO[i][j][e * 2 + 0] += RO_tmp_float[0];
-                RO[i][j][e * 2 + 1] += RO_tmp_float[1];
+                unpack_half2_from_uint32_to_float(RO_tmp_f32, RO_i32[fq][fv][e]);
+                RO[fq][fv][e * 2 + 0] += RO_tmp_f32[0];
+                RO[fq][fv][e * 2 + 1] += RO_tmp_f32[1];
             }
         }
     }

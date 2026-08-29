@@ -44,20 +44,30 @@ template<int                         BlockMajorSize,
          bool                        swizzle        = true,
          CUtensorMapL2promotion_enum promotion_mode = CU_TENSOR_MAP_L2_PROMOTION_NONE,
          typename T>
-CUtensorMap create_tensor_map_4D(
-    T* gmem_ptr, int64_t d1, int64_t d2, int64_t d3, int64_t d4, int64_t stride1, int64_t stride2, int64_t stride3)
+CUtensorMap create_tensor_map_4D(T*      gmem_ptr,
+                                 int64_t dim_batch,
+                                 int64_t dim_head,
+                                 int64_t dim_major,
+                                 int64_t dim_minor,
+                                 int64_t stride_batch,
+                                 int64_t stride_head,
+                                 int64_t stride_major)
 {
     constexpr int smem_stride = BlockMinorSize * sizeof(T);
     static_assert(sizeof(T) == 2 || sizeof(T) == 1);
     static_assert(smem_stride == 32 || smem_stride == 64 || smem_stride == 128);
 
     CUtensorMap tma_map;
-    void*       gmem_address        = (void*)gmem_ptr;
-    uint64_t    gmem_prob_shape[5]  = {(uint64_t)d4, (uint64_t)d3, (uint64_t)d2, (uint64_t)d1, 1};
-    uint64_t    gmem_prob_stride[5] = {
-           (uint64_t)stride3 * sizeof(T), (uint64_t)stride2 * sizeof(T), (uint64_t)stride1 * sizeof(T), 0, 0};
-    uint32_t smem_box_shape[5]  = {uint32_t(BlockMinorSize), uint32_t(BlockMajorSize), 1, 1, 1};
-    uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+    void*       gmem_address       = (void*)gmem_ptr;
+    uint64_t    gmem_prob_shape[5] = {
+           (uint64_t)dim_minor, (uint64_t)dim_major, (uint64_t)dim_head, (uint64_t)dim_batch, 1};
+    uint64_t gmem_prob_stride[5] = {(uint64_t)stride_major * sizeof(T),
+                                    (uint64_t)stride_head * sizeof(T),
+                                    (uint64_t)stride_batch * sizeof(T),
+                                    0,
+                                    0};
+    uint32_t smem_box_shape[5]   = {uint32_t(BlockMinorSize), uint32_t(BlockMajorSize), 1, 1, 1};
+    uint32_t smem_box_stride[5]  = {1, 1, 1, 1, 1};
 
     // Pre-validate the driver's documented limits so an oversized tensor
     // fails with the actual number instead of a bare CUDA_ERROR_INVALID_VALUE.
@@ -122,19 +132,18 @@ __device__ __forceinline__ void expect_bytes(uint64_t* bar)
 
 template<typename T>
 __device__ __forceinline__ void
-load_async_4D(T* dst, void const* const src_tma_map, uint64_t* bar, int s0, int s1, int s2, int s3)
+load_async_4D(T* dst, void const* const src_tma_map, uint64_t* bar, int coord0, int coord1, int coord2, int coord3)
 {
-    const int32_t coords[4] = {s0, s1, s2, s3};
+    const int32_t coords[4] = {coord0, coord1, coord2, coord3};
     cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_cluster, cuda::ptx::space_global, dst, src_tma_map, coords, bar);
 }
 
 // reserved: currently unused, planned for the sm90 TMA-store epilogue (perf
 // batch C item H6) — do not remove as dead code.
 template<typename T>
-__device__ __forceinline__ void
-store_async_4D(void const* dst_tma_map, T* src, int global_token_idx, int global_head_idx, int global_batch_idx)
+__device__ __forceinline__ void store_async_4D(void const* dst_tma_map, T* src, int coord1, int coord2, int coord3)
 {
-    const int32_t coords[4] = {0, global_token_idx, global_head_idx, global_batch_idx};
+    const int32_t coords[4] = {0, coord1, coord2, coord3};
     cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_global, cuda::ptx::space_shared, dst_tma_map, coords, src);
 }
 

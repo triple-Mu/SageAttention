@@ -53,14 +53,14 @@ torch::Tensor qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89(torch::Tensor       
         query, key, value, output, query_scale, key_scale, &value_scale, value_mean_opt, tensor_layout, return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_FP8(qkv);
 
-    auto         output_dtype = output.scalar_type();
-    cudaStream_t stream       = at::cuda::getCurrentCUDAStream();
+    auto         out_dtype = output.scalar_type();
+    cudaStream_t stream    = at::cuda::getCurrentCUDAStream();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q  = 128;
                         constexpr int CTA_K  = 64;
                         constexpr int WARP_Q = 32;

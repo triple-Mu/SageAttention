@@ -182,15 +182,15 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     const uint32_t num_iterations =
         div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
 
-    int p = 1;
+    int phase = 1;
     for (uint32_t iter = 1; iter < num_iterations; iter++) {
-        p ^= 1;
+        phase ^= 1;
 
         float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (iter - 1) * k_scale_advance_offset];
         sm_scale            = original_sm_scale * dequant_scale;
 
         // wait for K
-        wait(&barrier_K, p);
+        wait(&barrier_K, phase);
 
         // compute QK^T
         wgmma::warpgroup_arrive();
@@ -241,16 +241,16 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         RS_f32_to_f8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
         // wait for V
-        wait(&barrier_V, p);
+        wait(&barrier_V, phase);
 
-        float RO_temp[num_tiles_q][num_tiles_v][8];
+        float RO_tmp[num_tiles_q][num_tiles_v][8];
         wgmma::warpgroup_arrive();
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-            wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_temp[fq], RS_f8[fq][0], &sV[0]);
+            wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_tmp[fq], RS_f8[fq][0], &sV[0]);
 #pragma unroll
             for (uint32_t v_it = 1; v_it < num_tiles_pv_inner; v_it++) {
-                wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_temp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
+                wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_tmp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
             }
         }
 
@@ -263,7 +263,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
             for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
                 for (uint32_t e = 0; e < 8; e++) {
-                    RO[fq][fv][e] += RO_temp[fq][fv][e];
+                    RO[fq][fv][e] += RO_tmp[fq][fv][e];
                 }
             }
         }
@@ -276,13 +276,13 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     }
 
     {
-        p ^= 1;
+        phase ^= 1;
 
         float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (num_iterations - 1) * k_scale_advance_offset];
         sm_scale            = original_sm_scale;
 
         // wait for K
-        wait(&barrier_K, p);
+        wait(&barrier_K, phase);
 
         // compute QK^T
         wgmma::warpgroup_arrive();
@@ -354,16 +354,16 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         RS_f32_to_f8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
         // wait for V
-        wait(&barrier_V, p);
+        wait(&barrier_V, phase);
 
-        float RO_temp[num_tiles_q][num_tiles_v][8];
+        float RO_tmp[num_tiles_q][num_tiles_v][8];
         wgmma::warpgroup_arrive();
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-            wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_temp[fq], RS_f8[fq][0], &sV[0]);
+            wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_tmp[fq], RS_f8[fq][0], &sV[0]);
 #pragma unroll
             for (uint32_t v_it = 1; v_it < num_tiles_pv_inner; v_it++) {
-                wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_temp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
+                wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_tmp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
             }
         }
 
@@ -376,7 +376,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
             for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
                 for (uint32_t e = 0; e < 8; e++) {
-                    RO[fq][fv][e] += RO_temp[fq][fv][e];
+                    RO[fq][fv][e] += RO_tmp[fq][fv][e];
                 }
             }
         }
@@ -489,13 +489,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                                                           return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_FP8(qkv);
 
-    auto output_type = output.scalar_type();
+    auto out_dtype = output.scalar_type();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_type, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q       = 64;
                         constexpr int CTA_K       = 128;
                         constexpr int NUM_THREADS = 128;
@@ -625,13 +625,13 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                                           return_lse);
     SAGEATTN_QKV_LAYOUT_LOCALS_FP8(qkv);
 
-    auto output_dtype = output.scalar_type();
+    auto out_dtype = output.scalar_type();
 
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
             DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
                 DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+                    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(out_dtype, DTypeOut, {
                         constexpr int CTA_Q       = 64;
                         constexpr int CTA_K       = 128;
                         constexpr int NUM_THREADS = 128;

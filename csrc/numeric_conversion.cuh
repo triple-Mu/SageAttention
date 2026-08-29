@@ -36,11 +36,11 @@
 #define RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
-__device__ __forceinline__ void unpack_half2_from_uint32_to_float(float* dest, uint32_t source)
+__device__ __forceinline__ void unpack_half2_from_uint32_to_float(float* dst, uint32_t src)
 {
-    const half2 h2 = *reinterpret_cast<const half2*>(&source);
-    dest[0]        = __low2float(h2);
-    dest[1]        = __high2float(h2);
+    const half2 h2 = *reinterpret_cast<const half2*>(&src);
+    dst[0]         = __low2float(h2);
+    dst[1]         = __high2float(h2);
 }
 
 // Hand-written rather than two __nv_cvt_float2_to_fp8x2 calls: the official
@@ -49,7 +49,7 @@ __device__ __forceinline__ void unpack_half2_from_uint32_to_float(float* dest, u
 // loops). The inline mov.b32 %0, {lo, hi} below is free. cuda_fp8.h would
 // also fall back to a software emulation below sm_89, which FP8_CAST_ENABLED
 // deliberately does not.
-__device__ __forceinline__ void floatx4_to_e4m3x4(uint32_t* dest, float* source0, float* source1)
+__device__ __forceinline__ void floatx4_to_e4m3x4(uint32_t* dst, float* src0, float* src1)
 {
 #ifdef FP8_CAST_ENABLED
     asm volatile("{\n"
@@ -59,8 +59,8 @@ __device__ __forceinline__ void floatx4_to_e4m3x4(uint32_t* dest, float* source0
                  "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
                  "mov.b32 %0, {lo, hi};\n"
                  "}"
-                 : "=r"(dest[0])
-                 : "f"(source0[0]), "f"(source0[1]), "f"(source1[0]), "f"(source1[1]));
+                 : "=r"(dst[0])
+                 : "f"(src0[0]), "f"(src0[1]), "f"(src1[0]), "f"(src1[1]));
 #else
     RUNTIME_ASSERT("Unsupported CUDA architecture for FP8 CAST instruction");
 #endif
