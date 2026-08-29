@@ -208,7 +208,8 @@ Plan resolve(CC                       cc,
              std::optional<Backend>   req_backend,
              std::optional<QuantGran> req_gran,
              std::optional<PVAccum>   req_pv,
-             std::optional<bool>      req_smooth_v)
+             std::optional<bool>      req_smooth_v,
+             bool                     varlen)
 {
     Plan plan{};
 
@@ -273,6 +274,13 @@ Plan resolve(CC                       cc,
         plan.error = not_compiled_msg(plan.backend, cc);
         return plan;
     }
+    if (varlen && plan.backend == Backend::kSm100F8) {
+        // The tcgen05 kernels address K/V through tensor maps built per batch
+        // entry; the packed layout needs a different one and has not been
+        // written yet. Erroring beats silently reading across sequences.
+        plan.error = "varlen is not supported by the sm100 backend";
+        return plan;
+    }
 
     // ---- 2. defaults ----
     plan.gran     = req_gran ? *req_gran : (forced_fallback ? QuantGran::kPerWarp : default_gran(plan.backend));
@@ -294,7 +302,10 @@ Plan resolve(CC                       cc,
         plan.error = pv_msg(plan.backend, plan.pv);
         return plan;
     }
-    if (plan.smooth_v && !smooth_v_supported(plan.backend, plan.pv)) {
+    // varlen downgrades smooth_v unconditionally: no v_mean kernel takes
+    // cu_seqlens yet, and a per-sequence V mean is not the same tensor as the
+    // whole-batch one the dense kernels fuse.
+    if (plan.smooth_v && (varlen || !smooth_v_supported(plan.backend, plan.pv))) {
         plan.smooth_v         = false;
         plan.smooth_v_ignored = true;  // Python warns once per config
     }

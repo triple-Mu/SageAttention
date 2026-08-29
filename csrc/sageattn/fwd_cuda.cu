@@ -122,6 +122,15 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
     TORCH_CHECK(plan.need_value_mean == value_mean.has_value(),
                 plan.need_value_mean ? "smooth_v requires value_mean" :
                                        "value_mean was passed but the resolved plan has smooth_v off");
+    // The fp8 path zero-pads V^T to v_pad_multiple and tiles KV by blk_k. The
+    // varlen layout starts every sequence's V^T slab at a v_pad_multiple
+    // boundary (varlen.h, pad_offset), so the two must be the same number or
+    // the slabs stop landing on KV tile boundaries.
+    TORCH_CHECK(!plan.pv_fp8 || plan.v_pad_multiple == plan.blk_k,
+                "internal: v_pad_multiple ",
+                plan.v_pad_multiple,
+                " != blk_k ",
+                plan.blk_k);
 
     at::Tensor out = at::empty(query.sizes(), query.options().dtype(out_dtype));
 

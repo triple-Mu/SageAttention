@@ -62,13 +62,16 @@ struct Plan {
     std::string error;  // non-empty => invalid request, message is user-facing
 };
 
-// req_* being nullopt means "use this backend's default".
+// req_* being nullopt means "use this backend's default". varlen asks for the
+// packed [total_tokens, heads, head_dim] entry points, which serve a smaller
+// set of configurations than the dense ones.
 Plan resolve(CC                       cc,
              int                      head_dim,
              std::optional<Backend>   req_backend,
              std::optional<QuantGran> req_gran,
              std::optional<PVAccum>   req_pv,
-             std::optional<bool>      req_smooth_v);
+             std::optional<bool>      req_smooth_v,
+             bool                     varlen = false);
 
 // Which kernel families were compiled into this extension (build_config.h).
 bool backend_compiled(Backend b);

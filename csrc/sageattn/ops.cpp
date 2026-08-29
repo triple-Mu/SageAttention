@@ -364,7 +364,8 @@ plan(int64_t                         cc_major,
      std::optional<c10::string_view> backend,
      std::optional<c10::string_view> qk_quant_gran,
      std::optional<c10::string_view> pv_accum_dtype,
-     std::optional<bool>             smooth_v)
+     std::optional<bool>             smooth_v,
+     bool                            varlen)
 {
     std::optional<Backend>   req_backend;
     std::optional<QuantGran> req_gran;
@@ -381,7 +382,8 @@ plan(int64_t                         cc_major,
                      req_backend,
                      req_gran,
                      req_pv,
-                     smooth_v);
+                     smooth_v,
+                     varlen);
     return {name(p.backend),
             name(p.gran),
             name(p.pv),
@@ -410,7 +412,8 @@ TORCH_LIBRARY(sageattention, m)
     // host queries (catch-all: no tensors involved)
     m.def("compiled_archs() -> int[]", TORCH_FN(sage::compiled_archs));
     m.def("plan(int cc_major, int cc_minor, int head_dim, str? backend=None, "
-          "str? qk_quant_gran=None, str? pv_accum_dtype=None, bool? smooth_v=None) "
+          "str? qk_quant_gran=None, str? pv_accum_dtype=None, bool? smooth_v=None, "
+          "bool varlen=False) "
           "-> (str backend, str qk_quant_gran, str pv_accum_dtype, bool smooth_v, "
           "bool smooth_v_ignored, bool pv_fp8, str v_layout, int v_pad_multiple, "
           "float v_scale_max, bool need_value_scale, bool need_value_mean, "

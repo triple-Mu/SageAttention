@@ -57,9 +57,10 @@ _HDS = (64, 128)
 _GRANS = (None, "per_warp", "per_thread")
 _PVS = (None, "fp16", "fp32", "fp16+fp32", "fp32+fp32", "fp32+fp16")
 _SVS = (None, False, True)
+_VARLENS = (False, True)
 
-# (compute capability, head_dim, qk_quant_gran, pv_accum_dtype, smooth_v)
-PlanKey = Tuple[Tuple[int, int], int, Optional[str], Optional[str], Optional[bool]]
+# (compute capability, head_dim, qk_quant_gran, pv_accum_dtype, smooth_v, varlen)
+PlanKey = Tuple[Tuple[int, int], int, Optional[str], Optional[str], Optional[bool], bool]
 
 PLAN: Dict[PlanKey, Plan] = {}
 
@@ -71,9 +72,10 @@ def _prime() -> None:
             for gran in _GRANS:
                 for pv in _PVS:
                     for sv in _SVS:
-                        PLAN[(cc, hd, gran, pv, sv)] = Plan(
-                            *plan_op(cc[0], cc[1], hd, None, gran, pv, sv)
-                        )
+                        for varlen in _VARLENS:
+                            PLAN[(cc, hd, gran, pv, sv, varlen)] = Plan(
+                                *plan_op(cc[0], cc[1], hd, None, gran, pv, sv, varlen)
+                            )
 
 
 _prime()
@@ -85,6 +87,7 @@ def get_plan(
     qk_quant_gran: Optional[str],
     pv_accum_dtype: Optional[str],
     smooth_v: Optional[bool],
+    varlen: bool = False,
 ) -> Plan:
     """Look the plan up in the primed table.
 
@@ -94,12 +97,12 @@ def get_plan(
     an unprimed cc must be run once in eager mode before torch.compile
     (fullgraph=True) sees it.
     """
-    key: PlanKey = (cc, head_dim, qk_quant_gran, pv_accum_dtype, smooth_v)
+    key: PlanKey = (cc, head_dim, qk_quant_gran, pv_accum_dtype, smooth_v, varlen)
     p = PLAN.get(key)
     if p is None:  # capability not in the primed table (new hardware)
         p = Plan(
             *torch.ops.sageattention.plan(
-                cc[0], cc[1], head_dim, None, qk_quant_gran, pv_accum_dtype, smooth_v
+                cc[0], cc[1], head_dim, None, qk_quant_gran, pv_accum_dtype, smooth_v, varlen
             )
         )
         if not p.error:

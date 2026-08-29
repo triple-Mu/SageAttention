@@ -34,10 +34,10 @@ def test_plan_table_parity():
     """Every primed entry re-resolves to exactly the same 16-tuple."""
     assert PLAN, "the import-time plan table is empty"
     mismatches = []
-    for (cc, head_dim, gran, pv, sv), cached in PLAN.items():
-        fresh = Plan(*PLAN_OP(cc[0], cc[1], head_dim, None, gran, pv, sv))
+    for (cc, head_dim, gran, pv, sv, varlen), cached in PLAN.items():
+        fresh = Plan(*PLAN_OP(cc[0], cc[1], head_dim, None, gran, pv, sv, varlen))
         if tuple(fresh) != tuple(cached):
-            mismatches.append((cc, head_dim, gran, pv, sv, tuple(cached), tuple(fresh)))
+            mismatches.append((cc, head_dim, gran, pv, sv, varlen, tuple(cached), tuple(fresh)))
     assert not mismatches, mismatches[:5]
 
 
@@ -145,7 +145,7 @@ def test_get_plan_raises_on_error():
 def test_get_plan_uncached_capability():
     """A cc outside the primed table falls through to the live op once, then
     is memoized so later calls stay a pure dict lookup (traceable)."""
-    key = ((8, 5), 128, None, None, None)
+    key = ((8, 5), 128, None, None, None, False)
     PLAN.pop(key, None)
     p = get_plan(*key)
     assert p.backend == "sm80" and not p.error
