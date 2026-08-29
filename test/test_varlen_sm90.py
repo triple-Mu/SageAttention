@@ -234,6 +234,37 @@ def test_fwd_varlen_ragged_equals_per_sequence_dense(gran, head_dim):
         assert torch.equal(lse_v[:, cq[b] : cq[b + 1]].unsqueeze(0), lse_d), f"lse sequence {b}"
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_fwd_varlen_long_packed_tensor(causal):
+    """The tensor maps describe the whole packed tensor, so their major
+    dimension is total_tokens and not one sequence's length -- an extent no
+    dense map ever carries, and the one place cuTensorMapEncodeTiled's 2^32 /
+    2^40 limits could bite. 129536 tokens with a 64K sequence in front of a 4K
+    one exercises the encode and the offsets together."""
+    lens = [65536, 40000, 20000, 4000]
+    heads, head_dim, gran = 2, 128, "per_thread"
+    cq = cu_of(lens)
+    cu = torch.tensor(cq, device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(23)
+    q = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    out_v, _ = sage_varlen_raw(q, k, v, cu, cu, causal, gran, lse=True)
+
+    for b in range(len(lens)):
+        one_q = q[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_k = k[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_v = v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        dq, dqs, dk, dks = OPS.quant_qk(
+            one_q, one_k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM
+        )
+        dv, dvs = quant_v_dense(one_v)
+        out_d, _ = fwd_dense(dq, dk, dv, dqs, dks, dvs, causal, gran, lse=True)
+        got = out_v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0)
+        assert torch.equal(got, out_d), f"out sequence {b}"
+
+
 # --------------------------------------------- bottom-right causal (delta != 0)
 
 
