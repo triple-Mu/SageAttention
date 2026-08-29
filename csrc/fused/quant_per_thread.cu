@@ -238,8 +238,15 @@ __global__ void SAGE_QUANT_K_BOUNDS(WARP_TOKENS) QuantPerThreadKInt8Kernel(T* __
     constexpr bool     kCache =
         rows_per_thread <= kQuantCacheRows && rows_per_thread * pack_size * sizeof(T) <= kQuantCacheBytes;
     // full unroll only pays for the cached form, which needs constant cache
-    // indices; unrolling the reload form as well just inflates the live ranges
+    // indices; unrolling the reload form as well just inflates the live ranges.
+    // Under the 32-register pin (SAGE_QUANT_K_BOUNDS) even a partial unroll
+    // only buys spill and I-cache pressure, not ILP: not unrolling at all
+    // measures 1-3% faster across seq_lens on H200 and drops the spill to 0.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000)
+    constexpr uint32_t kUnroll = kCache ? pairs_per_group : 1;
+#else
     constexpr uint32_t kUnroll = kCache ? pairs_per_group : 4;
+#endif
 
     const uint32_t warp_tile_id         = blockIdx.x;
     const uint32_t head_id              = blockIdx.y;
