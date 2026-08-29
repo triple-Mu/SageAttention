@@ -114,13 +114,21 @@ __device__ __forceinline__ void load_global_to_shared(T**                       
 }
 
 // with predicate
-template<uint32_t    global_to_shared_line_lanes,
-         uint32_t    global_to_shared_copy_lines_per_warp_per_iter,
-         uint32_t    smem_iters_row,
-         uint32_t    smem_iters_col,
-         SwizzleMode swizzle_mode,
-         uint32_t    stride,
-         uint32_t    CTA,
+//
+// fill_mode says what an out-of-range row leaves in shared memory. kNoFill
+// keeps whatever was there, which is safe wherever the value is masked out of
+// an *integer* product (the QK path) and dangerous where it reaches an fp16
+// multiply: the masked probability is exactly 0, and 0 * NaN is NaN, so one
+// stale half in the V tile poisons a whole output row. The varlen kernels
+// zero-fill V for that reason.
+template<uint32_t                    global_to_shared_line_lanes,
+         uint32_t                    global_to_shared_copy_lines_per_warp_per_iter,
+         uint32_t                    smem_iters_row,
+         uint32_t                    smem_iters_col,
+         SwizzleMode                 swizzle_mode,
+         uint32_t                    stride,
+         uint32_t                    CTA,
+         cp_async::SharedMemFillMode fill_mode = cp_async::SharedMemFillMode::kNoFill,
          typename T>
 __device__ __forceinline__ void load_global_to_shared(T**                                 lane_ptr,
                                                       uint32_t&                           smem_offset,
@@ -139,7 +147,7 @@ __device__ __forceinline__ void load_global_to_shared(T**                       
     for (uint32_t i = 0; i < smem_iters_col; i++) {
 #pragma unroll
         for (uint32_t j = 0; j < smem_iters_row; j++) {
-            smem.load_128b_async<cp_async::SharedMemFillMode::kNoFill>(smem_offset, *lane_ptr, base_idx < max_len);
+            smem.load_128b_async<fill_mode>(smem_offset, *lane_ptr, base_idx < max_len);
             *lane_ptr += (global_to_shared_line_lanes * pack_size);
             smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
         }

@@ -357,6 +357,11 @@ class NewBackend:
 
         self.ops = torch.ops.sageattention
         self.sageattn = sageattention.sageattn
+        # absent from installs older than the varlen work, and from a build
+        # configured with -DSAGE_BUILD_VARLEN=OFF
+        self.sageattn_varlen = getattr(sageattention, "sageattn_varlen", None)
+        if not getattr(sageattention._C, "build_varlen", 0):
+            self.sageattn_varlen = None
 
     def compiled_archs(self):
         return sorted(self.ops.compiled_archs())
@@ -881,6 +886,28 @@ def equiv_cases(env, subset):
                                             qo=qo,
                                             kv=kv,
                                         )
+    # sageattn_varlen on an equal-length batch must be bit-identical to
+    # sageattn on the same tokens: that batch has delta == 0, where the packed
+    # kernels' tile structure degenerates to the dense one. Only sm80 has
+    # varlen kernels so far. smooth_k is off because its per-sequence mean goes
+    # through index_add_ atomics, which are not run-to-run deterministic.
+    if arch == 80:
+        for hd in (64, 128):
+            for causal in (False, True):
+                for lse in (False, True):
+                    for gran in ("per_warp", "per_thread"):
+                        for b, n in ((1, 128), (3, 256), (2, 100)):
+                            if subset and n > 128:
+                                continue
+                            yield dict(
+                                kind="varlen_vs_dense",
+                                hd=hd,
+                                causal=causal,
+                                lse=lse,
+                                gran=gran,
+                                b=b,
+                                n=n,
+                            )
     # quant_v_fp8(pad_multiple=128) must be bit-identical to python-side
     # zero padding followed by the 64-aligned quantization, which is what the
     # pre-refactor sm90/sm100 path did. Needs the fp8 converter (sm_89+).
@@ -914,6 +941,10 @@ def equiv_build(be, c):
         key = json.dumps(c, sort_keys=True)
         shape = qkv_shape(1, 2, c["kv"], c["hd"], c["layout"])
         return {"v": gen(shape, key + "/v", dtype=torch.float16)}
+    if c["kind"] == "varlen_vs_dense":
+        key = json.dumps(c, sort_keys=True)
+        shape = qkv_shape(c["b"], 4, c["n"], c["hd"], "HND")
+        return {n: gen(shape, f"{key}/{n}", dtype=torch.float16) for n in ("q", "k", "v")}
     return {}
 
 
@@ -952,6 +983,34 @@ def equiv_execute(be, c, inputs):
             if mine != got:
                 bad.append(f"sm_{cc[0]}{cc[1]}: mirror={mine} plan={got}")
         return {"equal": "yes" if not bad else "no: " + "; ".join(bad)}
+
+    if c["kind"] == "varlen_vs_dense":
+        if be.sageattn_varlen is None:
+            return {"equal": "skip: this install has no sageattn_varlen"}
+        b, n, hd = c["b"], c["n"], c["hd"]
+        q, k, v = inputs["q"], inputs["k"], inputs["v"]
+        heads = q.size(1)
+        cu = torch.arange(0, b * n + 1, n, device=q.device, dtype=torch.int32)
+
+        def packed(t):  # [b, heads, n, hd] -> [b * n, heads, hd]
+            return t.transpose(1, 2).reshape(b * n, heads, hd).contiguous()
+
+        kw = dict(is_causal=c["causal"], return_lse=c["lse"], smooth_k=False)
+        with torch.no_grad():
+            dense = be.sageattn(q, k, v, qk_quant_gran=c["gran"], **kw)
+            got = be.sageattn_varlen(
+                packed(q), packed(k), packed(v), cu, cu, n, n, qk_quant_gran=c["gran"], **kw
+            )
+        dense_out, dense_lse = dense if c["lse"] else (dense, None)
+        out, lse = got if c["lse"] else (got, None)
+        torch.cuda.synchronize()
+        if not torch.equal(out, packed(dense_out)):
+            return {"equal": "no: sageattn_varlen != sageattn (out)"}
+        if c["lse"] and not torch.equal(
+            lse.view(heads, b, n).transpose(0, 1).contiguous(), dense_lse
+        ):
+            return {"equal": "no: sageattn_varlen != sageattn (lse)"}
+        return {"equal": "yes"}
 
     if c["kind"] == "v_pad128":
         v, kv, layout, v_layout = inputs["v"], c["kv"], c["layout"], c["v_layout"]

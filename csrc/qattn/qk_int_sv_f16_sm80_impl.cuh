@@ -318,6 +318,19 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
         }
     }
 
+    // What a predicated V load leaves in the rows past the sequence. The masked
+    // probabilities are exactly 0 and 0 * NaN is NaN, so a stale half in the V
+    // tile poisons a whole output row. Every varlen sequence ends mid-tile,
+    // which makes that the normal case there rather than the exception; the
+    // dense kernel runs the same risk on its last tile only, and is left as it
+    // was (moving its SASS is what this split exists to avoid).
+    constexpr cp_async::SharedMemFillMode kVFillMode =
+#ifdef SAGE_VARLEN
+        cp_async::SharedMemFillMode::kFillZero;
+#else
+        cp_async::SharedMemFillMode::kNoFill;
+#endif
+
     constexpr uint32_t K_smem_row_offset = CTA_Q;
     constexpr uint32_t V_smem_row_offset = CTA_Q + CTA_K;
 
@@ -540,7 +553,8 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                           V_smem_iters_col,
                           swizzle_mode_V,
                           V_SMEM_STRIDE / PACK_SIZE_V,
-                          CTA_K>(
+                          CTA_K,
+                          kVFillMode>(
         &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
     cp_async::commit_group();
 
@@ -746,7 +760,8 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                       V_smem_iters_col,
                                       swizzle_mode_V,
                                       V_SMEM_STRIDE / PACK_SIZE_V,
-                                      CTA_K>(
+                                      CTA_K,
+                                      kVFillMode>(
                     &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
             }
             cp_async::commit_group();

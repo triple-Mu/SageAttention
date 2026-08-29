@@ -17,6 +17,7 @@ import torch
 from torch.library import opcheck
 
 from conftest import cos_sim, rel_l1, requires_backend, requires_varlen
+from sageattention import sageattn, sageattn_varlen
 
 DEV = "cuda"
 OPS = torch.ops.sageattention
@@ -511,3 +512,263 @@ def test_opcheck_fwd_varlen(causal, return_lse):
             out_dtype=torch.float16,
         ),
     )
+
+
+# ------------------------------------------------------- sageattn_varlen API
+
+
+def dense_of(packed, lens):
+    """Packed -> [batch, heads, n, head_dim] for an equal-length batch."""
+    n = lens[0]
+    return packed.view(len(lens), n, packed.size(1), packed.size(2)).transpose(1, 2).contiguous()
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("smooth_k", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_varlen_vs_dense_end_to_end(smooth_k, causal, head_dim):
+    """The equal-length batch again, this time through the public entry points.
+    Without smooth_k the two are bit-identical; with it the per-sequence mean
+    goes through index_add_ atomics, which are not run-to-run deterministic."""
+    b, heads, n = 3, 4, 256
+    lens = [n] * b
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(41)
+    packed = [
+        torch.randn((b * n, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+        for _ in range(3)
+    ]
+    q, k, v = packed
+
+    with torch.no_grad():
+        out_v, lse_v = sageattn_varlen(
+            q, k, v, cu, cu, n, n, is_causal=causal, return_lse=True, smooth_k=smooth_k
+        )
+        out_d, lse_d = sageattn(
+            *(dense_of(t, lens) for t in packed),
+            is_causal=causal,
+            return_lse=True,
+            smooth_k=smooth_k,
+        )
+
+    got_dense = dense_of(out_v, lens)
+    if smooth_k:
+        torch.testing.assert_close(got_dense, out_d, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(unpack_lse(lse_v, lens), lse_d, rtol=1e-3, atol=1e-3)
+    else:
+        assert torch.equal(got_dense, out_d), "out"
+        assert torch.equal(unpack_lse(lse_v, lens), lse_d), "lse"
+
+
+VARLEN_SEGMENTATIONS = [
+    ([256], [256]),  # single sequence
+    ([100, 256, 37], [100, 256, 37]),  # ragged, delta = 0
+    ([128, 64, 300], [163, 700, 300]),  # ragged, delta = 35 / 636 / 0
+    ([64, 0, 128], [64, 0, 128]),  # an empty sequence in the middle
+    ([300], [1]),  # kv much shorter than qo
+]
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("smooth_k", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_lens,k_lens", VARLEN_SEGMENTATIONS, ids=lambda p: "x".join(map(str, p)))
+def test_sageattn_varlen_matches_segmented_sdpa(smooth_k, causal, q_lens, k_lens):
+    """Accuracy against an fp32 per-sequence reference, on the sageattn gates."""
+    head_dim, heads = 64, 4
+    cu_q, cu_k = cu_of(q_lens), cu_of(k_lens)
+    g = torch.Generator(device=DEV).manual_seed(43)
+    q = torch.randn((cu_q[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((cu_k[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((cu_k[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    tq = torch.tensor(cu_q, device=DEV, dtype=torch.int32)
+    tk = torch.tensor(cu_k, device=DEV, dtype=torch.int32)
+
+    with torch.no_grad():
+        out, lse = sageattn_varlen(
+            q,
+            k,
+            v,
+            tq,
+            tk,
+            max(q_lens),
+            max(k_lens),
+            is_causal=causal,
+            return_lse=True,
+            smooth_k=smooth_k,
+        )
+    ref, ref_lse = sdpa_varlen_ref(q, k, v, cu_q, cu_k, causal, head_dim**-0.5)
+
+    live = ~(torch.isinf(ref_lse) & (ref_lse < 0))
+    if live.any():
+        cs, l1 = cos_sim(out, ref), rel_l1(out, ref)
+        assert cs > COS_MIN and l1 < REL_L1_MAX, f"cos_sim={cs:.5f} rel_l1={l1:.5f}"
+        torch.testing.assert_close(lse[live], ref_lse[live], rtol=2e-2, atol=5e-2)
+    assert torch.equal(lse[~live], ref_lse[~live]), "dead rows must carry -inf"
+
+
+@requires_backend("sm80")
+def test_sageattn_varlen_gqa_and_head_dim_pad():
+    """GQA plus a head_dim that is not 64 or 128: the pad is the dense one and
+    the output is sliced back."""
+    q_lens = k_lens = [96, 33]
+    cu = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(47)
+    q = torch.randn((sum(q_lens), 8, 96), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), 2, 96), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), 2, 96), device=DEV, dtype=torch.float16, generator=g)
+    with torch.no_grad():
+        out = sageattn_varlen(q, k, v, cu, cu, max(q_lens), max(k_lens), is_causal=True)
+    assert out.shape == q.shape and out.dtype == q.dtype
+    ref, _ = sdpa_varlen_ref(q, k, v, cu_of(q_lens), cu_of(k_lens), True, 96**-0.5)
+    cs = cos_sim(out, ref)
+    assert cs > COS_MIN, f"cos_sim={cs:.5f}"
+
+
+@requires_backend("sm80")
+def test_sageattn_varlen_rejects_dense_input():
+    q = torch.randn((2, 4, 64, 64), device=DEV, dtype=torch.float16)
+    cu = torch.tensor([0, 64, 128], device=DEV, dtype=torch.int32)
+    with pytest.raises(AssertionError, match="packed"):
+        sageattn_varlen(q, q, q, cu, cu, 64, 64)
+
+
+# ---------------------------------------------------------- compile / cudagraph
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("smooth_k", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_varlen_no_graph_breaks(smooth_k, return_lse):
+    """Nothing in sageattn_varlen may read cu_seqlens on the host: a shape
+    derived from tensor contents is a graph break (and a device sync)."""
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    lens = [128, 384]
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(53)
+    q, k, v = (
+        torch.randn((sum(lens), 2, 64), device=DEV, dtype=torch.float16, generator=g)
+        for _ in range(3)
+    )
+
+    def fn(q, k, v, cu):
+        return sageattn_varlen(
+            q, k, v, cu, cu, 384, 384, is_causal=True, return_lse=return_lse, smooth_k=smooth_k
+        )
+
+    with torch.no_grad():
+        explanation = torch._dynamo.explain(fn)(q, k, v, cu)
+    assert explanation.graph_break_count == 0, explanation.break_reasons
+
+
+@requires_backend("sm80")
+def test_varlen_compiled_matches_eager():
+    torch._dynamo.reset()
+    lens = [100, 256, 37]
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(59)
+    q, k, v = (
+        torch.randn((sum(lens), 4, 64), device=DEV, dtype=torch.float16, generator=g)
+        for _ in range(3)
+    )
+    compiled = torch.compile(sageattn_varlen, fullgraph=True)
+    with torch.no_grad():
+        want = sageattn_varlen(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=False)
+        got = compiled(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=False)
+    assert torch.equal(got, want)
+
+
+@requires_backend("sm80")
+def test_cudagraph_replay_with_a_new_segmentation():
+    """The whole point of the closed-form block algebra: no tensor shape depends
+    on the contents of cu_seqlens, so a replay may re-split the same tokens.
+    max_seqlen is baked into grid.x at capture, so it is captured at the upper
+    bound and every replayed sequence stays under it."""
+    total, heads, head_dim, max_seqlen = 512, 2, 64, 512
+    g = torch.Generator(device=DEV).manual_seed(61)
+    q, k, v = (
+        torch.randn((total, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+        for _ in range(3)
+    )
+    cu = torch.tensor(cu_of([256, 256]), device=DEV, dtype=torch.int32)
+
+    def run():
+        return sageattn_varlen(
+            q, k, v, cu, cu, max_seqlen, max_seqlen, is_causal=True, smooth_k=False
+        )
+
+    with torch.no_grad():
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = run()
+
+        for lens in ([256, 256], [100, 412], [512, 0], [1, 511]):
+            cu.copy_(torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32))
+            graph.replay()
+            torch.cuda.synchronize()
+            want = run()
+            assert torch.equal(static_out, want), f"replay with {lens}"
+
+
+@requires_backend("sm80")
+def test_smooth_v_is_ignored_with_a_warning():
+    """resolve() drops smooth_v for varlen; the entry point says so once and
+    returns the same answer it would have without the request."""
+    from sageattention.core import _warned_configs
+
+    lens = [128, 64]
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(67)
+    q, k, v = (
+        torch.randn((sum(lens), 2, 64), device=DEV, dtype=torch.float16, generator=g)
+        for _ in range(3)
+    )
+    _warned_configs.clear()
+    with torch.no_grad():
+        with pytest.warns(UserWarning, match="smooth_v"):
+            got = sageattn_varlen(q, k, v, cu, cu, 128, 128, smooth_v=True, smooth_k=False)
+        want = sageattn_varlen(q, k, v, cu, cu, 128, 128, smooth_v=False, smooth_k=False)
+    assert torch.equal(got, want)
+
+
+@requires_backend("sm80")
+def test_requires_grad_raises():
+    lens = [64]
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    q = torch.randn((64, 2, 64), device=DEV, dtype=torch.float16, requires_grad=True)
+    with pytest.raises(NotImplementedError, match="backward"):
+        sageattn_varlen(q, q, q, cu, cu, 64, 64)
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_output_dtype_follows_input(dtype):
+    """bfloat16 is a separate kernel instantiation (DTypeOut), so it gets its
+    own equality check against the per-sequence dense path."""
+    lens = [128, 64]
+    cu_list = cu_of(lens)
+    cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(71)
+    q, k, v = (
+        torch.randn((sum(lens), 2, 64), device=DEV, dtype=dtype, generator=g) for _ in range(3)
+    )
+    with torch.no_grad():
+        got = sageattn_varlen(q, k, v, cu, cu, 128, 128, is_causal=True, smooth_k=False)
+    assert got.dtype == dtype
+
+    outs = []
+    for b in range(len(lens)):
+        seg = slice(cu_list[b], cu_list[b + 1])
+        one = (t[seg].transpose(0, 1).unsqueeze(0).contiguous() for t in (q, k, v))
+        with torch.no_grad():
+            outs.append(sageattn(*one, is_causal=True, smooth_k=False)[0].transpose(0, 1))
+    assert torch.equal(got, torch.cat(outs, 0))

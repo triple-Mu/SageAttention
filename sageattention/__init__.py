@@ -12,6 +12,7 @@ from . import _C  # noqa: F401
 from . import ops  # noqa: F401  (register_fake; requires _C first)
 
 from .core import sageattn
+from .varlen import sageattn_varlen
 
-__all__ = ["sageattn"]
+__all__ = ["sageattn", "sageattn_varlen"]
 __version__ = _C.version
