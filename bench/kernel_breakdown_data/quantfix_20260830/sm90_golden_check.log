@@ -1,0 +1,33 @@
+{
+ "backend": "new",
+ "cc": [
+  9,
+  0
+ ],
+ "compiled_archs": [
+  80,
+  90
+ ],
+ "device_name": "NVIDIA H200",
+ "e2e_arch": 90,
+ "git_commit": "45d4f11",
+ "repeat": 2,
+ "runnable_archs": [
+  80,
+  90
+ ],
+ "sageattention_file": "/workspace/SageAttention-fixq/sageattention/__init__.py",
+ "sageattention_version": "2.2.0",
+ "schema_version": 1,
+ "sections": [
+  "quant",
+  "e2e"
+ ],
+ "subset": false,
+ "torch_version": "2.13.0a0+9186a08b2c.nv26.07"
+}
+[run] quant: 240 cases
+[run] e2e: 60 cases
+cases: 300, unstable: 0, raised: 0
+golden: backend=new sageattention=2.2.0 @45d4f11 torch=2.13.0a0+9186a08b2c.nv26.07
+ok=300 diff=0 env_mismatch=0 missing=0 whitelisted=0 skipped=0 extra=0
