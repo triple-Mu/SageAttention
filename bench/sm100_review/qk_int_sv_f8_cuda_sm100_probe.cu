@@ -19,44 +19,61 @@
 // paths (TS from TMEM / SS twin from smem) so every asm string, descriptor
 // and TMEM access is machine-checked by ptxas at sm_100a and sm_110a.
 //
+// Not wired into any build or CI — compile it by hand from the repo root
+// (nvcc >= 13.3, no GPU needed) and check that ptxas -v reports register
+// usage for all four instantiations:
+//
 //   nvcc -std=c++17 -O3 --use_fast_math -cubin -Xptxas -v \
-//        -gencode arch=compute_100a,code=sm_100a  (and compute_110a/sm_110a)
+//        -gencode arch=compute_100a,code=sm_100a \
+//        -I csrc/qattn -o /tmp/probe.cubin \
+//        bench/sm100_review/qk_int_sv_f8_cuda_sm100_probe.cu
+//
+//   (repeat with arch=compute_110a,code=sm_110a)
+//
+// The explicit instantiations below must track the kernel's namespace and
+// parameter list in csrc/qattn/qk_int_sv_f8_cuda_sm100.cu by hand.
 
 #define SAGE_SM100_DEVICE_ONLY 1
 #include "qk_int_sv_f8_cuda_sm100.cu"
+
+namespace sage {
+namespace sm100 {
 
 // HD=128, TS PV path, causal + lse + v_scale, per-thread quant, fp16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100<
     128u, 128u, 128u, 128u, QuantGranularity::kPerThread, QuantGranularity::kPerThread, half,
     MaskMode::kCausal, /*return_lse=*/true, /*fuse_v_scale=*/true, /*PV_FROM_SMEM=*/false>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, float *__restrict__, float *__restrict__,
-    float *__restrict__, half *, float *__restrict__, uint32_t, uint32_t, uint32_t,
-    const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
+    const float *__restrict__, half *, float *__restrict__, const int64_t, const int64_t,
+    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=128, SS twin PV path, non-causal, per-warp quant, bf16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100<
     128u, 128u, 128u, 128u, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp, nv_bfloat16,
     MaskMode::kNone, /*return_lse=*/false, /*fuse_v_scale=*/false, /*PV_FROM_SMEM=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, float *__restrict__, float *__restrict__,
-    float *__restrict__, nv_bfloat16 *, float *__restrict__, uint32_t, uint32_t, uint32_t,
-    const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
+    const float *__restrict__, nv_bfloat16 *, float *__restrict__, const int64_t, const int64_t,
+    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=64, TS PV path, non-causal + v_scale, per-warp quant, fp16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100<
     128u, 128u, 128u, 64u, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp, half,
     MaskMode::kNone, /*return_lse=*/false, /*fuse_v_scale=*/true, /*PV_FROM_SMEM=*/false>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, float *__restrict__, float *__restrict__,
-    float *__restrict__, half *, float *__restrict__, uint32_t, uint32_t, uint32_t,
-    const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
+    const float *__restrict__, half *, float *__restrict__, const int64_t, const int64_t,
+    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=64, SS twin PV path, causal + lse, per-thread quant, bf16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100<
     128u, 128u, 128u, 64u, QuantGranularity::kPerThread, QuantGranularity::kPerThread, nv_bfloat16,
     MaskMode::kCausal, /*return_lse=*/true, /*fuse_v_scale=*/false, /*PV_FROM_SMEM=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, float *__restrict__, float *__restrict__,
-    float *__restrict__, nv_bfloat16 *, float *__restrict__, uint32_t, uint32_t, uint32_t,
-    const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
+    const float *__restrict__, nv_bfloat16 *, float *__restrict__, const int64_t, const int64_t,
+    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
+
+}  // namespace sm100
+}  // namespace sage
