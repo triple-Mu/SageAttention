@@ -4,8 +4,9 @@ the varlen dimension of the plan table.
 No varlen kernel exists yet. What is pinned here is everything the kernels will
 be written against: the closed-form offsets in ``csrc/sageattn/varlen.h`` (both
 of their provable properties, plus a direct comparison against the compiled C++
-so the Python mirror below cannot drift), the pure-ATen reductions in
-``sageattention/varlen.py``, and the plan decisions varlen changes.
+so the Python mirror below cannot drift), the smooth_k reductions in
+``sageattention/varlen.py`` (the mean is the ``segment_mean_varlen`` op, the
+lse correction is pure ATen), and the plan decisions varlen changes.
 """
 
 import random
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from conftest import CC
+from conftest import CC, requires_cuda, requires_varlen
 from sageattention._plan import PLAN, Plan, get_plan
 from sageattention.varlen import _segment_lse_correction, _segment_mean
 
@@ -197,24 +198,74 @@ SEGMENTATIONS = [
     [100, 0, 233],  # an empty sequence in the middle
     [0, 64],  # an empty sequence first
     [37, 128, 1, 300],
+    [1500, 0, 700],  # max_seqlen > one op-internal chunk: the two-kernel path
+    [2500],  # three partial-sum chunks folded by the second kernel
 ]
 
 
-@pytest.mark.parametrize("lens", SEGMENTATIONS, ids=lambda p: "x".join(map(str, p)))
-def test_segment_mean_matches_per_sequence_mean(lens):
-    x, cu, total = _packed(lens)
-    got = _segment_mean(x, cu, len(lens), total)
-    assert got.shape == (len(lens), x.size(1), x.size(2))
-
-    start = 0
-    for b, n in enumerate(lens):
-        want = (
+def _per_sequence_means(x, lens):
+    means, start = [], 0
+    for n in lens:
+        means.append(
             x[start : start + n].float().mean(0)
             if n
-            else torch.zeros_like(got[b], dtype=torch.float32)
+            else torch.zeros((x.size(1), x.size(2)), device=x.device, dtype=torch.float32)
         )
-        torch.testing.assert_close(got[b].float(), want, rtol=1e-3, atol=1e-3)
         start += n
+    return means
+
+
+@requires_cuda
+@requires_varlen
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("lens", SEGMENTATIONS, ids=lambda p: "x".join(map(str, p)))
+def test_segment_mean_matches_per_sequence_mean(lens, head_dim, dtype):
+    x, cu, _ = _packed(lens, head_dim=head_dim, dtype=dtype)
+    got = _segment_mean(x, cu, max(lens))
+    assert got.shape == (len(lens), x.size(1), x.size(2))
+    assert got.dtype == x.dtype
+
+    # one output-dtype ulp around 1.0: the reference is float32, so casting the
+    # mean once costs up to eps/2 relative on its own
+    tol = 1e-3 if dtype == torch.float16 else 8e-3
+    for b, want in enumerate(_per_sequence_means(x, lens)):
+        torch.testing.assert_close(got[b].float(), want, rtol=tol, atol=tol)
+
+
+@requires_cuda
+@requires_varlen
+def test_segment_mean_takes_max_seqlen_as_an_upper_bound():
+    """max_seqlen only opens the grid, so a caller may pass its model-level
+    upper bound (the cudagraph capture pattern) instead of the exact maximum."""
+    lens = [37, 128, 1, 300]
+    x, cu, _ = _packed(lens)
+    exact = _segment_mean(x, cu, max(lens))
+    padded = _segment_mean(x, cu, 4096)
+    assert torch.equal(exact, padded)
+
+
+@requires_cuda
+@requires_varlen
+def test_segment_mean_is_deterministic():
+    """The op reduces in a fixed order; the atomic index_add_ composite it
+    replaced was run-to-run non-deterministic and could only be allclose'd."""
+    x, cu, _ = _packed([1500, 0, 700])
+    assert torch.equal(_segment_mean(x, cu, 1500), _segment_mean(x, cu, 1500))
+
+
+@requires_cuda
+@requires_varlen
+def test_segment_mean_takes_a_strided_input():
+    """k sliced out of a fused qkv projection is the common non-contiguous
+    caller: only the last dim is contiguous, which is all the op requires."""
+    lens = [100, 0, 233]
+    qkv, cu, _ = _packed(lens, heads=3 * 4)
+    k = qkv.view(qkv.size(0), 3, 4, qkv.size(2))[:, 1]
+    assert not k.is_contiguous()
+    got = _segment_mean(k, cu, max(lens))
+    for b, want in enumerate(_per_sequence_means(k.contiguous(), lens)):
+        torch.testing.assert_close(got[b].float(), want, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("q_per_kv_head", [1, 2])
@@ -239,15 +290,17 @@ def test_segment_lse_correction_matches_per_sequence_matmul(q_per_kv_head):
         start += n
 
 
+@requires_cuda
+@requires_varlen
 def test_segment_mean_has_no_graph_break():
     """The reduction sits inside the traced region of sageattn_varlen, so a
-    data-dependent shape here would cost the whole graph. output_size on
-    repeat_interleave is what prevents it."""
+    data-dependent shape here would cost the whole graph. The op's fake reads
+    batch_size off cu_seqlens' *shape* only, which is what prevents it."""
     torch._dynamo.reset()
-    x, cu, total = _packed([37, 128, 1, 300])
+    x, cu, _ = _packed([37, 128, 1, 300])
 
     def fn(x, cu):
-        return _segment_mean(x, cu, 4, total)
+        return _segment_mean(x, cu, 300)
 
     with torch.no_grad():
         explanation = torch._dynamo.explain(fn)(x, cu)

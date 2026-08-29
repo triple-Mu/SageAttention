@@ -211,6 +211,21 @@ def test_opcheck_quant_qk_varlen(gran, smooth_k):
     )
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "lens",
+    [[37, 128, 300], [1500, 0, 300]],  # one chunk; several chunks plus an empty sequence
+    ids=lambda p: "x".join(map(str, p)),
+)
+def test_opcheck_segment_mean_varlen(lens):
+    """smooth_k's production side. The second segmentation crosses the op's
+    internal chunk size, so both of its kernel paths go through the checks."""
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(13)
+    packed = torch.randn((sum(lens), 2, 128), device=DEV, dtype=torch.float16, generator=g)
+    opcheck(OPS.segment_mean_varlen.default, (packed, cu), dict(max_seqlen=max(lens)))
+
+
 @requires_backend("sm80")
 def test_quant_qk_varlen_empty_sequence():
     """An empty sequence owns one (unused) scale block and no tokens; its
@@ -732,7 +747,8 @@ def dense_of(packed, lens):
 def test_varlen_vs_dense_end_to_end(smooth_k, causal, head_dim):
     """The equal-length batch again, this time through the public entry points.
     Without smooth_k the two are bit-identical; with it the per-sequence mean
-    goes through index_add_ atomics, which are not run-to-run deterministic."""
+    comes from segment_mean_varlen, which is deterministic but reduces in a
+    different order than the dense k.mean, so the comparison stays allclose."""
     b, heads, n = 3, 4, 256
     lens = [n] * b
     cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
@@ -893,7 +909,10 @@ def test_varlen_no_graph_breaks(smooth_k, return_lse):
 
 
 @requires_varlen_backend
-def test_varlen_compiled_matches_eager():
+@pytest.mark.parametrize("smooth_k", [False, True])
+def test_varlen_compiled_matches_eager(smooth_k):
+    """torch.equal on both sides: every op in the traced region, the smooth_k
+    mean included, is deterministic."""
     torch._dynamo.reset()
     lens = [100, 256, 37]
     cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
@@ -904,18 +923,24 @@ def test_varlen_compiled_matches_eager():
     )
     compiled = torch.compile(sageattn_varlen, fullgraph=True)
     with torch.no_grad():
-        want = sageattn_varlen(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=False)
-        got = compiled(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=False)
+        want = sageattn_varlen(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=smooth_k)
+        got = compiled(q, k, v, cu, cu, 256, 256, is_causal=True, smooth_k=smooth_k)
     assert torch.equal(got, want)
 
 
 @requires_varlen_backend
-def test_cudagraph_replay_with_a_new_segmentation():
+@pytest.mark.parametrize(
+    "smooth_k,max_seqlen",
+    # 2048 puts the captured segment_mean_varlen on its multi-chunk path with
+    # every replayed sequence far below the bound
+    [(False, 512), (True, 512), (True, 2048)],
+)
+def test_cudagraph_replay_with_a_new_segmentation(smooth_k, max_seqlen):
     """The whole point of the closed-form block algebra: no tensor shape depends
     on the contents of cu_seqlens, so a replay may re-split the same tokens.
     max_seqlen is baked into grid.x at capture, so it is captured at the upper
     bound and every replayed sequence stays under it."""
-    total, heads, head_dim, max_seqlen = 512, 2, 64, 512
+    total, heads, head_dim = 512, 2, 64
     g = torch.Generator(device=DEV).manual_seed(61)
     q, k, v = (
         torch.randn((total, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
@@ -925,7 +950,7 @@ def test_cudagraph_replay_with_a_new_segmentation():
 
     def run():
         return sageattn_varlen(
-            q, k, v, cu, cu, max_seqlen, max_seqlen, is_causal=True, smooth_k=False
+            q, k, v, cu, cu, max_seqlen, max_seqlen, is_causal=True, smooth_k=smooth_k
         )
 
     with torch.no_grad():

@@ -108,7 +108,8 @@ set(SAGE_SRC_BINDING
   csrc/sageattn/quant_cuda.cu)
 set(SAGE_SRC_FUSED
   csrc/fused/fused.cu
-  csrc/fused/quant_per_thread.cu)
+  csrc/fused/quant_per_thread.cu
+  csrc/fused/segment_mean.cu)
 # The varlen TU is the same kernel body under -DSAGE_VARLEN (set in the file
 # itself), so it belongs to the same gencode group as the dense one.
 set(SAGE_SRC_SM80 csrc/qattn/qk_int_sv_f16_cuda_sm80.cu)

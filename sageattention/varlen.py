@@ -20,7 +20,8 @@ Python side of the flash-attention style varlen layout: q/k/v flattened to
 ``cu_seqlens`` prefix sum of shape ``[batch_size + 1]`` (int32, on the same
 device). ``csrc/sageattn/varlen.h`` holds the matching kernel-side addressing.
 
-The smooth_k reductions are pure ATen and stay inside a ``fullgraph=True``
+The smooth_k mean is a custom op (``segment_mean_varlen``); the lse correction
+that consumes it stays pure ATen. Both live inside a ``fullgraph=True``
 region. The one thing that would break that is a shape derived from tensor
 *contents*, which is why ``repeat_interleave`` is always given
 ``output_size``: the caller already knows ``total_tokens`` as a static shape,
@@ -49,25 +50,21 @@ def _segment_ids(cu_seqlens: torch.Tensor, batch_size: int, total: int) -> torch
     )
 
 
-def _segment_mean(
-    x: torch.Tensor, cu_seqlens: torch.Tensor, batch_size: int, total: int
-) -> torch.Tensor:
+def _segment_mean(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
     """Per-sequence mean of a packed ``[total, heads, head_dim]`` tensor.
 
     Returns ``[batch_size, heads, head_dim]`` in ``x``'s dtype. This is the
-    varlen form of the dense ``k.mean(dim=seq_dim)`` smooth_k reduction, so it
+    varlen form of the dense ``k.mean(dim=seq_dim)`` smooth_k reduction: the op
     accumulates in float32 and casts once at the end. An empty sequence gets a
-    zero mean (the divisor is clamped, the accumulator stays untouched).
+    zero mean. ``max_seqlen`` sizes the grid only, exactly as it does for the
+    quantization ops.
 
-    ``index_add_`` uses atomics on CUDA, so the result is run-to-run
-    non-deterministic; the smooth_k path is compared with allclose, never with
-    ``torch.equal``.
+    The op reduces in a fixed order, so unlike the ATen composite it replaced
+    (``repeat_interleave`` segment ids + an atomic ``index_add_``) the result
+    is deterministic run to run. It is still not bit-identical to the dense
+    ``k.mean``, so the smooth_k path keeps comparing with allclose.
     """
-    seg_id = _segment_ids(cu_seqlens, batch_size, total)
-    acc = x.new_zeros((batch_size,) + x.shape[1:], dtype=torch.float32)
-    acc.index_add_(0, seg_id, x.float())
-    seg_len = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=1).to(torch.float32)
-    return (acc / seg_len.view(-1, *([1] * (x.dim() - 1)))).to(x.dtype)
+    return torch.ops.sageattention.segment_mean_varlen(x, cu_seqlens, max_seqlen=max_seqlen)
 
 
 def _segment_lse_correction(
@@ -251,15 +248,15 @@ def sageattn_varlen(
             f"this device resolves to {p.backend}"
         )
 
-    # batch_size and the totals are static shapes, so the traced graph never
-    # has to look inside cu_seqlens
+    # batch_size and total_q are static shapes, so the traced graph never has
+    # to look inside cu_seqlens
     batch_size = cu_seqlens_q.size(0) - 1
-    total_q, total_k = q.size(0), k.size(0)
+    total_q = q.size(0)
 
     km = None
     lse_correction = None
     if smooth_k:
-        km = _segment_mean(k, cu_seqlens_k, batch_size, total_k)
+        km = _segment_mean(k, cu_seqlens_k, max_seqlen_k)
         if return_lse:
             lse_correction = _segment_lse_correction(q, km, cu_seqlens_q, batch_size, total_q)
 

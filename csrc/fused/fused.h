@@ -52,6 +52,14 @@ void quant_per_warp_int8_cuda(torch::Tensor      input,
 
 void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output, int tensor_layout);
 
+// Per-sequence mean of a packed [total_tokens, heads, head_dim] input into a
+// [batch_size, heads, head_dim] mean of the same dtype (float32 accumulation,
+// one cast at the end, an empty sequence gets zeros): smooth_k's production
+// side, feeding the fuse_sub_mean launchers above. Unlike them this one is
+// varlen-only, so the QuantVarlen is not optional; its max_seqlen sizes the
+// grid exactly like theirs.
+void segment_mean_cuda(torch::Tensor input, torch::Tensor mean, const QuantVarlen& varlen);
+
 // The transposed-value family takes the same trailing QuantVarlen; it
 // additionally uses its pad_tokens (the padded V^T axis block size).
 // num_tokens is the dense sequence length and is unused when packed - the

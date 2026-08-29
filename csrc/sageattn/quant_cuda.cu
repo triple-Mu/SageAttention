@@ -226,6 +226,32 @@ quant_qk_varlen_cuda(const at::Tensor&                query,
     return {q_int8, q_scale, k_int8, k_scale};
 }
 
+// The key_mean the fuse_sub_mean branches above consume, computed per
+// sequence: the varlen form of the dense k.mean(dim=seq_dim). One kernel
+// (two for a multi-chunk max_seqlen) instead of the ATen composite that used
+// to build it - repeat_interleave segment ids plus a float32 index_add_ over
+// the whole packed tensor - whose atomics also made the result run-to-run
+// non-deterministic. This one reduces in a fixed order.
+at::Tensor segment_mean_varlen_cuda(const at::Tensor& input, const at::Tensor& cu_seqlens, c10::SymInt max_seqlen)
+{
+    const c10::cuda::CUDAGuard device_guard(input.device());
+    TORCH_CHECK(SAGEATTN_BUILD_VARLEN != 0, "sageattention was built without varlen support (SAGE_BUILD_VARLEN=OFF)");
+    TORCH_CHECK(input.dim() == 3, "packed input must be 3-D [total_tokens, heads, head_dim]");
+    check_cu_seqlens(cu_seqlens, input, "cu_seqlens");
+
+    const int64_t batch_size = cu_seqlens.size(0) - 1;
+    const int64_t max_len    = max_seqlen.guard_int(__FILE__, __LINE__);
+
+    // at::empty is enough: every (sequence, head, channel) is written, an
+    // empty sequence's entries included (they get zeros from a clamped
+    // divisor), so the op's output is run-to-run stable.
+    at::Tensor mean = at::empty({batch_size, input.size(1), input.size(2)}, input.options());
+
+    const QuantVarlen varlen{cu_seqlens.data_ptr<int32_t>(), batch_size, max_len};
+    segment_mean_cuda(input, mean, varlen);
+    return mean;
+}
+
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(const at::Tensor& value,
                                                                                c10::string_view  tensor_layout,
                                                                                c10::string_view  v_layout,
@@ -388,6 +414,10 @@ TORCH_LIBRARY_FRAGMENT(sageattention, m)
           "SymInt max_seqlen_k, str qk_quant_gran=\"per_thread\", "
           "int blk_q=128, int warp_q=32, int blk_k=64, int warp_k=64) "
           "-> (Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale)");
+    // The mean is [batch_size, heads, head_dim]: batch_size is a static shape
+    // (cu_seqlens.size(0) - 1), so the fake needs nothing from the contents,
+    // and max_seqlen again only sizes the grid.
+    m.def("segment_mean_varlen(Tensor input, Tensor cu_seqlens, *, SymInt max_seqlen) -> Tensor");
     m.def("quant_v_fp8(Tensor value, *, str tensor_layout=\"HND\", "
           "str v_layout=\"mma_k16\", float scale_max=448.0, bool smooth_v=False, "
           "int pad_multiple=64) -> (Tensor v_fp8, Tensor v_scale, Tensor? v_mean)");
@@ -406,6 +436,7 @@ TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
 {
     m.impl("quant_qk", TORCH_FN(sage::quant_qk_cuda));
     m.impl("quant_qk_varlen", TORCH_FN(sage::quant_qk_varlen_cuda));
+    m.impl("segment_mean_varlen", TORCH_FN(sage::segment_mean_varlen_cuda));
     m.impl("quant_v_fp8", TORCH_FN(sage::quant_v_fp8_cuda));
     m.impl("quant_v_fp8_varlen", TORCH_FN(sage::quant_v_fp8_varlen_cuda));
     m.impl("sub_mean_v", TORCH_FN(sage::sub_mean_v_cuda));

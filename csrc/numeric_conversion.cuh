@@ -75,9 +75,10 @@ __device__ __forceinline__ int8_t float_to_int8_rn(float x)
     return reinterpret_cast<const int8_t&>(dst);
 }
 // ---------------------------------------------------------------------------
-// fp_traits<T>::to_fp32: scalar fp16/bf16 -> fp32 conversion. Single home for
-// the dtype converters fused.cu and quant_per_thread.cu used to each carry
-// their own copy of; adapted from the user's CTI common.cuh.
+// fp_traits<T>: scalar fp16/bf16 <-> fp32 conversion. Single home for the
+// dtype converters fused.cu and quant_per_thread.cu used to each carry their
+// own copy of; adapted from the user's CTI common.cuh. from_fp32 rounds to
+// nearest even, same as a plain T(float) construction, but spells it out.
 // ---------------------------------------------------------------------------
 
 template<typename T>
@@ -89,6 +90,10 @@ struct fp_traits<half> {
     {
         return __half2float(v);
     }
+    static __device__ __forceinline__ half from_fp32(float v)
+    {
+        return __float2half_rn(v);
+    }
 };
 
 template<>
@@ -96,5 +101,9 @@ struct fp_traits<__nv_bfloat16> {
     static __device__ __forceinline__ float to_fp32(__nv_bfloat16 v)
     {
         return __bfloat162float(v);
+    }
+    static __device__ __forceinline__ __nv_bfloat16 from_fp32(float v)
+    {
+        return __float2bfloat16_rn(v);
     }
 };

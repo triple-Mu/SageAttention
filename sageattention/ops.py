@@ -202,6 +202,13 @@ def _quant_qk_varlen_fake(
     )
 
 
+def _segment_mean_varlen_fake(input, cu_seqlens, *, max_seqlen):
+    # [batch_size, heads, head_dim]: batch_size is cu_seqlens.size(0) - 1, a
+    # static shape. max_seqlen sizes the grid only, so it stays unread here.
+    b = cu_seqlens.size(0) - 1
+    return torch.empty((b, input.size(1), input.size(2)), dtype=input.dtype, device=input.device)
+
+
 def _quant_v_fp8_fake(
     value,
     *,
@@ -266,6 +273,7 @@ def _register() -> None:
     torch.library.register_fake("sageattention::fwd_varlen")(_fwd_varlen_fake)
     torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)
     torch.library.register_fake("sageattention::quant_qk_varlen")(_quant_qk_varlen_fake)
+    torch.library.register_fake("sageattention::segment_mean_varlen")(_segment_mean_varlen_fake)
     torch.library.register_fake("sageattention::quant_v_fp8")(_quant_v_fp8_fake)
     torch.library.register_fake("sageattention::quant_v_fp8_varlen")(_quant_v_fp8_varlen_fake)
     torch.library.register_fake("sageattention::sub_mean_v")(_sub_mean_v_fake)
