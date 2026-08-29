@@ -46,7 +46,8 @@ PyMODINIT_FUNC PyInit__C(void)
     if (PyModule_AddStringConstant(mod, "built_archs", SAGEATTN_BUILT_ARCHS_STR) != 0
         || PyModule_AddStringConstant(mod, "version", SAGEATTN_VERSION) != 0
         || PyModule_AddStringConstant(mod, "cuda_version", SAGEATTN_CUDA_VERSION) != 0
-        || PyModule_AddStringConstant(mod, "torch_version", SAGEATTN_TORCH_VERSION) != 0) {
+        || PyModule_AddStringConstant(mod, "torch_version", SAGEATTN_TORCH_VERSION) != 0
+        || PyModule_AddIntConstant(mod, "build_varlen", SAGEATTN_BUILD_VARLEN) != 0) {
         Py_DECREF(mod);
         return nullptr;
     }

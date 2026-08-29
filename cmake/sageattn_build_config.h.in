@@ -10,6 +10,12 @@
 #cmakedefine01 SAGEATTN_BUILD_SM100
 #cmakedefine01 SAGEATTN_BUILD_SM120
 
+// Whether the varlen (packed [total_tokens, heads, head_dim]) kernel TUs were
+// compiled (CMake -DSAGE_BUILD_VARLEN=OFF drops them). The varlen ops are
+// always registered, so a build without them fails with a message instead of
+// with a missing operator.
+#cmakedefine01 SAGEATTN_BUILD_VARLEN
+
 // Arithmetic opt-ins (CMake -DSAGE_OPT_*=ON). 0 is the reference arithmetic the
 // bit-exact golden dumps were taken with. The recorded names deliberately differ
 // from the SAGE_OPT_* compile definitions the kernels guard on, so including this

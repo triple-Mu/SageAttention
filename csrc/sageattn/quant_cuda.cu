@@ -30,6 +30,7 @@
 
 #include "../fused/fused.h"
 #include "config.h"
+#include "sageattn_build_config.h"
 #include "varlen.h"
 #include "varlen_check.h"
 
@@ -140,7 +141,11 @@ quant_qk_varlen_cuda(const at::Tensor&                query,
                      int64_t                          warp_k)
 {
     const c10::cuda::CUDAGuard device_guard(query.device());
-    const QuantGran            gran = parse_quant_gran(qk_quant_gran);
+    // The quantization kernels themselves are always compiled (dense and
+    // varlen share them); refusing here keeps SAGE_BUILD_VARLEN=OFF from
+    // offering half a pipeline.
+    TORCH_CHECK(SAGEATTN_BUILD_VARLEN != 0, "sageattention was built without varlen support (SAGE_BUILD_VARLEN=OFF)");
+    const QuantGran gran = parse_quant_gran(qk_quant_gran);
     TORCH_CHECK(gran == QuantGran::kPerWarp || gran == QuantGran::kPerThread,
                 "quant_qk_varlen supports per_warp / per_thread");
     TORCH_CHECK(query.dim() == 3 && key.dim() == 3, "packed query/key must be 3-D [total_tokens, heads, head_dim]");

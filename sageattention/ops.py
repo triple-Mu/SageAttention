@@ -96,6 +96,39 @@ def _fwd_fake(
     return out, lse
 
 
+def _fwd_varlen_fake(
+    query,
+    key,
+    value,
+    query_scale,
+    key_scale,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    value_scale=None,
+    value_mean=None,
+    *,
+    max_seqlen_q,
+    max_seqlen_k,
+    qk_quant_gran="per_thread",
+    pv_accum_dtype="fp32",
+    v_layout="mma_k16",
+    is_causal=False,
+    sm_scale=1.0,
+    return_lse=False,
+    out_dtype=torch.float16,
+):
+    # packed [total_tokens, heads, head_dim]; the lse is head-major over the
+    # same packed token axis. max_seqlen_* are never read: they size grid.x
+    # only, which is what keeps them out of the traced shape environment.
+    out = torch.empty(query.shape, dtype=out_dtype, device=query.device)
+    if not return_lse:
+        return out, None
+    lse = torch.empty(
+        (query.size(1), query.size(0)), dtype=torch.float32, device=query.device
+    )
+    return out, lse
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b  # SymInt-friendly (no float round trip)
 
@@ -208,6 +241,7 @@ def _register() -> None:
             continue
         torch.library.register_fake(f"sageattention::{name}")(_qattn_fake)
     torch.library.register_fake("sageattention::fwd")(_fwd_fake)
+    torch.library.register_fake("sageattention::fwd_varlen")(_fwd_varlen_fake)
     torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)
     torch.library.register_fake("sageattention::quant_qk_varlen")(_quant_qk_varlen_fake)
     torch.library.register_fake("sageattention::quant_v_fp8")(_quant_v_fp8_fake)

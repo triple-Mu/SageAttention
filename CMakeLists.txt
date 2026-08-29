@@ -40,6 +40,26 @@ set(CMAKE_INSTALL_RPATH "")
 
 option(SAGE_PTXAS_VERBOSE "Pass -Xptxas=-v (per-kernel register/smem report)" OFF)
 option(SAGE_LINEINFO "Pass -lineinfo for ncu source correlation" OFF)
+option(SAGE_BUILD_VARLEN "Build the varlen (packed cu_seqlens layout) kernel TUs" ON)
+option(SAGE_CCACHE "Launch the compilers through ccache when one is installed" ON)
+
+# ccache halves a rebuild of this tree and is bit-exact by construction (a hit
+# replays the cached object), so the SASS gate still compares what it did
+# before - as long as both sides of a comparison are configured the same way.
+# An explicitly set launcher always wins.
+if(SAGE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    foreach(_sage_lang C CXX CUDA)
+      if(NOT CMAKE_${_sage_lang}_COMPILER_LAUNCHER)
+        set(CMAKE_${_sage_lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+      endif()
+    endforeach()
+    message(STATUS "[sageattention] ccache: ${CCACHE_PROGRAM}")
+  else()
+    message(STATUS "[sageattention] ccache: not found, compiling directly")
+  endif()
+endif()
 
 # Arithmetic opt-ins. Each one perturbs kernel results (never the API), so they
 # default OFF and the reference build stays bit-exact; turn one on only with
@@ -84,11 +104,21 @@ set(SAGE_SRC_BINDING
   csrc/sageattn/ops.cpp
   csrc/sageattn/plan.cpp
   csrc/sageattn/fwd_cuda.cu
+  csrc/sageattn/fwd_varlen_cuda.cu
   csrc/sageattn/quant_cuda.cu)
 set(SAGE_SRC_FUSED
   csrc/fused/fused.cu
   csrc/fused/quant_per_thread.cu)
+# The varlen TU is the same kernel body under -DSAGE_VARLEN (set in the file
+# itself), so it belongs to the same gencode group as the dense one.
 set(SAGE_SRC_SM80 csrc/qattn/qk_int_sv_f16_cuda_sm80.cu)
+if(SAGE_BUILD_VARLEN)
+  list(APPEND SAGE_SRC_SM80 csrc/qattn/qk_int_sv_f16_cuda_sm80_varlen.cu)
+  set(SAGEATTN_BUILD_VARLEN 1)
+else()
+  set(SAGEATTN_BUILD_VARLEN 0)
+  message(STATUS "[sageattention] varlen kernels disabled (SAGE_BUILD_VARLEN=OFF)")
+endif()
 set(SAGE_SRC_SM90 csrc/qattn/qk_int_sv_f8_cuda_sm90.cu)
 set(SAGE_SRC_SM100 csrc/qattn/qk_int_sv_f8_cuda_sm100.cu)
 # The sm89 template TUs are compiled twice (OBJECT libraries below): once as

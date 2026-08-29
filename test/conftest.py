@@ -49,6 +49,13 @@ def requires_backend(name):
 
 requires_cuda = pytest.mark.skipif(not CUDA_AVAILABLE, reason="needs CUDA")
 
+# -DSAGE_BUILD_VARLEN=OFF drops the packed-layout kernel TUs; the ops stay
+# registered and raise, so their tests skip rather than fail.
+BUILD_VARLEN = bool(getattr(sageattention._C, "build_varlen", 0))
+requires_varlen = pytest.mark.skipif(
+    not BUILD_VARLEN, reason="built with SAGE_BUILD_VARLEN=OFF"
+)
+
 # The fp8 quantization kernels emit `cvt.rn.satfinite.e4m3x2.f32`, which only
 # exists on sm_89+; below that the device code falls into RUNTIME_ASSERT ->
 # __brkpt(), which kills the CUDA context rather than raising.

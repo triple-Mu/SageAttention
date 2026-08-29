@@ -16,13 +16,21 @@ import pytest
 import torch
 from torch.library import opcheck
 
-from conftest import requires_backend
+from conftest import cos_sim, rel_l1, requires_backend, requires_varlen
 
 DEV = "cuda"
 OPS = torch.ops.sageattention
+pytestmark = requires_varlen
 
 # sm80 quantization tile geometry (plan.cpp fill_tiles)
 BLKQ, WARPQ, BLKK, WARPK = 128, 32, 64, 64
+
+# the sageattn accuracy gates (test_accuracy.py)
+COS_MIN = 0.99
+REL_L1_MAX = 0.06
+
+# the kernels return the lse in base 2; core.py divides by this same literal
+LOG2E = 1.44269504
 
 
 def blk_offset(cu, b, cta_tokens):
@@ -47,6 +55,12 @@ def pack(dense, lens, layout="HND"):
     if layout == "HND":
         dense = dense.transpose(1, 2)  # [B, N, H, D]
     return torch.cat([dense[b, : lens[b]] for b in range(len(lens))], dim=0).contiguous()
+
+
+def unpack_lse(lse, lens):
+    """[heads, total] -> [batch, heads, n] for an equal-length batch."""
+    h, total = lse.shape
+    return lse.view(h, len(lens), lens[0]).transpose(0, 1).contiguous()
 
 
 def rand_qkv(b, h_qo, h_kv, n, head_dim, layout="HND", seed=0, dtype=torch.float16):
@@ -227,3 +241,273 @@ def test_quant_qk_varlen_empty_sequence():
         )
         base = blk_offset(cu_list, seq, BLKK) * 4
         assert torch.equal(got[3][:, base : base + 4], ref[3][0, :, :4])
+
+
+# ------------------------------------------------------------- fwd_varlen
+
+GEOM = dict(blk_q=BLKQ, warp_q=WARPQ, blk_k=BLKK, warp_k=WARPK)
+
+
+def quant_varlen(q, k, cu_q, cu_k, gran, key_mean=None):
+    return OPS.quant_qk_varlen(
+        q,
+        k,
+        cu_q,
+        cu_k,
+        key_mean,
+        max_seqlen_q=seg_max(cu_q),
+        max_seqlen_k=seg_max(cu_k),
+        qk_quant_gran=gran,
+        **GEOM,
+    )
+
+
+def seg_max(cu):
+    cu = cu.tolist() if torch.is_tensor(cu) else cu
+    return max(cu[i + 1] - cu[i] for i in range(len(cu) - 1))
+
+
+def fwd_varlen(q_int8, k_int8, v, q_scale, k_scale, cu_q, cu_k, causal, gran, lse=False):
+    return OPS.fwd_varlen(
+        q_int8,
+        k_int8,
+        v.to(torch.float16),
+        q_scale,
+        k_scale,
+        cu_q,
+        cu_k,
+        None,
+        None,
+        max_seqlen_q=seg_max(cu_q),
+        max_seqlen_k=seg_max(cu_k),
+        qk_quant_gran=gran,
+        pv_accum_dtype="fp32",
+        v_layout="seq",
+        is_causal=causal,
+        sm_scale=q_int8.size(-1) ** -0.5,
+        return_lse=lse,
+        out_dtype=torch.float16,
+    )
+
+
+def fwd_dense(q_int8, k_int8, v, q_scale, k_scale, causal, gran, lse=False):
+    return OPS.fwd(
+        q_int8,
+        k_int8,
+        v.to(torch.float16),
+        q_scale,
+        k_scale,
+        None,
+        None,
+        tensor_layout="HND",
+        qk_quant_gran=gran,
+        pv_accum_dtype="fp32",
+        v_layout="seq",
+        is_causal=causal,
+        sm_scale=q_int8.size(-1) ** -0.5,
+        return_lse=lse,
+        out_dtype=torch.float16,
+    )
+
+
+FWD_SHAPES = [
+    # (batch, qo heads, kv heads, seq len)
+    (1, 2, 2, 128),
+    (2, 4, 2, 256),  # GQA
+    (3, 2, 2, 100),  # not a multiple of CTA_Q or CTA_K
+    (2, 1, 1, 577),
+]
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("b,h_qo,h_kv,n", FWD_SHAPES, ids=lambda p: str(p))
+def test_fwd_varlen_equals_dense(causal, gran, head_dim, b, h_qo, h_kv, n):
+    """An equal-length batch has delta == 0, where bottom-right causal is the
+    dense top-left one and the varlen tile structure degenerates to the dense
+    one. Both outputs must therefore be bit-identical."""
+    q, k, v = rand_qkv(b, h_qo, h_kv, n, head_dim, seed=(b * 977 + n) % 2**31)
+    lens = [n] * b
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+
+    dq, dqs, dk, dks = OPS.quant_qk(q, k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM)
+    out_d, lse_d = fwd_dense(dq, dk, v, dqs, dks, causal, gran, lse=True)
+
+    pq, pqs, pk, pks = quant_varlen(pack(q, lens), pack(k, lens), cu, cu, gran)
+    out_v, lse_v = fwd_varlen(pq, pk, pack(v, lens), pqs, pks, cu, cu, causal, gran, lse=True)
+
+    assert torch.equal(out_v, pack(out_d, lens)), "out"
+    assert torch.equal(unpack_lse(lse_v, lens), lse_d), "lse"
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fwd_varlen_ragged_equals_per_sequence_dense(gran, head_dim):
+    """Ragged, non-causal: each sequence must come out exactly as a batch-of-one
+    dense run of itself, including sequences whose q and kv lengths differ."""
+    q_lens = [37, 128, 300, 1]
+    k_lens = [200, 128, 64, 999]
+    cu_q = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(cu_of(k_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(17)
+    heads = 2
+    q = torch.randn((sum(q_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, gran)
+    out_v, lse_v = fwd_varlen(pq, pk, v, pqs, pks, cu_q, cu_k, False, gran, lse=True)
+
+    cq, ck = cu_of(q_lens), cu_of(k_lens)
+    for b in range(len(q_lens)):
+        one_q = q[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_k = k[ck[b] : ck[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_v = v[ck[b] : ck[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        dq, dqs, dk, dks = OPS.quant_qk(
+            one_q, one_k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM
+        )
+        out_d, lse_d = fwd_dense(dq, dk, one_v, dqs, dks, False, gran, lse=True)
+        got = out_v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0)
+        assert torch.equal(got, out_d), f"out sequence {b}"
+        assert torch.equal(lse_v[:, cq[b] : cq[b + 1]].unsqueeze(0), lse_d), f"lse sequence {b}"
+
+
+# --------------------------------------------- bottom-right causal (delta != 0)
+
+
+def sdpa_varlen_ref(q, k, v, cu_q, cu_k, is_causal, sm_scale):
+    """Per-sequence fp32 attention over packed inputs, with flash-attention's
+    bottom-right causal alignment: row r of a sequence attends to keys up to
+    r + (kv_len - qo_len). A row that admits no key gets a zero output and an
+    lse of -inf, which is what the kernel is required to write."""
+    out = torch.zeros_like(q, dtype=torch.float32)
+    lse = torch.full((q.size(1), q.size(0)), float("-inf"), device=q.device, dtype=torch.float32)
+    for b in range(len(cu_q) - 1):
+        qs, qe, ks, ke = cu_q[b], cu_q[b + 1], cu_k[b], cu_k[b + 1]
+        if qe == qs or ke == ks:
+            continue
+        qb = q[qs:qe].transpose(0, 1).float()  # [heads, n_q, head_dim]
+        kb = k[ks:ke].transpose(0, 1).float()
+        vb = v[ks:ke].transpose(0, 1).float()
+        if qb.size(0) != kb.size(0):
+            rep = qb.size(0) // kb.size(0)
+            kb, vb = kb.repeat_interleave(rep, 0), vb.repeat_interleave(rep, 0)
+        s = torch.matmul(qb, kb.transpose(-1, -2)) * sm_scale
+        if is_causal:
+            n_q, n_k = s.size(-2), s.size(-1)
+            keep = torch.ones(n_q, n_k, dtype=torch.bool, device=s.device).tril(diagonal=n_k - n_q)
+            s = s.masked_fill(~keep, float("-inf"))
+        p = torch.nan_to_num(torch.softmax(s, dim=-1))  # all-masked rows -> 0
+        out[qs:qe] = torch.matmul(p, vb).transpose(0, 1)
+        lse[:, qs:qe] = torch.logsumexp(s, dim=-1)
+    return out, lse
+
+
+def sage_varlen_raw(q, k, v, cu_q, cu_k, causal, gran, lse=False):
+    """quant_qk_varlen + fwd_varlen, i.e. the kernel pipeline without the
+    Python-side smooth_k."""
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, gran)
+    return fwd_varlen(pq, pk, v, pqs, pks, cu_q, cu_k, causal, gran, lse=lse)
+
+
+# (q_lens, k_lens) -- every one has at least one sequence whose delta is not a
+# multiple of CTA_K, which is where the diagonal band crosses a third KV tile
+CAUSAL_RAGGED = [
+    ([100, 256, 37], [163, 256, 300]),  # delta = 63 / 0 / 263
+    ([300, 1], [300, 1]),  # delta = 0, ragged lengths
+    ([1000], [1]),  # delta = -999: most rows see no key
+    ([128, 64], [1000, 65]),  # delta = 872 / 1
+]
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("q_lens,k_lens", CAUSAL_RAGGED, ids=lambda p: "x".join(map(str, p)))
+def test_fwd_varlen_bottom_right_causal(gran, head_dim, q_lens, k_lens):
+    """delta = kv_len - qo_len is what the masked-tile arithmetic is derived
+    from; a tile left unmasked (or a trip count underflowed in unsigned) shows
+    up here as a broken row, not as noise."""
+    cu_q, cu_k = cu_of(q_lens), cu_of(k_lens)
+    g = torch.Generator(device=DEV).manual_seed(23)
+    heads = 2
+    q = torch.randn((cu_q[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((cu_k[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((cu_k[-1], heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    tq = torch.tensor(cu_q, device=DEV, dtype=torch.int32)
+    tk = torch.tensor(cu_k, device=DEV, dtype=torch.int32)
+
+    out, lse = sage_varlen_raw(q, k, v, tq, tk, True, gran, lse=True)
+    lse = lse / LOG2E  # the op returns log2; sageattn_varlen does this divide
+    ref, ref_lse = sdpa_varlen_ref(q, k, v, cu_q, cu_k, True, head_dim**-0.5)
+
+    cs, l1 = cos_sim(out, ref), rel_l1(out, ref)
+    assert cs > COS_MIN and l1 < REL_L1_MAX, f"cos_sim={cs:.5f} rel_l1={l1:.5f}"
+
+    # rows with no admissible key: exactly zero, lse exactly -inf
+    dead = torch.isinf(ref_lse) & (ref_lse < 0)
+    if dead.any():
+        assert torch.equal(lse[dead], ref_lse[dead]), "an all-masked row must carry -inf"
+        assert not out.transpose(0, 1)[dead].any(), "an all-masked row must be zero"
+    live = ~dead
+    torch.testing.assert_close(lse[live], ref_lse[live], rtol=2e-2, atol=5e-2)
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("causal", [False, True])
+def test_fwd_varlen_empty_kv_sequence(causal):
+    """A sequence with no keys at all: O is zero and lse is -inf, and its
+    neighbours are untouched."""
+    q_lens, k_lens = [64, 128, 32], [64, 0, 32]
+    cu_q, cu_k = cu_of(q_lens), cu_of(k_lens)
+    g = torch.Generator(device=DEV).manual_seed(29)
+    q = torch.randn((cu_q[-1], 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((max(cu_k[-1], 1), 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((max(cu_k[-1], 1), 2, 64), device=DEV, dtype=torch.float16, generator=g)
+    tq = torch.tensor(cu_q, device=DEV, dtype=torch.int32)
+    tk = torch.tensor(cu_k, device=DEV, dtype=torch.int32)
+
+    out, lse = sage_varlen_raw(
+        q, k[: cu_k[-1]], v[: cu_k[-1]], tq, tk, causal, "per_thread", lse=True
+    )
+    ref, _ = sdpa_varlen_ref(q, k, v, cu_q, cu_k, causal, 64**-0.5)
+
+    empty = slice(cu_q[1], cu_q[2])
+    assert not out[empty].any(), "the empty sequence must produce zeros"
+    assert torch.isinf(lse[:, empty]).all() and (lse[:, empty] < 0).all()
+    for other in (slice(0, cu_q[1]), slice(cu_q[2], cu_q[3])):
+        cs = cos_sim(out[other], ref[other])
+        assert cs > COS_MIN, f"neighbour cos_sim={cs:.5f}"
+
+
+@requires_backend("sm80")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_opcheck_fwd_varlen(causal, return_lse):
+    q_lens, k_lens = [37, 128, 300], [200, 128, 64]
+    cu_q = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(cu_of(k_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(31)
+    q = torch.randn((sum(q_lens), 2, 128), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), 2, 128), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), 2, 128), device=DEV, dtype=torch.float16, generator=g)
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, "per_thread")
+
+    opcheck(
+        OPS.fwd_varlen.default,
+        (pq, pk, v, pqs, pks, cu_q, cu_k, None, None),
+        dict(
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            qk_quant_gran="per_thread",
+            pv_accum_dtype="fp32",
+            v_layout="seq",
+            is_causal=causal,
+            sm_scale=128**-0.5,
+            return_lse=return_lse,
+            out_dtype=torch.float16,
+        ),
+    )

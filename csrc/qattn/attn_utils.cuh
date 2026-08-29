@@ -330,6 +330,37 @@ apply_causal_mask(const uint32_t& Q_idx_lane_base, const uint32_t& K_idx_lane_ba
     }
 }
 
+// apply_causal_mask with the row index already shifted by the bottom-right
+// alignment delta (kv_len - qo_len), which the varlen kernels fold into
+// Q_idx_lane_base. delta can be negative, so the row index is signed and so is
+// the comparison: an unsigned one would wrap a negative row bound into a huge
+// positive one and mask nothing exactly where everything should be masked.
+template<uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
+__device__ __forceinline__ void apply_causal_mask_bottom_right(const int32_t&  Q_idx_lane_base,
+                                                               const uint32_t& K_idx_lane_base,
+                                                               DTypeQKAccum    RS[][num_tiles_k][8])
+{
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+            for (uint32_t e = 0; e < 8; e++) {
+                const int32_t q_idx            = Q_idx_lane_base + static_cast<int32_t>(fq * 16 + 8 * ((e % 4) / 2));
+                const int32_t kv_idx           = static_cast<int32_t>(K_idx_lane_base + fk * 16 + 8 * (e / 4) + e % 2);
+                const bool    is_out_of_bounds = (kv_idx > q_idx);
+
+                if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+                    RS[fq][fk][e] = (is_out_of_bounds ? -5000000.0f : RS[fq][fk][e]);
+                }
+                else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
+                    RS[fq][fk][e] = (is_out_of_bounds ? __float2half_rn(-50000.0f) : RS[fq][fk][e]);
+                }
+            }
+        }
+    }
+}
+
 template<uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
 __device__ __forceinline__ void
 apply_out_of_bounds_mask(const uint32_t& K_idx_lane_base, DTypeQKAccum RS[][num_tiles_k][8], const uint32_t& kv_len)

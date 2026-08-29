@@ -16,6 +16,8 @@
 
 #pragma once
 #include "../sageattn/launch_helpers.cuh"
+#include "../sageattn/varlen.h"
+#include "../sageattn/varlen_check.h"
 #include "../utils.cuh"
 
 // Shared tensor-check / layout prelude for the qk_int* attention launchers.
@@ -329,6 +331,141 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
     return layout;
 }
 
+// ------------------------------------------------------------------ varlen
+// The packed [total_tokens, heads, head_dim] counterpart of the above. It is a
+// separate parse rather than a flag on qkv_layout_parse: the ranks differ, the
+// scale tensors lose their batch dimension, and the dense error strings are
+// pinned by tests. Only the fp16 (seq-major value) family exists so far - the
+// transposed-value families get their value branch with their varlen TUs.
+struct QKVVarlenLayout {
+    int64_t       batch_size;
+    int64_t       head_dim;
+    int64_t       total_q, total_k;
+    int64_t       max_seqlen_q, max_seqlen_k;
+    int64_t       num_qo_heads, num_kv_heads, qo_per_kv_head;
+    int64_t       stride_seq_q, stride_h_q;
+    int64_t       stride_seq_k, stride_h_k;
+    int64_t       stride_seq_v, stride_h_v;
+    int64_t       stride_seq_o, stride_h_o;
+    int64_t       q_scale_stride_h, k_scale_stride_h;
+    torch::Tensor lse;  // empty unless return_lse
+};
+
+inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
+                                               const torch::Tensor& key,
+                                               const torch::Tensor& value,
+                                               const torch::Tensor& output,
+                                               const torch::Tensor& query_scale,
+                                               const torch::Tensor& key_scale,
+                                               const torch::Tensor& cu_seqlens_q,
+                                               const torch::Tensor& cu_seqlens_k,
+                                               int64_t              max_seqlen_q,
+                                               int64_t              max_seqlen_k,
+                                               int                  return_lse)
+{
+    CHECK_CUDA(query);
+    CHECK_CUDA(key);
+    CHECK_CUDA(value);
+    CHECK_CUDA(output);
+    CHECK_CUDA(query_scale);
+    CHECK_CUDA(key_scale);
+
+    CHECK_CONTIGUOUS(query);
+    CHECK_CONTIGUOUS(key);
+    CHECK_LASTDIM_CONTIGUOUS(value);
+    CHECK_LASTDIM_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(query_scale);
+    CHECK_CONTIGUOUS(key_scale);
+
+    CHECK_DTYPE(query, torch::kInt8);
+    CHECK_DTYPE(key, torch::kInt8);
+    CHECK_DTYPE(value, torch::kHalf);
+    CHECK_DTYPE(query_scale, torch::kFloat32);
+    CHECK_DTYPE(key_scale, torch::kFloat32);
+
+    CHECK_DIMS(query, 3);
+    CHECK_DIMS(key, 3);
+    CHECK_DIMS(value, 3);
+    CHECK_DIMS(output, 3);
+    CHECK_DIMS(query_scale, 2);
+    CHECK_DIMS(key_scale, 2);
+
+    sage::check_cu_seqlens(cu_seqlens_q, query, "cu_seqlens_q");
+    sage::check_cu_seqlens(cu_seqlens_k, key, "cu_seqlens_k");
+    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_k.size(0),
+                "cu_seqlens_q and cu_seqlens_k must describe the same batch, got lengths ",
+                cu_seqlens_q.size(0),
+                " and ",
+                cu_seqlens_k.size(0));
+
+    QKVVarlenLayout layout;
+    layout.batch_size   = cu_seqlens_q.size(0) - 1;
+    layout.head_dim     = query.size(2);
+    layout.total_q      = query.size(0);
+    layout.total_k      = key.size(0);
+    layout.max_seqlen_q = max_seqlen_q;
+    layout.max_seqlen_k = max_seqlen_k;
+    layout.num_qo_heads = query.size(1);
+    layout.num_kv_heads = key.size(1);
+
+    const int64_t total_q      = layout.total_q;
+    const int64_t total_k      = layout.total_k;
+    const int64_t head_dim     = layout.head_dim;
+    const int64_t num_qo_heads = layout.num_qo_heads;
+    const int64_t num_kv_heads = layout.num_kv_heads;
+
+    CHECK_SHAPE(key, total_k, num_kv_heads, head_dim);
+    CHECK_SHAPE(value, total_k, num_kv_heads, head_dim);
+    CHECK_SHAPE(output, total_q, num_qo_heads, head_dim);
+
+    TORCH_CHECK_VALUE(num_qo_heads % num_kv_heads == 0,
+                      "num_qo_heads (",
+                      num_qo_heads,
+                      ") must be divisible by num_kv_heads (",
+                      num_kv_heads,
+                      ")");
+    layout.qo_per_kv_head = num_qo_heads / num_kv_heads;
+
+    layout.stride_seq_q = query.stride(0);
+    layout.stride_h_q   = query.stride(1);
+    layout.stride_seq_k = key.stride(0);
+    layout.stride_h_k   = key.stride(1);
+    layout.stride_seq_v = value.stride(0);
+    layout.stride_h_v   = value.stride(1);
+    layout.stride_seq_o = output.stride(0);
+    layout.stride_h_o   = output.stride(1);
+
+    TORCH_CHECK(query_scale.size(0) == num_qo_heads,
+                "query_scale must be [num_qo_heads, blocks], got dim 0 = ",
+                query_scale.size(0));
+    TORCH_CHECK(
+        key_scale.size(0) == num_kv_heads, "key_scale must be [num_kv_heads, blocks], got dim 0 = ", key_scale.size(0));
+    layout.q_scale_stride_h = query_scale.stride(0);
+    layout.k_scale_stride_h = key_scale.stride(0);
+
+    // Same width contract as the dense parse; total_tokens is the quantity
+    // that has to fit in int32 here, since it is what the kernels index with.
+    CHECK_LEN_I32(total_q, total_q);
+    CHECK_LEN_I32(total_k, total_k);
+    CHECK_LEN_I32(max_seqlen_q, max_seqlen_q);
+    CHECK_LEN_I32(max_seqlen_k, max_seqlen_k);
+    CHECK_STRIDE_LOOP32(query, layout.stride_seq_q);
+    CHECK_STRIDE_LOOP32(key, layout.stride_seq_k);
+    CHECK_STRIDE_LOOP32(value, layout.stride_seq_v);
+    CHECK_STRIDE_LOOP32(output, layout.stride_seq_o);
+    CHECK_STRIDE_LOOP32(query_scale, layout.q_scale_stride_h);
+    CHECK_STRIDE_LOOP32(key_scale, layout.k_scale_stride_h);
+
+    // head-major, one entry per packed token (documented on sageattn_varlen:
+    // this is not flash-attention's [total_q, heads])
+    layout.lse = torch::empty({0});
+    if (return_lse) {
+        layout.lse = torch::empty({num_qo_heads, total_q}, query.options().dtype(torch::kFloat32));
+    }
+
+    return layout;
+}
+
 // Rebind the parsed layout to the local names the DISPATCH bodies were
 // written against. CHECK_SHAPE stringifies its arguments into the error
 // message, so the spellings below must stay identical to the original
@@ -366,3 +503,28 @@ inline QKVLayout qkv_layout_parse(const torch::Tensor& query,
 #define SAGEATTN_QKV_LAYOUT_LOCALS_F16(L)                                                                              \
     SAGEATTN_QKV_LAYOUT_LOCALS_COMMON(L);                                                                              \
     const uint32_t stride_seq_v = static_cast<uint32_t>((L).stride_seq_v)
+
+// The varlen counterpart. Same width contract: the per-head strides stay
+// 64-bit (used once for the base offset), the loop-carried token strides
+// re-narrow to uint32_t.
+#define SAGEATTN_QKV_VARLEN_LOCALS_F16(L)                                                                              \
+    const int64_t  batch_size       = (L).batch_size;                                                                  \
+    const int64_t  head_dim         = (L).head_dim;                                                                    \
+    const int64_t  total_q          = (L).total_q;                                                                     \
+    const int64_t  total_k          = (L).total_k;                                                                     \
+    const int64_t  max_seqlen_q     = (L).max_seqlen_q;                                                                \
+    const int64_t  max_seqlen_k     = (L).max_seqlen_k;                                                                \
+    const int64_t  num_qo_heads     = (L).num_qo_heads;                                                                \
+    const int64_t  num_kv_heads     = (L).num_kv_heads;                                                                \
+    const int64_t  qo_per_kv_head   = (L).qo_per_kv_head;                                                              \
+    const uint32_t stride_seq_q     = static_cast<uint32_t>((L).stride_seq_q);                                         \
+    const int64_t  stride_h_q       = (L).stride_h_q;                                                                  \
+    const uint32_t stride_seq_k     = static_cast<uint32_t>((L).stride_seq_k);                                         \
+    const int64_t  stride_h_k       = (L).stride_h_k;                                                                  \
+    const uint32_t stride_seq_v     = static_cast<uint32_t>((L).stride_seq_v);                                         \
+    const int64_t  stride_h_v       = (L).stride_h_v;                                                                  \
+    const uint32_t stride_seq_o     = static_cast<uint32_t>((L).stride_seq_o);                                         \
+    const int64_t  stride_h_o       = (L).stride_h_o;                                                                  \
+    const uint32_t q_scale_stride_h = static_cast<uint32_t>((L).q_scale_stride_h);                                     \
+    const uint32_t k_scale_stride_h = static_cast<uint32_t>((L).k_scale_stride_h);                                     \
+    torch::Tensor  lse              = (L).lse
