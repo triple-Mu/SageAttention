@@ -296,12 +296,19 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(c
         transpose_pad_cuda(value, value_t, layout_int);
     }
 
-    // zeros, not empty: the fp8 quant kernel writes tokens up to the 64-aligned
-    // bound only; for pad_multiple=128 the [64-aligned, 128-aligned) tail must
-    // still be valid fp8 (a NaN-encoded garbage byte would poison PV through
-    // 0 * NaN). Zero bytes are exactly what quantizing the zero-padded input
-    // produces, so this stays bit-identical to the old cat-then-quantize path.
-    at::Tensor v_fp8   = at::zeros(value_t.sizes(), value_t.options().dtype(at::kFloat8_e4m3fn));
+    // The fp8 quant kernel writes tokens up to the 64-aligned bound only. When
+    // the buffer runs past it (pad_multiple=128 and a kv_len whose 128-aligned
+    // bound is larger) that tail must still be valid fp8 -- a NaN-encoded
+    // garbage byte would poison PV through 0 * NaN -- so it is zero-filled
+    // first; zero bytes are exactly what quantizing the zero-padded input
+    // produces, which is what keeps this bit-identical to the old
+    // cat-then-quantize path. When the two bounds coincide the kernel covers
+    // every byte and the fill is pure bandwidth: that is every sm89/sm120 call
+    // (pad_multiple=64) plus any already 128-aligned kv_len.
+    const bool fill_covered_by_quant = padded_kv_len == at::round_up<int64_t>(kv_len, 64);
+    const auto v_fp8_options         = value_t.options().dtype(at::kFloat8_e4m3fn);
+    at::Tensor v_fp8 =
+        fill_covered_by_quant ? at::empty(value_t.sizes(), v_fp8_options) : at::zeros(value_t.sizes(), v_fp8_options);
     at::Tensor v_scale = at::empty({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
 
     if (smooth_v) {
