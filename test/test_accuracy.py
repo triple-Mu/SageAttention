@@ -1,18 +1,63 @@
 """Numerical accuracy of sageattn against an fp32 SDPA math reference.
 
 Quantized attention is lossy by construction, so the gates are the ones the
-SageAttention papers report: cosine similarity and relative L1 error.
+SageAttention papers report: cosine similarity and relative L1 error. The
+sweep runs on whatever backend this device resolves to, over the
+pv_accum_dtype values that backend accepts (plan.cpp `pv_supported`).
 """
 
 import pytest
 import torch
 
-from conftest import cos_sim, ref_scores, rel_l1, requires_backend, sdpa_ref
+from conftest import (
+    RESOLVED_BACKEND,
+    backend_available,
+    cos_sim,
+    ref_scores,
+    rel_l1,
+    sdpa_ref,
+)
 from sageattention import sageattn
 
 DEV = "cuda"
-pytestmark = requires_backend("sm80")
 
+# The backend this run exercises: whatever the device resolves to, provided it
+# is compiled in. None skips the whole module (CPU box, or a build/device
+# mismatch that resolves to nothing).
+BACKEND = (
+    RESOLVED_BACKEND
+    if RESOLVED_BACKEND is not None and backend_available(RESOLVED_BACKEND)
+    else None
+)
+pytestmark = pytest.mark.skipif(
+    BACKEND is None,
+    reason=f"no runnable backend here (resolved={RESOLVED_BACKEND})",
+)
+
+# pv_accum_dtype values each backend accepts, and the one accumulator whose
+# smooth_v variant is fused into a kernel. Both mirror csrc/sageattn/plan.cpp
+# (`pv_supported` / `smooth_v_supported`; sm90 and sm100 have no fused
+# smooth_v kernel).
+PV_COMBOS = {
+    "sm80": ("fp32", "fp16", "fp16+fp32"),
+    "sm89": ("fp32", "fp32+fp32", "fp32+fp16"),
+    "sm90": ("fp32+fp32",),
+    "sm100": ("fp32",),
+    "sm120": ("fp32", "fp32+fp16"),
+}
+SMOOTH_V_PV = {"sm80": "fp16", "sm89": "fp32", "sm120": "fp32"}
+
+# On a box with no runnable backend everything is skipped anyway; fall back to
+# the sm80 lists so parameterized tests still collect.
+_PVS = PV_COMBOS[BACKEND or "sm80"]
+_SMOOTH_V_PV = SMOOTH_V_PV.get(BACKEND or "sm80")
+
+# One gate for every backend. Measured worst cases over this sweep
+# (2026-08-29): sm80 cos 0.99992 / rel_l1 0.013; the fp8-PV backends are
+# lossier at cos 0.99926 / rel_l1 0.039 (sm90 on H200, sm120 on RTX PRO 6000,
+# every legal pv_accum_dtype) but still clear the same gate. sm89/sm100 are
+# unmeasured (no hardware yet, see HARDWARE_CHECKLIST.md); their kernels
+# share the sm120/sm90 quantization structure.
 COS_MIN = 0.99
 REL_L1_MAX = 0.06
 
@@ -59,9 +104,9 @@ def _check(out, ref, tag=""):
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
-@pytest.mark.parametrize("pv", ["fp32", "fp16", "fp16+fp32"])
+@pytest.mark.parametrize("pv", _PVS)
 @pytest.mark.parametrize("smooth_k", [True, False])
-def test_accuracy_sm80(layout, is_causal, head_dim, gran, pv, smooth_k):
+def test_accuracy_pv_sweep(layout, is_causal, head_dim, gran, pv, smooth_k):
     q, k, v = _qkv(head_dim=head_dim, layout=layout)
     with torch.no_grad():
         out = sageattn(
@@ -78,11 +123,15 @@ def test_accuracy_sm80(layout, is_causal, head_dim, gran, pv, smooth_k):
     _check(out, ref, f"{layout}/{head_dim}/{gran}/{pv}/smooth_k={smooth_k}")
 
 
+@pytest.mark.skipif(
+    BACKEND is not None and _SMOOTH_V_PV is None,
+    reason=f"{BACKEND} has no fused smooth_v kernel",
+)
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("smooth_k", [True, False])
 def test_accuracy_smooth_v(layout, is_causal, smooth_k):
-    """smooth_v is only fused on sm80 for the pure-fp16 accumulator."""
+    """smooth_v is only fused for one accumulator per backend (SMOOTH_V_PV)."""
     q, k, v = _qkv(layout=layout)
     with torch.no_grad():
         out = sageattn(
@@ -91,7 +140,7 @@ def test_accuracy_smooth_v(layout, is_causal, smooth_k):
             v,
             tensor_layout=layout,
             is_causal=is_causal,
-            pv_accum_dtype="fp16",
+            pv_accum_dtype=_SMOOTH_V_PV,
             smooth_v=True,
             smooth_k=smooth_k,
         )

@@ -37,7 +37,9 @@ max_seqlen 的 dense,同数据同 API,`--csv` 存表)。
 - [x] sm89(L20,sm_89,2026-08-29):`--dump`/`--check` 全绿,
       `ok=2004 diff=0 env_mismatch=0 missing=0`,equiv 345/345。A4-1 主循环
       合并(见 §3)与 `quant_v_fp8(pad_multiple)` 修复由 equiv 段覆盖。
-      数字见 §5d。
+      数字见 §5d。注:精度准入检查已按 backend 参数化(eb510e5),L20 那轮
+      跑在参数化之前——下次上 sm89 卡顺跑 `pytest test/test_accuracy.py`
+      补三个 pv_accum_dtype 的实测数值。
 - [x] sm89+ 任一实机(sm_120,2026-08-29):fp8 zero-amax 回归(`test_ops.py` 的
       `test_quant_v_fp8_zero_amax_channel` / `test_quant_v_fp8_subnormal_amax_channel`
       / `test_sageattn_zero_v_channel_fp8`,以及 `test_varlen.py` 的
@@ -57,7 +59,8 @@ max_seqlen 的 dense,同数据同 API,`--csv` 存表)。
 - [x] sm100(B200,2026-08-29):SS twin 与 TS 各对同一份 baseline golden
       `--check`,两轮都是 `ok=2280 diff=0`。tcgen05 kernel 第一次上真硬件就
       暴露了两个 launcher bug(都不在 kernel 里,见 §5f),修完才全绿。
-      数字见 §5f。
+      数字见 §5f。SDPA 精度 62/62 ×2 轮已实测;参数化后的
+      `test_accuracy.py` 全量数值下次上机顺跑。
 
 ## 1b. varlen(packed cu_seqlens 布局)
 
@@ -224,8 +227,14 @@ sm120,`requires_backend("sm80"/"sm89"/"sm90")` 一律跳过),外加
 - `test_accuracy.py` 整个文件是 `pytestmark = requires_backend("sm80")`,
   所以任何 fp8 卡上都不跑。临时去掉这一行在 sm_120 上跑,54 个用例过
   (cos_sim > 0.99、rel_l1 < 0.06),72 个报 `ValueError: pv_accum_dtype`
-  ——它们写死了 sm80 才有的 `"fp16"` / `"fp16+fp32"`。把 pv 按 backend 参数化
-  就能把这套精度门禁铺到 fp8 路径上。
+  ——它们写死了 sm80 才有的 `"fp16"` / `"fp16+fp32"`。
+  **已解决(2026-08-29)**:pv 按 resolve 到的 backend 参数化(合法集合镜像
+  plan.cpp 的 `pv_supported`/`smooth_v_supported`)。实跑:sm120 单文件
+  94 passed(全量 383 passed / 271 skipped),sm90(H200)54 passed /
+  8 skipped(skip 全是 smooth_v——sm90 无 fused smooth_v kernel),本机
+  sm86 全量 548 passed / 138 skipped 不变。实测最差:sm80 cos 0.99992 /
+  rel_l1 0.013,fp8(sm90、sm120 全部合法 pv)cos 0.99926 / rel_l1 0.039,
+  0.99/0.06 阈值对所有实测 backend 成立,数值不动。sm89/sm100 尚无实测数值(见 §1)。
 - 跑测试的容器里有 `pip install -e /workspace/SageAttention`,它的
   MetaPathFinder 排在 `sys.meta_path` 末尾:待测树里缺席的子模块会静默落到
   那个安装上(本轮就撞到 `sageattention._qattn_sm90`)。用 PYTHONPATH 指向
