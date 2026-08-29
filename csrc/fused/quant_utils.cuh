@@ -17,6 +17,7 @@
 #pragma once
 #include <torch/types.h>
 
+#include "../sageattn/varlen.h"
 #include "../utils.cuh"
 
 // Shared input/output/scale prelude for the int8 quantization launchers
@@ -35,6 +36,21 @@ struct QuantLayout {
     int64_t num_heads;
     int64_t stride_batch_input, stride_seq_input, stride_h_input;
     int64_t stride_batch_output, stride_seq_output, stride_h_output;
+};
+
+// The packed [total_tokens, heads, head_dim] varlen layout, passed to the
+// quantization launchers as a trailing argument. A null cu_seqlens means
+// dense, and every launcher then behaves exactly as it did before varlen
+// existed (FA2 passes its varlen pointers the same way).
+//
+// The kernels are shared, not duplicated: the sequence's tokens are addressed
+// relative to its own start, so an equal-length batch quantizes to bit-identical
+// output either way. See csrc/sageattn/varlen.h for the addressing.
+struct QuantVarlen {
+    const int32_t* cu_seqlens = nullptr;  // [batch_size + 1] int32, device
+    int64_t        batch_size = 0;
+    int64_t        max_seqlen = 0;  // grid.x is opened to this and blocks past
+                                    // their own sequence exit immediately
 };
 
 // The CHECK_* sequence and tensor_layout-dependent sizes/strides common to
@@ -105,6 +121,51 @@ inline QuantLayout parse_quant_layout(const torch::Tensor& input,
     return l;
 }
 
+// parse_quant_layout's varlen counterpart. The packed tensors are 3-D, so the
+// batch stride is 0 and blockIdx.z indexes cu_seqlens; num_tokens carries
+// max_seqlen, which sizes grid.x only (the kernel reads the sequence's own
+// length out of cu_seqlens).
+inline QuantLayout parse_quant_varlen_layout(const torch::Tensor& input,
+                                             const torch::Tensor& output,
+                                             const torch::Tensor& scale,
+                                             const QuantVarlen&   varlen)
+{
+    CHECK_CUDA(input);
+    CHECK_CUDA(output);
+    CHECK_CUDA(scale);
+
+    CHECK_DTYPE(output, torch::kInt8);
+    CHECK_DTYPE(scale, torch::kFloat);
+
+    CHECK_LASTDIM_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(scale);
+
+    CHECK_DIMS(input, 3);
+    CHECK_DIMS(output, 3);
+    CHECK_DIMS(scale, 2);
+    CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2));
+
+    QuantLayout l;
+    l.batch_size          = varlen.batch_size;
+    l.head_dim            = input.size(2);
+    l.num_tokens          = varlen.max_seqlen;
+    l.num_heads           = input.size(1);
+    l.stride_batch_input  = 0;
+    l.stride_seq_input    = input.stride(0);
+    l.stride_h_input      = input.stride(1);
+    l.stride_batch_output = 0;
+    l.stride_seq_output   = output.stride(0);
+    l.stride_h_output     = output.stride(1);
+
+    CHECK_LEN_I32(num_tokens, l.num_tokens);
+    CHECK_LEN_I32(total_tokens, input.size(0));
+    CHECK_STRIDE_LOOP32(input, l.stride_seq_input);
+    CHECK_STRIDE_LOOP32(output, l.stride_seq_output);
+
+    return l;
+}
+
 // Layout prelude for the transposed-value family ([B, H, D, padded_n] (HND) /
 // [B, D, H, padded_n] (NHD)): transpose_pad_v / scale_fuse_quant /
 // mean_scale_fuse_quant. Here the per-CTA loops advance along the padded
@@ -146,8 +207,15 @@ inline VTLayout parse_vt_layout(const torch::Tensor& t, int tensor_layout)
 inline QuantLayout check_quant_layout(const torch::Tensor& input,
                                       const torch::Tensor& output,
                                       const torch::Tensor& scale,
-                                      int                  tensor_layout)
+                                      int                  tensor_layout,
+                                      const QuantVarlen&   varlen = {})
 {
+    if (varlen.cu_seqlens != nullptr) {
+        QuantLayout l = parse_quant_varlen_layout(input, output, scale, varlen);
+        TORCH_CHECK(l.head_dim % 32 == 0, "head_dim must be a multiple of 32");
+        return l;
+    }
+
     QuantLayout l = parse_quant_layout(input, output, scale, tensor_layout);
 
     CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
@@ -158,6 +226,13 @@ inline QuantLayout check_quant_layout(const torch::Tensor& input,
 // Rebind the parsed layout to the local names fused.cu's DISPATCH bodies were
 // written against (CHECK_SHAPE stringifies these spellings into its error
 // messages).
+// The scale tensor is [batch, heads, blocks] when dense and [heads, blocks]
+// when packed, and the kernels take its two strides; varlen therefore has no
+// batch stride and reads the head stride out of dim 0.
+#define SAGEATTN_QUANT_SCALE_STRIDES(scale, is_varlen)                                                                 \
+    const int64_t stride_batch_scale = (is_varlen) ? 0 : (scale).stride(0);                                            \
+    const int64_t stride_h_scale     = (is_varlen) ? (scale).stride(0) : (scale).stride(1)
+
 #define SAGEATTN_QUANT_LAYOUT_LOCALS(L)                                                                                \
     const int64_t  batch_size          = (L).batch_size;                                                               \
     const int64_t  head_dim            = (L).head_dim;                                                                 \

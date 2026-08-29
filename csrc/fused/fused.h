@@ -18,25 +18,37 @@
 
 #include <torch/types.h>
 
+#include "quant_utils.cuh"
+
+// The int8 launchers whose kernels the packed varlen layout shares take a
+// trailing QuantVarlen; a default-constructed one (null cu_seqlens) is the
+// dense behaviour, unchanged.
+
 void quant_per_block_int8_cuda(
     torch::Tensor input, torch::Tensor output, torch::Tensor scale, float sm_scale, int block_size, int tensor_layout);
 
-void quant_per_block_int8_cuda(
-    torch::Tensor input, torch::Tensor output, torch::Tensor scale, int block_size, int tensor_layout);
+void quant_per_block_int8_cuda(torch::Tensor      input,
+                               torch::Tensor      output,
+                               torch::Tensor      scale,
+                               int                block_size,
+                               int                tensor_layout,
+                               const QuantVarlen& varlen = {});
 
-void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor input,
-                                             torch::Tensor mean,
-                                             torch::Tensor output,
-                                             torch::Tensor scale,
-                                             int           block_size,
-                                             int           tensor_layout);
+void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor      input,
+                                             torch::Tensor      mean,
+                                             torch::Tensor      output,
+                                             torch::Tensor      scale,
+                                             int                block_size,
+                                             int                tensor_layout,
+                                             const QuantVarlen& varlen = {});
 
-void quant_per_warp_int8_cuda(torch::Tensor input,
-                              torch::Tensor output,
-                              torch::Tensor scale,
-                              int           block_size,
-                              int           warp_block_size,
-                              int           tensor_layout);
+void quant_per_warp_int8_cuda(torch::Tensor      input,
+                              torch::Tensor      output,
+                              torch::Tensor      scale,
+                              int                block_size,
+                              int                warp_block_size,
+                              int                tensor_layout,
+                              const QuantVarlen& varlen = {});
 
 void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output, int tensor_layout);
 
@@ -55,24 +67,27 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
                                 float         scale_max,
                                 int           tensor_layout);
 
-void quant_per_thread_int8_q_cuda(torch::Tensor input,
-                                  torch::Tensor output,
-                                  torch::Tensor scale,
-                                  int           block_size,
-                                  int           warp_block_size,
-                                  int           tensor_layout);
+void quant_per_thread_int8_q_cuda(torch::Tensor      input,
+                                  torch::Tensor      output,
+                                  torch::Tensor      scale,
+                                  int                block_size,
+                                  int                warp_block_size,
+                                  int                tensor_layout,
+                                  const QuantVarlen& varlen = {});
 
-void quant_per_thread_int8_k_cuda(torch::Tensor input,
-                                  torch::Tensor output,
-                                  torch::Tensor scale,
-                                  int           block_size,
-                                  int           warp_block_size,
-                                  int           tensor_layout);
+void quant_per_thread_int8_k_cuda(torch::Tensor      input,
+                                  torch::Tensor      output,
+                                  torch::Tensor      scale,
+                                  int                block_size,
+                                  int                warp_block_size,
+                                  int                tensor_layout,
+                                  const QuantVarlen& varlen = {});
 
-void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor input,
-                                                torch::Tensor mean,
-                                                torch::Tensor output,
-                                                torch::Tensor scale,
-                                                int           block_size,
-                                                int           warp_block_size,
-                                                int           tensor_layout);
+void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor      input,
+                                                torch::Tensor      mean,
+                                                torch::Tensor      output,
+                                                torch::Tensor      scale,
+                                                int                block_size,
+                                                int                warp_block_size,
+                                                int                tensor_layout,
+                                                const QuantVarlen& varlen = {});

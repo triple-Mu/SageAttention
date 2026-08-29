@@ -129,6 +129,46 @@ def _quant_qk_fake(
     )
 
 
+def _blk_total(total_tokens, batch_size, cta_tokens):
+    """csrc/sageattn/varlen.h blk_total: the packed block count of the whole
+    batch. It reads (total_tokens, batch_size) only -- both static shapes --
+    which is why no varlen fake kernel needs an unbacked SymInt."""
+    return total_tokens // cta_tokens + batch_size
+
+
+def _quant_qk_varlen_fake(
+    query,
+    key,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    key_mean=None,
+    *,
+    max_seqlen_q,
+    max_seqlen_k,
+    qk_quant_gran="per_thread",
+    blk_q=128,
+    warp_q=32,
+    blk_k=64,
+    warp_k=64,
+):
+    b = cu_seqlens_q.size(0) - 1
+    q_blocks = _blk_total(query.size(0), b, blk_q)
+    k_blocks = _blk_total(key.size(0), b, blk_k)
+    if qk_quant_gran == "per_warp":
+        qs = q_blocks * (blk_q // warp_q)
+        ks = k_blocks
+    else:
+        qs = q_blocks * (blk_q // warp_q) * 8
+        ks = k_blocks * (blk_k // warp_k) * 4
+    dev = query.device
+    return (
+        torch.empty(query.shape, dtype=torch.int8, device=dev),
+        torch.empty((query.size(1), qs), dtype=torch.float32, device=dev),
+        torch.empty(key.shape, dtype=torch.int8, device=dev),
+        torch.empty((key.size(1), ks), dtype=torch.float32, device=dev),
+    )
+
+
 def _quant_v_fp8_fake(
     value,
     *,
@@ -169,6 +209,7 @@ def _register() -> None:
         torch.library.register_fake(f"sageattention::{name}")(_qattn_fake)
     torch.library.register_fake("sageattention::fwd")(_fwd_fake)
     torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)
+    torch.library.register_fake("sageattention::quant_qk_varlen")(_quant_qk_varlen_fake)
     torch.library.register_fake("sageattention::quant_v_fp8")(_quant_v_fp8_fake)
     torch.library.register_fake("sageattention::sub_mean_v")(_sub_mean_v_fake)
 

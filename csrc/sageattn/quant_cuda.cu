@@ -30,6 +30,8 @@
 
 #include "../fused/fused.h"
 #include "config.h"
+#include "varlen.h"
+#include "varlen_check.h"
 
 namespace sage {
 namespace {
@@ -112,6 +114,108 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> quant_qk_cuda(const a
         else {
             quant_per_thread_int8_k_cuda(
                 key, k_int8, k_scale, static_cast<int>(blk_k), static_cast<int>(warp_k), layout_int);
+        }
+    }
+    return {q_int8, q_scale, k_int8, k_scale};
+}
+
+// quant_qk's packed [total_tokens, heads, head_dim] counterpart. The kernels
+// are the same ones (a null cu_seqlens is what makes them dense), so the only
+// thing that changes here is the addressing: no tensor_layout (packed 3-D has
+// one meaning, and a layout difference degenerates to a stride), the scale
+// tensors lose their batch dimension, and their length is the block algebra of
+// varlen.h rather than ceil_div over a single sequence length.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+quant_qk_varlen_cuda(const at::Tensor&                query,
+                     const at::Tensor&                key,
+                     const at::Tensor&                cu_seqlens_q,
+                     const at::Tensor&                cu_seqlens_k,
+                     const std::optional<at::Tensor>& key_mean,
+                     c10::SymInt                      max_seqlen_q,
+                     c10::SymInt                      max_seqlen_k,
+                     c10::string_view                 qk_quant_gran,
+                     int64_t                          blk_q,
+                     int64_t                          warp_q,
+                     int64_t                          blk_k,
+                     int64_t                          warp_k)
+{
+    const c10::cuda::CUDAGuard device_guard(query.device());
+    const QuantGran            gran = parse_quant_gran(qk_quant_gran);
+    TORCH_CHECK(gran == QuantGran::kPerWarp || gran == QuantGran::kPerThread,
+                "quant_qk_varlen supports per_warp / per_thread");
+    TORCH_CHECK(query.dim() == 3 && key.dim() == 3, "packed query/key must be 3-D [total_tokens, heads, head_dim]");
+    check_cu_seqlens(cu_seqlens_q, query, "cu_seqlens_q");
+    check_cu_seqlens(cu_seqlens_k, key, "cu_seqlens_k");
+    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_k.size(0),
+                "cu_seqlens_q and cu_seqlens_k must describe the same batch, got lengths ",
+                cu_seqlens_q.size(0),
+                " and ",
+                cu_seqlens_k.size(0));
+
+    const int64_t batch_size   = cu_seqlens_q.size(0) - 1;
+    const int64_t total_q      = query.size(0);
+    const int64_t total_k      = key.size(0);
+    const int64_t num_qo_heads = query.size(1);
+    const int64_t num_kv_heads = key.size(1);
+    const int64_t max_q        = max_seqlen_q.guard_int(__FILE__, __LINE__);
+    const int64_t max_k        = max_seqlen_k.guard_int(__FILE__, __LINE__);
+
+    const int64_t q_blocks = sage::blk_total(total_q, batch_size, blk_q);
+    const int64_t k_blocks = sage::blk_total(total_k, batch_size, blk_k);
+    int64_t       q_scale_len, k_scale_len;
+    if (gran == QuantGran::kPerWarp) {
+        q_scale_len = q_blocks * (blk_q / warp_q);
+        k_scale_len = k_blocks;
+    }
+    else {
+        q_scale_len = q_blocks * (blk_q / warp_q) * 8;
+        k_scale_len = k_blocks * (blk_k / warp_k) * 4;
+    }
+
+    at::Tensor q_int8 = at::empty(query.sizes(), query.options().dtype(at::kChar));
+    at::Tensor k_int8 = at::empty(key.sizes(), key.options().dtype(at::kChar));
+    // zeros, not empty: a sequence owns ceil(len / blk) + 1 blocks at most
+    // (varlen.h, Property 1), so up to one scale block per sequence is never
+    // written. The attention kernel does not read those, but leaving them
+    // uninitialized makes the op's output run-to-run unstable, which is a
+    // torch.compile correctness failure (opcheck's test_aot_dispatch_dynamic
+    // compares eager against traced values). The tensors are [heads, blocks].
+    at::Tensor q_scale = at::zeros({num_qo_heads, q_scale_len}, query.options().dtype(at::kFloat));
+    at::Tensor k_scale = at::zeros({num_kv_heads, k_scale_len}, key.options().dtype(at::kFloat));
+
+    const QuantVarlen varlen_q{cu_seqlens_q.data_ptr<int32_t>(), batch_size, max_q};
+    const QuantVarlen varlen_k{cu_seqlens_k.data_ptr<int32_t>(), batch_size, max_k};
+    // tensor_layout is unused on the varlen path (the strides carry the layout);
+    // pass the HND flag so the argument still has a legal value.
+    const int layout_int = static_cast<int>(TensorLayout::kHND);
+
+    if (gran == QuantGran::kPerWarp) {
+        quant_per_warp_int8_cuda(
+            query, q_int8, q_scale, static_cast<int>(blk_q), static_cast<int>(warp_q), layout_int, varlen_q);
+        if (key_mean.has_value()) {
+            quant_per_block_int8_fuse_sub_mean_cuda(
+                key, *key_mean, k_int8, k_scale, static_cast<int>(blk_k), layout_int, varlen_k);
+        }
+        else {
+            quant_per_block_int8_cuda(key, k_int8, k_scale, static_cast<int>(blk_k), layout_int, varlen_k);
+        }
+    }
+    else {
+        quant_per_thread_int8_q_cuda(
+            query, q_int8, q_scale, static_cast<int>(blk_q), static_cast<int>(warp_q), layout_int, varlen_q);
+        if (key_mean.has_value()) {
+            quant_per_thread_int8_k_fuse_sub_mean_cuda(key,
+                                                       *key_mean,
+                                                       k_int8,
+                                                       k_scale,
+                                                       static_cast<int>(blk_k),
+                                                       static_cast<int>(warp_k),
+                                                       layout_int,
+                                                       varlen_k);
+        }
+        else {
+            quant_per_thread_int8_k_cuda(
+                key, k_int8, k_scale, static_cast<int>(blk_k), static_cast<int>(warp_k), layout_int, varlen_k);
         }
     }
     return {q_int8, q_scale, k_int8, k_scale};
@@ -200,6 +304,14 @@ TORCH_LIBRARY_FRAGMENT(sageattention, m)
           "str tensor_layout=\"HND\", str qk_quant_gran=\"per_thread\", "
           "int blk_q=128, int warp_q=32, int blk_k=64, int warp_k=64) "
           "-> (Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale)");
+    // max_seqlen_* are SymInt on purpose: they only size grid.x and are absent
+    // from every output shape, so dynamo keeps them symbolic instead of
+    // specializing the graph on their value (one recompile per batch shape).
+    m.def("quant_qk_varlen(Tensor query, Tensor key, Tensor cu_seqlens_q, "
+          "Tensor cu_seqlens_k, Tensor? key_mean=None, *, SymInt max_seqlen_q, "
+          "SymInt max_seqlen_k, str qk_quant_gran=\"per_thread\", "
+          "int blk_q=128, int warp_q=32, int blk_k=64, int warp_k=64) "
+          "-> (Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale)");
     m.def("quant_v_fp8(Tensor value, *, str tensor_layout=\"HND\", "
           "str v_layout=\"mma_k16\", float scale_max=448.0, bool smooth_v=False, "
           "int pad_multiple=64) -> (Tensor v_fp8, Tensor v_scale, Tensor? v_mean)");
@@ -210,6 +322,7 @@ TORCH_LIBRARY_FRAGMENT(sageattention, m)
 TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
 {
     m.impl("quant_qk", TORCH_FN(sage::quant_qk_cuda));
+    m.impl("quant_qk_varlen", TORCH_FN(sage::quant_qk_varlen_cuda));
     m.impl("quant_v_fp8", TORCH_FN(sage::quant_v_fp8_cuda));
     m.impl("sub_mean_v", TORCH_FN(sage::sub_mean_v_cuda));
 }

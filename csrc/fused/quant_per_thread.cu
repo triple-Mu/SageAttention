@@ -92,7 +92,9 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
                                           const uint32_t stride_seq_output,
                                           const int64_t  stride_h_output,
                                           const int64_t  stride_batch_scale,
-                                          const int64_t  stride_h_scale)
+                                          const int64_t  stride_h_scale,
+                                          const int32_t* __restrict__ cu_seqlens,
+                                          const uint32_t scale_blk_tokens)
 {
     constexpr uint32_t pack_size      = PerThreadVec<head_dim>::pack_size;
     using pack_t                      = sage::vec_t<T, pack_size>;
@@ -112,14 +114,30 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
     const uint32_t col                  = lane_id * pack_size;
     const uint32_t warp_tile_base_token = warp_tile_id * WARP_TOKENS;
 
+    // Packed varlen layout: see the QuantInt8Kernel comment in fused.cu. The
+    // rows stay sequence-relative, only the token base and the scale slot move.
+    uint32_t seq_tokens = num_tokens;
+    int64_t  seq_base   = 0;
+    uint32_t scale_slot = warp_tile_id;
+    if (cu_seqlens != nullptr) {
+        seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+        const uint32_t ctas_per_blk = scale_blk_tokens / WARP_TOKENS;
+        if (warp_tile_id >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
+            return;
+        }
+        seq_base   = sage::seq_offset(cu_seqlens, batch_id);
+        scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
+                     + warp_tile_id;
+    }
+
     // The warp-tile base is the only offset that can reach the n*h*hd range, so
     // it is computed in 64-bit once; the in-tile row offsets stay 32-bit.
     const T* input_ptr_base =
         input + static_cast<int64_t>(batch_id) * stride_batch_input + static_cast<int64_t>(head_id) * stride_h_input
-        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_input + static_cast<int64_t>(col);
+        + (seq_base + static_cast<int64_t>(warp_tile_base_token)) * stride_seq_input + static_cast<int64_t>(col);
     int8_t* output_ptr_base =
         output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
-        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_output + static_cast<int64_t>(col);
+        + (seq_base + static_cast<int64_t>(warp_tile_base_token)) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t x_cache[kCache ? rows_per_group : 1];
 
@@ -128,7 +146,7 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
     for (uint32_t r = 0; r < rows_per_group; r++) {
         const uint32_t local = r * 8 + warp_id;
         const uint32_t token = warp_tile_base_token + local;
-        if (token < num_tokens) {
+        if (token < seq_tokens) {
             pack_t x_val;
             x_val.load_ro(input_ptr_base + local * stride_seq_input);
             if constexpr (kCache) {
@@ -148,7 +166,7 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
     for (uint32_t r = 0; r < rows_per_group; r++) {
         const uint32_t local = r * 8 + warp_id;
         const uint32_t token = warp_tile_base_token + local;
-        if (token < num_tokens) {
+        if (token < seq_tokens) {
             pack_t x_val;
             if constexpr (kCache) {
                 x_val = x_cache[r];
@@ -167,7 +185,7 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 
     if (lane_id == 0) {
         scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
-              + warp_tile_id * 8 + warp_id] = group_scale;
+              + scale_slot * 8 + warp_id] = group_scale;
     }
 }
 
@@ -191,7 +209,9 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
                                           const uint32_t stride_seq_output,
                                           const int64_t  stride_h_output,
                                           const int64_t  stride_batch_scale,
-                                          const int64_t  stride_h_scale)
+                                          const int64_t  stride_h_scale,
+                                          const int32_t* __restrict__ cu_seqlens,
+                                          const uint32_t scale_blk_tokens)
 {
     constexpr uint32_t pack_size       = PerThreadVec<head_dim>::pack_size;
     using pack_t                       = sage::vec_t<T, pack_size>;
@@ -212,14 +232,30 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
     const uint32_t col                  = lane_id * pack_size;
     const uint32_t warp_tile_base_token = warp_tile_id * WARP_TOKENS;
 
+    // Packed varlen layout: see the QuantInt8Kernel comment in fused.cu. The
+    // rows stay sequence-relative, only the token base and the scale slot move.
+    uint32_t seq_tokens = num_tokens;
+    int64_t  seq_base   = 0;
+    uint32_t scale_slot = warp_tile_id;
+    if (cu_seqlens != nullptr) {
+        seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+        const uint32_t ctas_per_blk = scale_blk_tokens / WARP_TOKENS;
+        if (warp_tile_id >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
+            return;
+        }
+        seq_base   = sage::seq_offset(cu_seqlens, batch_id);
+        scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
+                     + warp_tile_id;
+    }
+
     // The warp-tile base is the only offset that can reach the n*h*hd range, so
     // it is computed in 64-bit once; the in-tile row offsets stay 32-bit.
     const T* input_ptr_base =
         input + static_cast<int64_t>(batch_id) * stride_batch_input + static_cast<int64_t>(head_id) * stride_h_input
-        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_input + static_cast<int64_t>(col);
+        + (seq_base + static_cast<int64_t>(warp_tile_base_token)) * stride_seq_input + static_cast<int64_t>(col);
     int8_t* output_ptr_base =
         output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
-        + static_cast<int64_t>(warp_tile_base_token) * stride_seq_output + static_cast<int64_t>(col);
+        + (seq_base + static_cast<int64_t>(warp_tile_base_token)) * stride_seq_output + static_cast<int64_t>(col);
 
     pack_t mean_val;
     if constexpr (sub_mean) {
@@ -250,7 +286,7 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
         for (uint32_t p = 0; p < 2; p++) {
             const uint32_t local = r * 8 + warp_id * 2 + p;
             const uint32_t token = warp_tile_base_token + local;
-            if (token < num_tokens) {
+            if (token < seq_tokens) {
                 pack_t x_val = load_row(local);
                 if constexpr (kCache) {
                     x_cache[r * 2 + p] = x_val;
@@ -272,7 +308,7 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
         for (uint32_t p = 0; p < 2; p++) {
             const uint32_t local = r * 8 + warp_id * 2 + p;
             const uint32_t token = warp_tile_base_token + local;
-            if (token < num_tokens) {
+            if (token < seq_tokens) {
                 pack_t x_val;
                 if constexpr (kCache) {
                     x_val = x_cache[r * 2 + p];
@@ -292,28 +328,38 @@ __global__ void QuantPerThreadKInt8Kernel(T* __restrict__ input,
 
     if (lane_id == 0) {
         scale[static_cast<int64_t>(batch_id) * stride_batch_scale + static_cast<int64_t>(head_id) * stride_h_scale
-              + warp_tile_id * 4 + warp_id] = group_scale;
+              + scale_slot * 4 + warp_id] = group_scale;
     }
 }
 
 }  // namespace
 
-void quant_per_thread_int8_q_cuda(torch::Tensor input,
-                                  torch::Tensor output,
-                                  torch::Tensor scale,
-                                  int           block_size,
-                                  int           warp_block_size,
-                                  int           tensor_layout)
+void quant_per_thread_int8_q_cuda(torch::Tensor      input,
+                                  torch::Tensor      output,
+                                  torch::Tensor      scale,
+                                  int                block_size,
+                                  int                warp_block_size,
+                                  int                tensor_layout,
+                                  const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
+    const bool  is_varlen = varlen.cu_seqlens != nullptr;
+    QuantLayout layout    = check_quant_layout(input, output, scale, tensor_layout, varlen);
+    SAGEATTN_QUANT_SCALE_STRIDES(scale, is_varlen);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
     const int num_warp_tiles =
         static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 8);
+    if (is_varlen) {
+        CHECK_SHAPE(scale,
+                    layout.num_heads,
+                    sage::blk_total(input.size(0), layout.batch_size, block_size) * (block_size / warp_block_size) * 8);
+    }
+    else {
+        CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 8);
+    }
 
     auto input_dtype = input.scalar_type();
 
@@ -335,30 +381,42 @@ void quant_per_thread_int8_q_cuda(torch::Tensor input,
                                                  layout.stride_batch_output,
                                                  layout.stride_seq_output,
                                                  layout.stride_h_output,
-                                                 scale.stride(0),
-                                                 scale.stride(1));
+                                                 stride_batch_scale,
+                                                 stride_h_scale,
+                                                 varlen.cu_seqlens,
+                                                 block_size);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });
 }
 
-void quant_per_thread_int8_k_cuda(torch::Tensor input,
-                                  torch::Tensor output,
-                                  torch::Tensor scale,
-                                  int           block_size,
-                                  int           warp_block_size,
-                                  int           tensor_layout)
+void quant_per_thread_int8_k_cuda(torch::Tensor      input,
+                                  torch::Tensor      output,
+                                  torch::Tensor      scale,
+                                  int                block_size,
+                                  int                warp_block_size,
+                                  int                tensor_layout,
+                                  const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
+    const bool  is_varlen = varlen.cu_seqlens != nullptr;
+    QuantLayout layout    = check_quant_layout(input, output, scale, tensor_layout, varlen);
+    SAGEATTN_QUANT_SCALE_STRIDES(scale, is_varlen);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
     const int num_warp_tiles =
         static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
+    if (is_varlen) {
+        CHECK_SHAPE(scale,
+                    layout.num_heads,
+                    sage::blk_total(input.size(0), layout.batch_size, block_size) * (block_size / warp_block_size) * 4);
+    }
+    else {
+        CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
+    }
 
     auto input_dtype = input.scalar_type();
 
@@ -383,37 +441,50 @@ void quant_per_thread_int8_k_cuda(torch::Tensor input,
                                                  layout.stride_batch_output,
                                                  layout.stride_seq_output,
                                                  layout.stride_h_output,
-                                                 scale.stride(0),
-                                                 scale.stride(1));
+                                                 stride_batch_scale,
+                                                 stride_h_scale,
+                                                 varlen.cu_seqlens,
+                                                 block_size);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });
 }
 
-void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor input,
-                                                torch::Tensor mean,
-                                                torch::Tensor output,
-                                                torch::Tensor scale,
-                                                int           block_size,
-                                                int           warp_block_size,
-                                                int           tensor_layout)
+void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor      input,
+                                                torch::Tensor      mean,
+                                                torch::Tensor      output,
+                                                torch::Tensor      scale,
+                                                int                block_size,
+                                                int                warp_block_size,
+                                                int                tensor_layout,
+                                                const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
-    QuantLayout layout = check_quant_layout(input, output, scale, tensor_layout);
+    const bool  is_varlen = varlen.cu_seqlens != nullptr;
+    QuantLayout layout    = check_quant_layout(input, output, scale, tensor_layout, varlen);
+    SAGEATTN_QUANT_SCALE_STRIDES(scale, is_varlen);
     TORCH_CHECK(warp_block_size % 8 == 0 && block_size % warp_block_size == 0,
                 "block_size must be a multiple of warp_block_size, warp_block_size a multiple of 8");
 
     CHECK_CUDA(mean);
     CHECK_LASTDIM_CONTIGUOUS(mean);
     CHECK_DIMS(mean, 3);
+    // the per-sequence mean keeps the dense [batch, heads, head_dim] shape
     CHECK_SHAPE(mean, layout.batch_size, layout.num_heads, layout.head_dim);
     TORCH_CHECK(input.scalar_type() == mean.scalar_type(), "Input and mean must have the same data type");
 
     const int num_warp_tiles =
         static_cast<int>(at::ceil_div<int64_t>(layout.num_tokens, block_size)) * (block_size / warp_block_size);
-    CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
+    if (is_varlen) {
+        CHECK_SHAPE(scale,
+                    layout.num_heads,
+                    sage::blk_total(input.size(0), layout.batch_size, block_size) * (block_size / warp_block_size) * 4);
+    }
+    else {
+        CHECK_SHAPE(scale, layout.batch_size, layout.num_heads, num_warp_tiles * 4);
+    }
 
     auto input_dtype = input.scalar_type();
 
@@ -438,8 +509,10 @@ void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor input,
                                                  layout.stride_batch_output,
                                                  layout.stride_seq_output,
                                                  layout.stride_h_output,
-                                                 scale.stride(0),
-                                                 scale.stride(1));
+                                                 stride_batch_scale,
+                                                 stride_h_scale,
+                                                 varlen.cu_seqlens,
+                                                 block_size);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
