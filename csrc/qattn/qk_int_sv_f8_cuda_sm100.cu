@@ -294,6 +294,11 @@ __global__ void __launch_bounds__(NUM_THREADS)
     __shared__ __align__(8) uint64_t barrier_S_done;
     __shared__ __align__(8) uint64_t barrier_O_done;
     __shared__ __align__(4) uint32_t tmem_addr_slot;
+    // Per-channel v_scale, staged once in the prologue (head_dim * 4 B = 512 B
+    // at head_dim=128): every row needs every channel, so it cannot live in
+    // registers, and reading it from global in the epilogue puts head_dim LDGs
+    // right after the last PV MMA where nothing is left to hide them.
+    __shared__ __align__(16) float sV_scale[fuse_v_scale ? head_dim : 1];
 
     if (threadIdx.x == 0) {
         tcgen05::init_barrier(&barrier_Q, 1);
@@ -316,6 +321,17 @@ __global__ void __launch_bounds__(NUM_THREADS)
     }
 
     const float q_scale = Q_scale[q_scale_idx];
+
+    // --- stage v_scale in smem (published by the __syncthreads below) ---
+    const float* V_scale_base_ptr =
+        fuse_v_scale ? V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
+                           + static_cast<int64_t>(kv_head_id) * head_dim :
+                       nullptr;
+    if constexpr (fuse_v_scale) {
+        if (threadIdx.x < head_dim) {
+            sV_scale[threadIdx.x] = V_scale_base_ptr[threadIdx.x];
+        }
+    }
 
     // --- TMEM allocation: warp-collective alloc of TMEM_COLS_TOTAL cols, then
     //     immediately relinquish the alloc permit (CUTLASS ordering, risk R7) ---
@@ -552,10 +568,6 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const bool  row_valid  = q_idx < qo_len;
     DTypeOut*   O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
                            + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
-    const float* V_scale_base_ptr =
-        fuse_v_scale ? V_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * head_dim
-                           + static_cast<int64_t>(kv_head_id) * head_dim :
-                       nullptr;
 
 #pragma unroll
     for (uint32_t c = 0; c < num_tiles_o; c++) {
@@ -568,7 +580,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
         for (uint32_t jj = 0; jj < 32; jj++) {
             RO_f32[jj] = __uint_as_float(RO_u32[jj]) * d_rcp;
             if constexpr (fuse_v_scale) {
-                RO_f32[jj] *= __ldg(V_scale_base_ptr + c * 32 + jj);  // per-channel v_scale
+                RO_f32[jj] *= sV_scale[c * 32 + jj];  // per-channel v_scale, staged in the prologue
             }
         }
 
