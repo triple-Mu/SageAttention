@@ -51,6 +51,11 @@ struct QuantVarlen {
     int64_t        batch_size = 0;
     int64_t        max_seqlen = 0;  // grid.x is opened to this and blocks past
                                     // their own sequence exit immediately
+    int64_t pad_tokens = 0;         // transposed-value family only: the block
+                                    // size the padded V^T axis is laid out
+                                    // with (varlen.h pad_offset). The int8 QK
+                                    // launchers take their block size as an
+                                    // explicit argument instead.
 };
 
 // The CHECK_* sequence and tensor_layout-dependent sizes/strides common to
@@ -197,6 +202,25 @@ inline VTLayout parse_vt_layout(const torch::Tensor& t, int tensor_layout)
         l.stride_h  = t.stride(1);
         l.stride_d  = t.stride(2);
     }
+    CHECK_LEN_I32(padded_num_tokens, l.padded_num_tokens);
+    return l;
+}
+
+// parse_vt_layout's varlen counterpart. The packed transposed value is
+// [heads, head_dim, padded_total]: the batch dimension is gone, and a
+// sequence's slab starts at varlen.h's pad_offset instead of a batch stride.
+inline VTLayout parse_vt_varlen_layout(const torch::Tensor& t, const QuantVarlen& varlen)
+{
+    CHECK_DIMS(t, 3);
+
+    VTLayout l;
+    l.batch_size        = varlen.batch_size;
+    l.num_heads         = t.size(0);
+    l.head_dim          = t.size(1);
+    l.padded_num_tokens = t.size(2);
+    l.stride_batch      = 0;
+    l.stride_h          = t.stride(0);
+    l.stride_d          = t.stride(1);
     CHECK_LEN_I32(padded_num_tokens, l.padded_num_tokens);
     return l;
 }

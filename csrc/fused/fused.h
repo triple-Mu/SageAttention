@@ -52,20 +52,34 @@ void quant_per_warp_int8_cuda(torch::Tensor      input,
 
 void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output, int tensor_layout);
 
-void transpose_pad_permute_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout);
+// The transposed-value family takes the same trailing QuantVarlen; it
+// additionally uses its pad_tokens (the padded V^T axis block size).
+// num_tokens is the dense sequence length and is unused when packed - the
+// kernel reads each sequence's own length out of cu_seqlens.
 
-void transpose_pad_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout);
+void transpose_pad_permute_cuda(torch::Tensor      input,
+                                torch::Tensor      output,
+                                int                tensor_layout,
+                                const QuantVarlen& varlen = {});
 
-void scale_fuse_quant_cuda(
-    torch::Tensor input, torch::Tensor output, torch::Tensor scale, int num_tokens, float scale_max, int tensor_layout);
+void transpose_pad_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout, const QuantVarlen& varlen = {});
 
-void mean_scale_fuse_quant_cuda(torch::Tensor input,
-                                torch::Tensor output,
-                                torch::Tensor mean,
-                                torch::Tensor scale,
-                                int           num_tokens,
-                                float         scale_max,
-                                int           tensor_layout);
+void scale_fuse_quant_cuda(torch::Tensor      input,
+                           torch::Tensor      output,
+                           torch::Tensor      scale,
+                           int                num_tokens,
+                           float              scale_max,
+                           int                tensor_layout,
+                           const QuantVarlen& varlen = {});
+
+void mean_scale_fuse_quant_cuda(torch::Tensor      input,
+                                torch::Tensor      output,
+                                torch::Tensor      mean,
+                                torch::Tensor      scale,
+                                int                num_tokens,
+                                float              scale_max,
+                                int                tensor_layout,
+                                const QuantVarlen& varlen = {});
 
 void quant_per_thread_int8_q_cuda(torch::Tensor      input,
                                   torch::Tensor      output,

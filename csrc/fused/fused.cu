@@ -282,7 +282,9 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
                                           const int64_t  stride_h_input,
                                           const int64_t  stride_batch_output,
                                           const uint32_t stride_d_output,
-                                          const int64_t  stride_h_output)
+                                          const int64_t  stride_h_output,
+                                          const int32_t* __restrict__ cu_seqlens,
+                                          const uint32_t pad_tokens)
 {
 
     static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value,
@@ -297,14 +299,34 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
     uint32_t batch_id      = blockIdx.z;
     uint32_t thread_id     = threadIdx.x;
 
+    // Packed varlen layout (cu_seqlens != nullptr): blockIdx.z selects a
+    // sequence of the prefix sum instead of a batch entry, and this kernel is
+    // where the two coordinate systems of varlen.h meet. The input moves by
+    // the sequence's token base, the output by its padded-slab base; the
+    // predicate below stays in sequence-relative tokens, which is what makes
+    // an equal-length batch transpose bit-identically either way. The grid is
+    // opened to max_seqlen, so a block past this sequence leaves here:
+    // block-uniform, and before any __syncthreads.
+    uint32_t seq_tokens = num_tokens;
+    int64_t  seq_base   = 0;
+    int64_t  pad_base   = 0;
+    if (cu_seqlens != nullptr) {
+        seq_tokens = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+        if (token_cta_idx * CTA_TOKENS >= seq_tokens) {
+            return;
+        }
+        seq_base = sage::seq_offset(cu_seqlens, batch_id);
+        pad_base = sage::pad_offset(cu_seqlens, batch_id, pad_tokens);
+    }
+
     uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
 
     T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input
-                        + static_cast<int64_t>(thread_base_token) * stride_seq_input
+                        + (seq_base + static_cast<int64_t>(thread_base_token)) * stride_seq_input
                         + static_cast<int64_t>(thread_id % num_threads_per_token * pack_size);
     T* output_ptr_base = output + static_cast<int64_t>(batch_id) * stride_batch_output
-                         + static_cast<int64_t>(head_id) * stride_h_output
+                         + static_cast<int64_t>(head_id) * stride_h_output + pad_base
                          + static_cast<int64_t>(token_cta_idx * CTA_TOKENS)
                          + static_cast<int64_t>(thread_id % num_threads_per_cta * pack_size)
                          + static_cast<int64_t>(thread_id / num_threads_per_cta) * stride_d_output;
@@ -339,7 +361,7 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
     cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(
         smem_load_tile[smem_load_row] + thread_id % num_threads_per_token * pack_size,
         input_ptr_base,
-        thread_base_token < num_tokens);
+        thread_base_token < seq_tokens);
     cp_async::commit_group();
     cp_async::wait_group<0>();
     __syncthreads();
@@ -377,7 +399,9 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
                                 const int64_t  stride_batch_mean,
                                 const int64_t  stride_h_mean,
                                 const int64_t  stride_batch_scale,
-                                const int64_t  stride_h_scale)
+                                const int64_t  stride_h_scale,
+                                const int32_t* __restrict__ cu_seqlens,
+                                const uint32_t pad_tokens)
 {
     static_assert(std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value,
                   "Only half and bfloat16 are supported");
@@ -401,12 +425,33 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
 
     uint32_t num_threads = blockDim.x;
     uint32_t gmem_stride = num_threads * pack_size;
+
+    // Packed varlen layout (cu_seqlens != nullptr): the transposed tensors
+    // lose their batch dimension and blockIdx.y selects a sequence of the
+    // prefix sum; its slab starts at varlen.h's pad_offset, the same
+    // expression the transpose kernel wrote it with. num_tokens becomes the
+    // sequence's own length, and the ceil16 statistics divisor below is taken
+    // over that - an equal-length batch then quantizes bit-identically.
+    uint32_t seq_tokens = num_tokens;
+    int64_t  pad_base   = 0;
+    if (cu_seqlens != nullptr) {
+        seq_tokens = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+        // An empty sequence has no statistic to reduce and no fp8 token to
+        // write. Leaving here (block-uniform, before the block reductions)
+        // also keeps a 0/0 mean out of the output; the scale and mean entries
+        // stay the zeros the allocation put there.
+        if (seq_tokens == 0) {
+            return;
+        }
+        pad_base = sage::pad_offset(cu_seqlens, batch_id, pad_tokens);
+    }
+
     // pad the number of tokens to 16 to deal with fp8 permute in previous kernel
-    uint32_t stat_padded_num_tokens = at::round_up<uint32_t>(num_tokens, 16);
+    uint32_t stat_padded_num_tokens = at::round_up<uint32_t>(seq_tokens, 16);
     uint32_t num_iters =
         stat_padded_num_tokens / gmem_stride + ((stat_padded_num_tokens % gmem_stride) > thread_id * pack_size);
     // the quantize pass covers all fp8 output tokens to prevent nan in random initialization
-    uint32_t padded_num_tokens = at::round_up<uint32_t>(num_tokens, pad_size);
+    uint32_t padded_num_tokens = at::round_up<uint32_t>(seq_tokens, pad_size);
     uint32_t num_quant_iters =
         padded_num_tokens / gmem_stride + ((padded_num_tokens % gmem_stride) > thread_id * pack_size);
 
@@ -414,10 +459,10 @@ __global__ void MeanScaleKernel(T* __restrict__ input,
 
     T* input_ptr_base = input + static_cast<int64_t>(batch_id) * stride_batch_input
                         + static_cast<int64_t>(head_id) * stride_h_input + static_cast<int64_t>(d_id) * stride_d_input
-                        + static_cast<int64_t>(thread_id * pack_size);
+                        + pad_base + static_cast<int64_t>(thread_id * pack_size);
     int8_t* output_ptr_base =
         output + static_cast<int64_t>(batch_id) * stride_batch_output + static_cast<int64_t>(head_id) * stride_h_output
-        + static_cast<int64_t>(d_id) * stride_d_output + static_cast<int64_t>(thread_id * pack_size);
+        + static_cast<int64_t>(d_id) * stride_d_output + pad_base + static_cast<int64_t>(thread_id * pack_size);
 
     pack_t x_cache[kCache];
 
@@ -891,7 +936,8 @@ void sub_mean_cuda(torch::Tensor input, torch::Tensor mean, torch::Tensor output
                 x.size(3),                                                                                             \
                 ")")
 
-static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int tensor_layout, bool permute)
+static void transpose_pad_impl(
+    torch::Tensor input, torch::Tensor output, int tensor_layout, bool permute, const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -901,45 +947,104 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
     CHECK_LASTDIM_CONTIGUOUS(input);
     CHECK_CONTIGUOUS(output);
 
-    CHECK_DIMS(input, 4);
-    CHECK_DIMS(output, 4);
-
     constexpr int CTA_TOKENS = 64;
 
-    const int64_t batch_size = input.size(0);
-    const int64_t head_dim   = input.size(3);
+    int64_t batch_size, head_dim, num_heads, num_tokens, grid_blocks;
+    int64_t stride_batch_input, stride_seq_input, stride_h_input;
+    int64_t stride_batch_output, stride_d_output, stride_h_output;
 
-    int64_t stride_batch_input = input.stride(0);
+    if (varlen.cu_seqlens != nullptr) {
+        // packed [total_tokens, heads, head_dim] -> [heads, head_dim, padded_total]
+        CHECK_DIMS(input, 3);
 
-    // The output is the transposed-value layout. Only its strides come from the
-    // parsed layout: its sizes are what the CHECK_SHAPE below validates against
-    // the input-derived ones, so they must stay input-derived.
-    const VTLayout out_layout          = parse_vt_layout(output, tensor_layout);
-    const int64_t  stride_batch_output = out_layout.stride_batch;
-    const int64_t  stride_d_output     = out_layout.stride_d;
-    const int64_t  stride_h_output     = out_layout.stride_h;
+        const VTLayout out_layout = parse_vt_varlen_layout(output, varlen);
 
-    int64_t num_tokens, padded_num_tokens, num_heads;
-    int64_t stride_seq_input, stride_h_input;
+        batch_size          = varlen.batch_size;
+        num_heads           = input.size(1);
+        head_dim            = input.size(2);
+        num_tokens          = varlen.max_seqlen;  // sizes the grid; the kernel reads its own length
+        stride_batch_input  = 0;
+        stride_seq_input    = input.stride(0);
+        stride_h_input      = input.stride(1);
+        stride_batch_output = 0;
+        stride_d_output     = out_layout.stride_d;
+        stride_h_output     = out_layout.stride_h;
 
-    if (tensor_layout == 0) {
-        num_tokens       = input.size(1);
-        num_heads        = input.size(2);
-        stride_seq_input = input.stride(1);
-        stride_h_input   = input.stride(2);
-
-        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
-
-        CHECK_SHAPE_PADDED_SEQ(output, batch_size, head_dim, num_heads, padded_num_tokens);
+        TORCH_CHECK(out_layout.num_heads == num_heads && out_layout.head_dim == head_dim,
+                    "transposed value must be (heads, head_dim, padded_total) = (",
+                    num_heads,
+                    ", ",
+                    head_dim,
+                    ", n), got (",
+                    output.size(0),
+                    ", ",
+                    output.size(1),
+                    ", ",
+                    output.size(2),
+                    ")");
+        const int64_t padded_total = sage::blk_total(input.size(0), batch_size, varlen.pad_tokens) * varlen.pad_tokens;
+        TORCH_CHECK(out_layout.padded_num_tokens == padded_total,
+                    "transposed value last dim (",
+                    out_layout.padded_num_tokens,
+                    ") must be blk_total(total_tokens, batch_size, ",
+                    varlen.pad_tokens,
+                    ") * ",
+                    varlen.pad_tokens,
+                    " (",
+                    padded_total,
+                    ")");
+        TORCH_CHECK(varlen.pad_tokens % CTA_TOKENS == 0,
+                    "pad_multiple (",
+                    varlen.pad_tokens,
+                    ") must be a multiple of ",
+                    CTA_TOKENS);
+        // Each sequence owns ceil(len / pad) padded blocks at most (varlen.h,
+        // Property 1); the CTAs below cover ceil(len / CTA_TOKENS) of them, so
+        // for pad_multiple > CTA_TOKENS the slab's tail stays unwritten. The
+        // fp8 quantization pass stops at the same bound and the fp8 output is
+        // allocated zeroed, exactly as the dense pad_multiple=128 path.
+        grid_blocks = at::ceil_div<int64_t>(num_tokens, CTA_TOKENS);
     }
     else {
-        num_tokens       = input.size(2);
-        num_heads        = input.size(1);
-        stride_seq_input = input.stride(2);
-        stride_h_input   = input.stride(1);
+        CHECK_DIMS(input, 4);
+        CHECK_DIMS(output, 4);
 
-        padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
-        CHECK_SHAPE_PADDED_SEQ(output, batch_size, num_heads, head_dim, padded_num_tokens);
+        batch_size = input.size(0);
+        head_dim   = input.size(3);
+
+        stride_batch_input = input.stride(0);
+
+        // The output is the transposed-value layout. Only its strides come from the
+        // parsed layout: its sizes are what the CHECK_SHAPE below validates against
+        // the input-derived ones, so they must stay input-derived.
+        const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
+        stride_batch_output       = out_layout.stride_batch;
+        stride_d_output           = out_layout.stride_d;
+        stride_h_output           = out_layout.stride_h;
+
+        int64_t padded_num_tokens;
+
+        if (tensor_layout == 0) {
+            num_tokens       = input.size(1);
+            num_heads        = input.size(2);
+            stride_seq_input = input.stride(1);
+            stride_h_input   = input.stride(2);
+
+            padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
+
+            CHECK_SHAPE_PADDED_SEQ(output, batch_size, head_dim, num_heads, padded_num_tokens);
+        }
+        else {
+            num_tokens       = input.size(2);
+            num_heads        = input.size(1);
+            stride_seq_input = input.stride(2);
+            stride_h_input   = input.stride(1);
+
+            padded_num_tokens = at::round_up<int64_t>(num_tokens, CTA_TOKENS);
+            CHECK_SHAPE_PADDED_SEQ(output, batch_size, num_heads, head_dim, padded_num_tokens);
+        }
+
+        grid_blocks = padded_num_tokens / CTA_TOKENS;
     }
 
     auto input_dtype  = input.scalar_type();
@@ -951,7 +1056,7 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            dim3 grid(padded_num_tokens / CTA_TOKENS, num_heads, batch_size);
+            dim3 grid(grid_blocks, num_heads, batch_size);
 
             static_assert(CTA_TOKENS * HEAD_DIM <= 8192);
 
@@ -967,7 +1072,9 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
                                                  stride_h_input,
                                                  stride_batch_output,
                                                  stride_d_output,
-                                                 stride_h_output);
+                                                 stride_h_output,
+                                                 varlen.cu_seqlens,
+                                                 static_cast<uint32_t>(varlen.pad_tokens));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             else {
@@ -980,25 +1087,84 @@ static void transpose_pad_impl(torch::Tensor input, torch::Tensor output, int te
                                                  stride_h_input,
                                                  stride_batch_output,
                                                  stride_d_output,
-                                                 stride_h_output);
+                                                 stride_h_output,
+                                                 varlen.cu_seqlens,
+                                                 static_cast<uint32_t>(varlen.pad_tokens));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
         });
     });
 }
 
-void transpose_pad_permute_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout)
+void transpose_pad_permute_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout, const QuantVarlen& varlen)
 {
-    transpose_pad_impl(input, output, tensor_layout, /*permute=*/true);
+    transpose_pad_impl(input, output, tensor_layout, /*permute=*/true, varlen);
 }
 
-void transpose_pad_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout)
+void transpose_pad_cuda(torch::Tensor input, torch::Tensor output, int tensor_layout, const QuantVarlen& varlen)
 {
-    transpose_pad_impl(input, output, tensor_layout, /*permute=*/false);
+    transpose_pad_impl(input, output, tensor_layout, /*permute=*/false, varlen);
 }
 
-void scale_fuse_quant_cuda(
-    torch::Tensor input, torch::Tensor output, torch::Tensor scale, int num_tokens, float scale_max, int tensor_layout)
+// The transposed-value sizes, strides and output shape check that the two fp8
+// V quantization launchers share. Dense is [B, H, D, padded] (HND) /
+// [B, D, H, padded] (NHD); packed drops the batch dimension to
+// [H, D, padded_total], and which slab a sequence owns is the kernel's
+// business (varlen.h pad_offset), not the host's.
+struct VTQuantLayout {
+    int64_t batch_size, num_heads, head_dim;
+    int64_t stride_batch_input, stride_d_input, stride_h_input;
+    int64_t stride_batch_output, stride_d_output, stride_h_output;
+};
+
+static VTQuantLayout parse_vt_quant_layout(const torch::Tensor& input,
+                                           const torch::Tensor& output,
+                                           int                  tensor_layout,
+                                           const QuantVarlen&   varlen)
+{
+    VTQuantLayout l;
+    if (varlen.cu_seqlens != nullptr) {
+        const VTLayout in_layout  = parse_vt_varlen_layout(input, varlen);
+        const VTLayout out_layout = parse_vt_varlen_layout(output, varlen);
+
+        CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2));
+
+        l.batch_size          = varlen.batch_size;
+        l.num_heads           = in_layout.num_heads;
+        l.head_dim            = in_layout.head_dim;
+        l.stride_batch_input  = 0;
+        l.stride_d_input      = in_layout.stride_d;
+        l.stride_h_input      = in_layout.stride_h;
+        l.stride_batch_output = 0;
+        l.stride_d_output     = out_layout.stride_d;
+        l.stride_h_output     = out_layout.stride_h;
+        return l;
+    }
+
+    const VTLayout in_layout  = parse_vt_layout(input, tensor_layout);
+    const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
+
+    CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
+
+    l.batch_size          = in_layout.batch_size;
+    l.num_heads           = in_layout.num_heads;
+    l.head_dim            = in_layout.head_dim;
+    l.stride_batch_input  = in_layout.stride_batch;
+    l.stride_d_input      = in_layout.stride_d;
+    l.stride_h_input      = in_layout.stride_h;
+    l.stride_batch_output = out_layout.stride_batch;
+    l.stride_d_output     = out_layout.stride_d;
+    l.stride_h_output     = out_layout.stride_h;
+    return l;
+}
+
+void scale_fuse_quant_cuda(torch::Tensor      input,
+                           torch::Tensor      output,
+                           torch::Tensor      scale,
+                           int                num_tokens,
+                           float              scale_max,
+                           int                tensor_layout,
+                           const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -1024,26 +1190,26 @@ void scale_fuse_quant_cuda(
     CHECK_CONTIGUOUS(output);
     CHECK_CONTIGUOUS(scale);
 
-    CHECK_DIMS(input, 4);
-    CHECK_DIMS(output, 4);
+    if (varlen.cu_seqlens == nullptr) {
+        CHECK_DIMS(input, 4);
+        CHECK_DIMS(output, 4);
+    }  // the packed rank is checked by parse_vt_varlen_layout
     CHECK_DIMS(scale, 3);
 
-    const VTLayout in_layout  = parse_vt_layout(input, tensor_layout);
-    const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
+    const VTQuantLayout l = parse_vt_quant_layout(input, output, tensor_layout, varlen);
 
-    const int64_t batch_size = in_layout.batch_size;
-    const int64_t num_heads  = in_layout.num_heads;
-    const int64_t head_dim   = in_layout.head_dim;
+    const int64_t batch_size = l.batch_size;
+    const int64_t num_heads  = l.num_heads;
+    const int64_t head_dim   = l.head_dim;
 
-    const int64_t stride_batch_input = in_layout.stride_batch;
-    const int64_t stride_d_input     = in_layout.stride_d;
-    const int64_t stride_h_input     = in_layout.stride_h;
+    const int64_t stride_batch_input = l.stride_batch_input;
+    const int64_t stride_d_input     = l.stride_d_input;
+    const int64_t stride_h_input     = l.stride_h_input;
 
-    const int64_t stride_batch_output = out_layout.stride_batch;
-    const int64_t stride_d_output     = out_layout.stride_d;
-    const int64_t stride_h_output     = out_layout.stride_h;
+    const int64_t stride_batch_output = l.stride_batch_output;
+    const int64_t stride_d_output     = l.stride_d_output;
+    const int64_t stride_h_output     = l.stride_h_output;
 
-    CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
 
     constexpr int CTA_THREADS = 256;
@@ -1071,18 +1237,21 @@ void scale_fuse_quant_cuda(
                                                                        0,
                                                                        0,
                                                                        scale.stride(0),
-                                                                       scale.stride(1));
+                                                                       scale.stride(1),
+                                                                       varlen.cu_seqlens,
+                                                                       static_cast<uint32_t>(varlen.pad_tokens));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
 }
 
-void mean_scale_fuse_quant_cuda(torch::Tensor input,
-                                torch::Tensor output,
-                                torch::Tensor mean,
-                                torch::Tensor scale,
-                                int           num_tokens,
-                                float         scale_max,
-                                int           tensor_layout)
+void mean_scale_fuse_quant_cuda(torch::Tensor      input,
+                                torch::Tensor      output,
+                                torch::Tensor      mean,
+                                torch::Tensor      scale,
+                                int                num_tokens,
+                                float              scale_max,
+                                int                tensor_layout,
+                                const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -1111,27 +1280,27 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
     CHECK_CONTIGUOUS(mean);
     CHECK_CONTIGUOUS(scale);
 
-    CHECK_DIMS(input, 4);
-    CHECK_DIMS(output, 4);
+    if (varlen.cu_seqlens == nullptr) {
+        CHECK_DIMS(input, 4);
+        CHECK_DIMS(output, 4);
+    }  // the packed rank is checked by parse_vt_varlen_layout
     CHECK_DIMS(mean, 3);
     CHECK_DIMS(scale, 3);
 
-    const VTLayout in_layout  = parse_vt_layout(input, tensor_layout);
-    const VTLayout out_layout = parse_vt_layout(output, tensor_layout);
+    const VTQuantLayout l = parse_vt_quant_layout(input, output, tensor_layout, varlen);
 
-    const int64_t batch_size = in_layout.batch_size;
-    const int64_t num_heads  = in_layout.num_heads;
-    const int64_t head_dim   = in_layout.head_dim;
+    const int64_t batch_size = l.batch_size;
+    const int64_t num_heads  = l.num_heads;
+    const int64_t head_dim   = l.head_dim;
 
-    const int64_t stride_batch_input = in_layout.stride_batch;
-    const int64_t stride_d_input     = in_layout.stride_d;
-    const int64_t stride_h_input     = in_layout.stride_h;
+    const int64_t stride_batch_input = l.stride_batch_input;
+    const int64_t stride_d_input     = l.stride_d_input;
+    const int64_t stride_h_input     = l.stride_h_input;
 
-    const int64_t stride_batch_output = out_layout.stride_batch;
-    const int64_t stride_d_output     = out_layout.stride_d;
-    const int64_t stride_h_output     = out_layout.stride_h;
+    const int64_t stride_batch_output = l.stride_batch_output;
+    const int64_t stride_d_output     = l.stride_d_output;
+    const int64_t stride_h_output     = l.stride_h_output;
 
-    CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
     CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
 
@@ -1160,7 +1329,9 @@ void mean_scale_fuse_quant_cuda(torch::Tensor input,
                                                                       mean.stride(0),
                                                                       mean.stride(1),
                                                                       scale.stride(0),
-                                                                      scale.stride(1));
+                                                                      scale.stride(1),
+                                                                      varlen.cu_seqlens,
+                                                                      static_cast<uint32_t>(varlen.pad_tokens));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
 }
