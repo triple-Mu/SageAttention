@@ -348,27 +348,46 @@ def test_quant_v_fp8_varlen_matches_per_sequence_dense(v_layout, smooth_v):
 
 
 @requires_fp8_cast
+@pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
 @pytest.mark.parametrize("smooth_v", [False, True])
 @pytest.mark.parametrize("pad", [64, 128])
-def test_quant_v_fp8_varlen_tail_is_zero(smooth_v, pad):
-    """The white-box invariant the sm89 V load runs on: it reads whole CTA_K
-    tiles straight out of the slab with no predicate, so every byte from a
-    sequence's length to the end of its blocks has to be a zero fp8 - not
-    stale, and above all not a NaN encoding (0 * NaN would poison PV). At
-    pad=128 (sm90/sm100) part of that tail is never written at all, and the
-    zeroed allocation is what has to cover it."""
+def test_quant_v_fp8_varlen_tail_is_zero(v_layout, smooth_v, pad):
+    """The white-box invariant the fp8 V load runs on: it reads whole CTA_K
+    tiles straight out of the slab with no predicate, so every column a padding
+    token owns has to be a zero fp8 - not stale, and above all not a NaN
+    encoding (0 * NaN would poison PV). At pad=128 (sm90/sm100) part of that
+    tail is never written at all, and the zeroed allocation is what covers it.
+
+    Which columns those are depends on the layout. linear keeps token order, so
+    the tail starts exactly at the sequence length. mma_k16 permutes tokens
+    inside each 16-token group, so in the group straddling the length the real
+    values and the zeros interleave and a padding token's column is only fixed
+    from the 16-aligned bound above it. That is the dense layout too, byte for
+    byte - it is what the PV mma consumes.
+
+    smooth_v moves the goalposts rather than the bytes: a padding token's zero
+    quantizes to (0 - v_mean) / v_scale, which is not zero and is not meant to
+    be - the kernel adds v_mean back in the epilogue and the masked probability
+    is what zeroes the term. So the requirement there is only that the tail
+    stays a finite fp8, which is the half that would actually poison PV. (No
+    varlen attention kernel asks for smooth_v; resolve() downgrades it.)"""
     lens = [37, 128, 0, 1, 300]
     cu_list = cu_of(lens)
     packed = rand_packed(lens, seed=29)
     cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
 
     v_fp8 = OPS.quant_v_fp8_varlen(
-        packed, cu, max_seqlen_k=max(lens), smooth_v=smooth_v, pad_multiple=pad
+        packed, cu, max_seqlen_k=max(lens), v_layout=v_layout, smooth_v=smooth_v, pad_multiple=pad
     )[0].view(torch.uint8)
 
     for b, n in enumerate(lens):
         base, end = pad_offset(cu_list, b, pad), pad_offset(cu_list, b + 1, pad)
-        assert (v_fp8[:, :, base + n : end] == 0).all(), f"sequence {b}"
+        first_pad = cdiv(n, 16) * 16 if v_layout == "mma_k16" else n
+        tail = v_fp8[:, :, base + first_pad : end]
+        # fp8 e4m3 encodes NaN as 0x7f / 0xff; there is no infinity
+        assert ((tail & 0x7F) != 0x7F).all(), f"NaN encoding in sequence {b}"
+        if not smooth_v:
+            assert (tail == 0).all(), f"sequence {b}"
 
 
 @requires_fp8_cast
