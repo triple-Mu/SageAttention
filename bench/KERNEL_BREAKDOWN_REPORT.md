@@ -374,6 +374,7 @@ sm80 路径不做 V 的 fp8 预处理，所以没有 V-prep 角色。另有一�
 | 重复性 | sm89 上整轮 50 形状重跑过一次（间隔约 6 分钟），两轮 attention 合计比值都是 0.9838 |
 | 影响量级 | attention 占 TOTAL 98%，所以直接决定整机结论：sm89 50 形状合计 TOTAL 0.984、sm120 0.988。长序列段（s ≥ 8192）TOTAL 全部 < 1 |
 | 对照 | 同一改动在 sm100 上只有 0.995（+0.5%），sm90 落在噪声里。这两个 attention kernel 的入参是 TMA descriptor（`CUtensorMap_st`），推测指针与 stride 不参与主循环的地址计算——尚未验证 |
+| **结案** | **已修，commit `93d79e8`**。根因不是 stride 签名而是三副本合并后 `k_scale_off` 活跃区间横跨三个展开点，255 寄存器顶格下 ptxas 在主循环内 S2R 重算 `lane_id % 4`，落在每轮 `dequant_scale` 依赖链上；对非 causal 且非 lse 实例把偏移预折进指针后，L20 非 causal 46 形状合计 0.9836 → 0.9993，causal 与其余实例 SASS 逐字节不动。定位、修复排除项与双卡复测见 [SM89_NONCAUSAL_FIX_REPORT.md](SM89_NONCAUSAL_FIX_REPORT.md) |
 
 三项的共同背景是同一次签名改造（const 指针 + int64 stride + 多两个 varlen 参数）。影响并不均匀：**受影响重的是用裸指针做地址计算的 kernel**（sm89/sm120 的 attention、sm90/sm100 的 quant），入参走 TMA descriptor 的 attention kernel 受影响小得多（sm100 +0.5%，sm90 落在噪声里）。但同一个 quant kernel 为什么在 sm89/sm120 上不回退、在 sm90/sm100 上回退，本实验没有答案——三项立案都需要 SASS / ncu 层面的单独定位。
 
