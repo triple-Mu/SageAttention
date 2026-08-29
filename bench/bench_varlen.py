@@ -57,6 +57,21 @@ SHAPES = [
 PROFILES = [("equal", 1.0), ("ragged .25-1x", 0.25), ("ragged .1-1x", 0.1)]
 
 
+def parse_shape(spec: str):
+    """'b8 h16 n4096 d128' or '8,16,4096,128' -> (label, batch, heads, seq, dim)."""
+    if "," in spec:
+        batch, heads, seq, dim = (int(x) for x in spec.split(","))
+        return (f"b{batch} h{heads} n{seq} d{dim}", batch, heads, seq, dim)
+    fields = {tok[0]: int(tok[1:]) for tok in spec.split()}
+    return (spec, fields["b"], fields["h"], fields["n"], fields["d"])
+
+
+def parse_profile(spec: str):
+    """'0.25' -> ('ragged .25-1x', 0.25); '1' -> ('equal', 1.0)."""
+    low = float(spec)
+    return ("equal" if low >= 1.0 else f"ragged {spec.lstrip('0')}-1x", low)
+
+
 def seqlens(batch: int, seq_len: int, low: float, seed: int = 0) -> list:
     """Sequence lengths spread over [low * seq_len, seq_len], longest pinned.
 
@@ -141,7 +156,21 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--csv", help="also write the rows to this file")
+    ap.add_argument(
+        "--shape",
+        action="append",
+        help="override the shape list, repeatable: 'b8 h16 n4096 d128' or '8,16,4096,128'",
+    )
+    ap.add_argument(
+        "--profile",
+        action="append",
+        help="override the raggedness list, repeatable: the shortest sequence as a "
+        "fraction of seq_len (1 = equal lengths)",
+    )
     args = ap.parse_args()
+
+    shapes = [parse_shape(s) for s in args.shape] if args.shape else SHAPES
+    profiles = [parse_profile(p) for p in args.profile] if args.profile else PROFILES
 
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
@@ -162,8 +191,8 @@ def main():
     for causal in causals:
         print(f"-- causal={int(causal)}")
         print(header + f"{'speedup':>9}{'varlen TF':>11}{'dense TF':>10}")
-        for label, *shape in SHAPES:
-            for profile, low in PROFILES:
+        for label, *shape in shapes:
+            for profile, low in profiles:
                 lens = seqlens(shape[0], shape[2], low)
                 r = run_case(shape, lens, causal, device, dtype, args.warmup, args.iters)
                 tokens = f"{r['tokens']}/{r['padded_tokens']}"
