@@ -38,7 +38,7 @@ from .core import _LOG2E_V2, _pad_qkv_head_dim, _warned_configs
 # Backends with a packed-layout attention kernel, mirroring the dispatch table
 # in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
 # raise keeps a device without one from paying for the quantization first.
-_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm120"})
+_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm90", "sm120"})
 
 
 def _segment_ids(cu_seqlens: torch.Tensor, batch_size: int, total: int) -> torch.Tensor:

@@ -43,6 +43,9 @@
 #if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM89
 #include "../qattn/attn_cuda_sm89_varlen.h"
 #endif
+#if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM90
+#include "../qattn/attn_cuda_sm90_varlen.h"
+#endif
 #if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM120
 #include "../qattn/attn_cuda_sm120_varlen.h"
 #endif
@@ -162,6 +165,31 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_varlen_cuda(const at::Tens
                         name(plan.pv),
                         "\" has no varlen kernel yet; sm89 varlen implements \"fp32+fp16\"");
             lse = sm89_varlen::qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf(query,
+                                                                                         key,
+                                                                                         value,
+                                                                                         out,
+                                                                                         query_scale,
+                                                                                         key_scale,
+                                                                                         *value_scale,
+                                                                                         cu_seqlens_q,
+                                                                                         cu_seqlens_k,
+                                                                                         max_q,
+                                                                                         max_k,
+                                                                                         causal_int,
+                                                                                         gran_int,
+                                                                                         sm_scale_f32,
+                                                                                         return_lse_int);
+            break;
+        }
+#endif
+#if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM90
+        case Backend::kSm90F8: {
+            // one instantiation, the default pv_accum_dtype for sm90 (its only one)
+            TORCH_CHECK(plan.pv == PVAccum::kFp32Fp32,
+                        "pv_accum_dtype \"",
+                        name(plan.pv),
+                        "\" has no varlen kernel yet; sm90 varlen implements \"fp32+fp32\"");
+            lse = sm90_varlen::qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn_inst_buf(query,
                                                                                          key,
                                                                                          value,
                                                                                          out,

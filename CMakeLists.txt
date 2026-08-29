@@ -119,7 +119,12 @@ else()
   set(SAGEATTN_BUILD_VARLEN 0)
   message(STATUS "[sageattention] varlen kernels disabled (SAGE_BUILD_VARLEN=OFF)")
 endif()
+# sm90 is a plain source group rather than an OBJECT library, so its varlen TU
+# joins the group the way sm80's does; it names its own namespace internally.
 set(SAGE_SRC_SM90 csrc/qattn/qk_int_sv_f8_cuda_sm90.cu)
+if(SAGE_BUILD_VARLEN)
+  list(APPEND SAGE_SRC_SM90 csrc/qattn/qk_int_sv_f8_cuda_sm90_varlen.cu)
+endif()
 set(SAGE_SRC_SM100 csrc/qattn/qk_int_sv_f8_cuda_sm100.cu)
 # The sm89 template TUs are compiled twice (OBJECT libraries below): once as
 # sage::sm89 with the full fallback arch set, once as sage::sm120 with the

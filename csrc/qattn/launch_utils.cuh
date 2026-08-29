@@ -371,8 +371,6 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
                                                int64_t              max_seqlen_k,
                                                int                  return_lse)
 {
-    static_assert(kFamily != QKVFamily::kSVF8TMA, "the sm90/sm100 varlen value branch is not written yet");
-
     CHECK_CUDA(query);
     CHECK_CUDA(key);
     CHECK_CUDA(value);
@@ -382,11 +380,11 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
 
     CHECK_CONTIGUOUS(query);
     CHECK_CONTIGUOUS(key);
-    if constexpr (kFamily == QKVFamily::kSVF16) {
-        CHECK_LASTDIM_CONTIGUOUS(value);
+    if constexpr (kFamily == QKVFamily::kSVF8CudaCore) {
+        CHECK_CONTIGUOUS(value);  // ensure value is contiguous to prevent troubles in the kernel
     }
     else {
-        CHECK_CONTIGUOUS(value);  // ensure value is contiguous to prevent troubles in the kernel
+        CHECK_LASTDIM_CONTIGUOUS(value);
     }
     CHECK_LASTDIM_CONTIGUOUS(output);
     CHECK_CONTIGUOUS(query_scale);
@@ -396,6 +394,9 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     CHECK_DTYPE(key, torch::kInt8);
     if constexpr (kFamily == QKVFamily::kSVF16) {
         CHECK_DTYPE(value, torch::kHalf);
+    }
+    else if constexpr (kFamily == QKVFamily::kSVF8TMA) {
+        CHECK_DTYPE(value, at::ScalarType::Float8_e4m3fn);
     }
     // kSVF8CudaCore leaves the fp8 value's dtype unchecked, as the dense parse does
     CHECK_DTYPE(query_scale, torch::kFloat32);
