@@ -402,6 +402,16 @@ __device__ __forceinline__ void tcgen05_commit(uint64_t* bar)
 #endif
 }
 
+// Makes this thread's prior generic-proxy shared-memory writes visible to the
+// async proxy, which is how tcgen05.mma reads its smem operands. Needed by any
+// path that hand-writes an MMA operand into smem (CUTLASS fence_view_async_shared);
+// __syncthreads() alone only orders the generic proxy against itself. Plain
+// sm_80+ PTX, so unlike the tcgen05.* wrappers it needs no arch guard.
+__device__ __forceinline__ void fence_async_shared()
+{
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 // Order TMEM accesses across __syncthreads(): producer issues
 // tcgen05_fence_before_sync() before the barrier, consumer issues
 // tcgen05_fence_after_sync() after it.

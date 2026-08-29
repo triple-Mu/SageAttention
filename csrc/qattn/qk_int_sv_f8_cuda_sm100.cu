@@ -27,7 +27,9 @@
 // wgmma sync (commit_batch/wait_group) replaced by tcgen05.commit + mbarrier
 // parity waits (barrier_S_done / barrier_O_done).
 //
-// TMEM column plan (128 lanes x 512 cols x 32b, one alloc of all 512 cols):
+// TMEM column plan (128 lanes x 512 cols x 32b per SM; one alloc of the
+// power-of-two round-up of what the plan below needs - 256 cols at head_dim=64,
+// 512 at head_dim=128 - so that two CTAs can hold TMEM at once when it fits):
 //   S [0,128)          128x128 s32 QK accumulator (1 col = 1 s32 per lane)
 //   P [128,160)        128x128 e4m3, packed 4-per-word (K elems 4c..4c+3 in
 //                      word col c, byte b = K elem 4c+b) - the kind::f8f6f4
@@ -149,14 +151,23 @@ __global__ void __launch_bounds__(NUM_THREADS)
     static_assert(head_dim % 32 == 0, "QK MMA is chained in K=32 steps");
 
     // --- TMEM column plan; regions disjoint by construction ---
-    constexpr uint32_t TMEM_COLS_TOTAL = 512;
-    constexpr uint32_t TMEM_COL_S      = 0;
-    constexpr uint32_t TMEM_COLS_S     = CTA_K;  // s32: one column per element
-    constexpr uint32_t TMEM_COL_P      = TMEM_COL_S + TMEM_COLS_S;
-    constexpr uint32_t TMEM_COLS_P     = CTA_K / 4;  // e4m3 packed 4 per 32b word
-    constexpr uint32_t TMEM_COL_O      = TMEM_COL_P + TMEM_COLS_P;
-    constexpr uint32_t TMEM_COLS_O     = head_dim;  // f32: one column per element
-    static_assert(TMEM_COL_O + TMEM_COLS_O <= TMEM_COLS_TOTAL, "TMEM budget exceeded");
+    constexpr uint32_t TMEM_COL_S  = 0;
+    constexpr uint32_t TMEM_COLS_S = CTA_K;  // s32: one column per element
+    constexpr uint32_t TMEM_COL_P  = TMEM_COL_S + TMEM_COLS_S;
+    constexpr uint32_t TMEM_COLS_P = CTA_K / 4;  // e4m3 packed 4 per 32b word
+    constexpr uint32_t TMEM_COL_O  = TMEM_COL_P + TMEM_COLS_P;
+    constexpr uint32_t TMEM_COLS_O = head_dim;  // f32: one column per element
+
+    // Right-sized allocation: an SM owns 512 TMEM columns total, so asking for
+    // all 512 lets only one CTA hold TMEM at a time and the second resident CTA
+    // stalls inside tcgen05.alloc. tcgen05.alloc takes a power of two in
+    // [32, 512]; the plan needs 224 columns at head_dim=64 (-> 256, so two CTAs
+    // fit: 1.19-1.64x on B200) and 288 at head_dim=128 (-> 512, unchanged).
+    // Numbers and method in test/HARDWARE_CHECKLIST.md section 5f.
+    constexpr uint32_t TMEM_COLS_NEEDED = TMEM_COL_O + TMEM_COLS_O;
+    static_assert(TMEM_COLS_NEEDED > 128 && TMEM_COLS_NEEDED <= 512,
+                  "TMEM budget exceeded, or small enough that the round-up below is too coarse");
+    constexpr uint32_t TMEM_COLS_TOTAL = (TMEM_COLS_NEEDED <= 256) ? 256 : 512;
     static_assert(TMEM_COL_P >= TMEM_COL_S + TMEM_COLS_S && TMEM_COL_O >= TMEM_COL_P + TMEM_COLS_P,
                   "TMEM regions must not overlap");
 
@@ -290,7 +301,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
     const float q_scale = Q_scale[q_scale_idx];
 
-    // --- TMEM allocation: warp-collective alloc of the whole 512 cols, then
+    // --- TMEM allocation: warp-collective alloc of TMEM_COLS_TOTAL cols, then
     //     immediately relinquish the alloc permit (CUTLASS ordering, risk R7) ---
     if (warp_idx == 0) {
         tcgen05::tmem_alloc(&tmem_addr_slot, TMEM_COLS_TOTAL);
@@ -462,6 +473,11 @@ __global__ void __launch_bounds__(NUM_THREADS)
             for (uint32_t w = 0; w < CTA_K / 4; w++) {
                 sP_row[(((w >> 2) ^ (row_id & 7)) << 2) | (w & 3)] = RP_u32[w];
             }
+            // These are generic-proxy stores; the PV MMA below reads sP through
+            // the async proxy, which __syncthreads() does not order against.
+            // Without this fence the SS twin hangs once two CTAs share an SM
+            // (test/HARDWARE_CHECKLIST.md section 5f).
+            tcgen05::fence_async_shared();
         }
 
         // ---- TMEM/smem producer (128 threads) -> MMA issuer handoff ----

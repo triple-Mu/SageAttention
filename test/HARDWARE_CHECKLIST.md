@@ -4,8 +4,8 @@
 **sm90 已在 H200 上全部验证完毕**(dense 2026-08-28、varlen 2026-08-29,
 见 §5),**sm120 已在 RTX PRO 6000 Blackwell 上验证完毕**(2026-08-29,
 见 §5b),**sm89 已在 L20 上验证完毕**(2026-08-29,见 §5d),
-**sm100 已在 B200 上验证完毕**(2026-08-29,见 §5f)。四个 arch 的
-bitwise 对拍与 varlen 都有硬件证据了。
+**sm100 已在 B200 上验证完毕**(2026-08-29 首轮、2026-08-30 补 TMEM
+右尺寸化,见 §5f)。四个 arch 的 bitwise 对拍与 varlen 都有硬件证据了。
 sm89 与 sm120 都过了,删除过渡期
 `torch.ops.sageattention.qattn_smXX_*` 低层 op(它们是对拍工具)的条件
 已经达成,见 §7。
@@ -744,45 +744,78 @@ sm100 这个 MVP kernel 离硬件上限还很远(d128 seq32768 约 634 TFLOPS)�
 
 - [ ] **C-9 主方向:warp specialization + 多级流水**。数据支持(barrier 占
       stall 37.7%、eligible warp 0.30),但是重写级工作量,这一轮没做。
-- [ ] **TMEM 右尺寸化:测出 1.18-1.64× 但没有合入,原因见下。**
+- [x] **TMEM 右尺寸化:hd64 快 1.19-1.64×,已合入。**上一轮卡住的 SS 挂死
+      找到根因了(缺 async proxy fence),见下。
 
-### 未合入的优化:TMEM 右尺寸化(head_dim=64)
+### TMEM 右尺寸化(head_dim=64)—— 已合入
 
-`TMEM_COLS_TOTAL` 写死 512,而一个 SM 总共就 512 列,所以**一次只有一个 CTA
-能持有 TMEM**:occupancy 允许 2 个 CTA 同时驻留,第二个只能堵在
+`TMEM_COLS_TOTAL` 原先写死 512,而一个 SM 总共就 512 列,所以**一次只有一个
+CTA 能持有 TMEM**:occupancy 允许 2 个 CTA 同时驻留,第二个只能堵在
 `tcgen05.alloc` 里等第一个 dealloc。列计划实际要的是
 `S(128) + P(32) + O(head_dim)`,head_dim=64 只要 224 列,凑到 2 的幂是 256,
 两个 CTA 就都能拿到(head_dim=128 要 288,还是得进位到 512,所以只有 d64 受益)。
 
-实测(TS 路径,3 轮交替中位数,40 配置):
+2026-08-30 复测(B200 `umbriel-b200-094`,TS 路径,3 轮交替取每形状中位数,
+40 配置;baseline = 同一棵树把 `TMEM_COLS_TOTAL` 改回 512 重编):
 
-| | 结果 |
+| head_dim | 加速比 |
 |---|---|
-| head_dim=64 | **1.18-1.64×**(seq 越长收益越大) |
-| head_dim=128 | 1.000×(如预期完全不变) |
-| 数值 | `ok=2280 diff=0`,精度 62/62 |
-| ncu 机理确认(d64 seq4096) | Duration 1.62 → 1.02 ms;Compute SM 31.3% → 50.4%;eligible warp/scheduler 0.33 → 0.63;No Eligible 68.8% → 51.1% |
+| 64 | **1.19-1.64×**(中位 1.53×,seq 越长收益越大) |
+| 128 | 0.999-1.002×(中位 1.000×,如预期完全不变) |
 
-**没有合入**:同一份改动编进 SS twin 之后,`compare_reference.py --check` 的
-`attn` 段(1980 个低层 kernel 用例)**挂死**——GPU 100% 占用、进程空转,
-10 分钟不返回,可稳定复现。同一个 SS 构建单独跑都是好的:直接调
-`qattn_sm100_*` 的 fuse_v_scale 与 base 两个 launcher、hd 64/128 ×
-qo/kv {128,256,512,300/777,1024} × per_warp/per_thread × causal 两态 ×
-`return_lse` 两态 × fp16/bf16 输出、以及 4096 CTA 的大 grid,全部 0.0x 秒通过;
-`quant` / `e2e` / `equiv` 三段也都 `diff=0`。只有 attn 段整段跑才挂。
-TS 路径带这个改动跑同样的 attn 段是过的(`ok=2280 diff=0`)。
+hd64 分档:seq 1k 1.19-1.22×、4k 1.45-1.53×、16k 1.59-1.62×、
+32k 以上 1.62-1.64×。hd128 整列 1.000× 正好当这次 A/B 的自检对照。
 
-假设:让两个 CTA 真正同时持有 TMEM 之后,SS 路径的 mbarrier / TMEM 交接里
-有一个只在 CTA 并发时才现形的竞争(SS 比 TS 多一段 `sP` 的 smem staging 与
-对应的 barrier)。SS twin 存在的意义就是当 TS 的 oracle,oracle 挂了就不能
-放行被它盯着的那个改动,所以这一轮把它撤回,留复现命令等下一次上机:
+**A/B 的坑**:上一轮留在机器上的 `new/` 树其实**没有**把这个改动撤掉
+(只是没进 git),所以 `_C.ts.abi3.so` 已经是右尺寸化的构建,拿它当
+baseline 量出来是 1.00×。确认口径:`cuobjdump -sass` 里
+`UTCATOMSWS.FIND_AND_SET.ALIGN` 前那条 `UMOV` 的立即数 = 列数/32
+(8 = 256 列、16 = 512 列),量之前先核这个数。
 
-```bash
-# 复现(容器内,new 树带 TMEM_COLS_TOTAL 右尺寸化):
-NVCC_APPEND_FLAGS=-DSAGE_SM100_PV_FROM_SMEM python setup.py build_ext --inplace
-SAGEATTN_SM100_TCGEN05=1 python compare_reference.py --check --backend new \
-    --golden-dir <golden> --section attn      # 挂在这里,TS 同命令是过的
-```
+ncu 机理(上一轮采的,d64 seq4096):Duration 1.62 → 1.02 ms;
+Compute SM 31.3% → 50.4%;eligible warp/scheduler 0.33 → 0.63;
+No Eligible 68.8% → 51.1%。
+
+### 上一轮的 SS 挂死:根因是缺 `fence.proxy.async.shared::cta`
+
+现象回顾:右尺寸化编进 SS twin 后 `compare_reference.py --check --section attn`
+(1980 个用例)挂死,GPU 100% 占用、进程空转;TS 带同样改动是过的,SS 单独调
+各 launcher 也都过,只有 attn 段整段跑才挂。
+
+根因不是 mbarrier / TMEM 竞争,是 **smem 的 proxy 可见性**:SS twin 用普通
+`st.shared`(generic proxy)把 P 写进 `sP`,而 `tcgen05.mma` 读 smem operand
+走的是 **async proxy**。`tcgen05.fence::before_thread_sync` 只排序 TMEM 访问,
+`__syncthreads()` 只排序 generic proxy 对自己,两个都不跨 proxy——所以 MMA
+读到的 `sP` 是未定义的。TS 路径把 P 写进 TMEM,不经过 smem,所以一直没暴露。
+1 CTA/SM 时时序上碰巧看不出来,2 CTA 真并发后才现形。
+
+修法:`sP` 写完、`__syncthreads()` 之前加一条
+`fence.proxy.async.shared::cta`(即 `tcgen05::fence_async_shared()`,
+对应 CUTLASS 的 `fence_view_async_shared`)。
+
+对照实验(两个构建的 TMEM 列数**完全相同**,hd64 都是 256,只差这条 fence):
+
+| 构建 | `FENCE.VIEW.ASYNC.S` 条数 | `--section attn` |
+|---|---|---|
+| 右尺寸化,无 fence | 64 | **rc=124 挂死**(600 s 超时) |
+| 右尺寸化,有 fence | 192 | `ok=1980 diff=0` |
+
+这一轮的验收(同一份 golden-sm100,2280 case):
+
+| 项 | 结果 |
+|---|---|
+| TS `--check`(发布路径) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| SS twin `--check`(oracle) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| SDPA 精度 | TS 62/62、SS 62/62 |
+| pytest 全量 | 307 passed / 441 skipped,0 failed(与上一轮同数) |
+
+因为 oracle 自己被修好了,**不需要**按 `PV_FROM_SMEM` 给 TMEM 列数分支:
+TS 和 SS 用同一套右尺寸化,SS 继续当 TS 的数值 oracle。
+
+留给下次的一条通则:任何**手写进 smem 再喂给 `tcgen05.mma` / `wgmma` 的
+operand**,写完都要过一条 `fence.proxy.async.shared::cta`;TMA 填的 buffer
+不需要(TMA 本身就在 async proxy 里,靠 mbarrier 完成)。本仓目前只有 SS twin
+的 `sP` 属于前者。
 
 ## 6. 性能决策点
 
