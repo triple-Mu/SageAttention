@@ -115,6 +115,21 @@ TU 的合并。
 不变——f32 inst_buf 1576 B / f16 inst_buf 2088 B 的 spill 归零 + bench
 `pv_accum_dtype=fp32+fp16, per_warp` 预期 +15-30%。
 
+- [x] sm120 上机判定:**NO-GO**(2026-08-29,数据见 §5c)。两条独立理由:
+  1. **前提不成立**。1576 / 2088 B 那两个数字是 sm_89 cubin 的。同一批 TU
+     编成 sm_120 后,每个 head_dim=128 实例只剩 12-84 B spill,而且 ncu 的
+     `Local Memory Spilling Requests` 是 0——spill 全在冷路径,一次都没执行。
+  2. **约束方向是负的**。真正的限制是寄存器数本身:所有 head_dim=128 实例
+     顶 255 reg,`Block Limit Registers=2`,occupancy 16.7%。要拿到
+     3 block/SM 得压到 ≤170 reg;`-maxrregcount=168` 让 spill 从 ~50 B 涨到
+     ~2350 B,head_dim=128 慢 **190-207%**(dense)/ **185-205%**(varlen)。
+  3. **head_dim=64 是不带 spill 的对照组,同样没有收益**。它基线 187-216 reg、
+     零 spill,压到 168 只花 12-88 B spill,occupancy 实测 16.5% → 24.5%
+     (+49%),吞吐只动 2%。**这个 kernel 不是 occupancy 受限的**——ncu 也是
+     这么说的(Compute SM 76.7%,`math_pipe_throttle` 占 stall 的 38.6%)。
+  dense 与 varlen 两路分别测过,结论一致;sm89(Ada)那一侧的 spill 数字仍未
+  复核,但机制一样,方向大概率不变。
+
 ## 4. 批次 D 宏(CMake option,默认 OFF)
 
 本机 sm86 已采数(scratchpad batchd/,精度统计见会话报告):三宏 OFF 时
@@ -181,6 +196,168 @@ sm120,`requires_backend("sm80"/"sm89"/"sm90")` 一律跳过),外加
   那个安装上(本轮就撞到 `sageattention._qattn_sm90`)。用 PYTHONPATH 指向
   待测树之前先把这个 finder 摘掉。
 
+## 5c. sm120 profiling(2026-08-29,ncu 2026.2.1 / nsys 2026.3.1)
+
+容器是特权模式(`CapEff` 全开),ncu 硬件计数器可用,不需要降级到 nsys-only。
+**dense 与 varlen 两路都采、都测。** dense 的形状网格取
+`bench/bench_qk_int8_pv_fp8_cuda.py` 的那一套:batch 4、heads 32、
+head_dim 64/128、seq 1024-32768、NHD、causal 两态。varlen 在等长(与 dense
+同形状对照)之外再加三档偏斜(.5-1x / .25-1x / .1-1x),形状覆盖小 batch 长
+序列(b1 h16 n32768、b2 h16 n16384)到大 batch 短序列(b16 h8 n2048)。
+
+### 全流程时间占比(nsys,d128,batch 4 heads 32,每个 kernel 25 次的合计)
+
+dense(`sageattn`,smooth_k 的均值走 ATen `reduce_kernel`):
+
+| seq / causal | attention | transpose_pad | quant K | quant Q | MeanScale | `k.mean` | fp8 零填充 |
+|---|---|---|---|---|---|---|---|
+| 1024 / 0 | 47.2% | 13.7% | 9.6% | 7.9% | 9.0% | 9.7% | 1.7% |
+| 1024 / 1 | 36.7% | 16.3% | 11.7% | 9.5% | 10.8% | 11.6% | 2.0% |
+| 4096 / 0 | 74.4% | 7.0% | 5.2% | 4.2% | 4.2% | 3.5% | 1.1% |
+| 4096 / 1 | 61.2% | 10.6% | 7.9% | 6.3% | 6.3% | 5.3% | 1.7% |
+| 16384 / 0 | 91.7% | 2.1% | 1.6% | 1.5% | 1.6% | 1.0% | 0.4% |
+| 16384 / 1 | 84.7% | 3.9% | 2.9% | 2.7% | 2.9% | 1.9% | 0.8% |
+
+varlen(`sageattn_varlen`,非 causal;均值走 `SegmentMeanKernel`。
+`equal` 是等长 batch,`.25-1x` 是最短序列取 0.25 倍的偏斜):
+
+| seq / 偏斜 | attention | transpose_pad | quant K | quant Q | MeanScale | `segment_mean` | fp8 零填充 |
+|---|---|---|---|---|---|---|---|
+| 1024 / equal | 46.2% | 13.7% | 9.5% | 8.2% | 10.3% | 8.7% | 1.7% |
+| 1024 / .25-1x | 40.9% | 16.6% | 6.4% | 9.4% | 19.3% | 3.3% | 1.8% |
+| 4096 / equal | 73.9% | 7.1% | 5.3% | 4.3% | 4.2% | 3.3% | 1.1% |
+| 4096 / .25-1x | 69.9% | 8.5% | 6.3% | 4.7% | 4.6% | 4.0% | 1.3% |
+| 16384 / equal | 91.6% | 2.1% | 1.6% | 1.5% | 1.6% | 1.0% | 0.4% |
+| 16384 / .25-1x | 90.1% | 2.5% | 1.9% | 1.8% | 1.9% | 1.2% | 0.5% |
+
+数字是 nsys 自己的 Time(%),分母里还含一个生成测试数据的 RNG kernel
+(1.1% / 0.5% / 0.1%),所以每行合计不到 100。**两路的形状完全一样**:
+seq ≥ 4096 时 attention kernel 是绝对大头(61-92%),前处理要到 seq ≤ 2048
+才值得看。varlen 的 `segment_mean` 在偏斜大时比 dense 的 ATen `k.mean` 便宜
+(它只读真实 token),但省下的比例又被 attention kernel 同步缩短抵掉,占比反而
+看不出优势。
+
+### attention kernel(d128 n4096 非 causal,dense 与 varlen packed 各一份)
+
+| 指标 | dense | varlen packed |
+|---|---|---|
+| Duration | 2.69 ms | 2.65 ms |
+| Compute (SM) Throughput | 76.7% | 78.3% |
+| Memory Throughput | 28.1% | 28.0% |
+| 寄存器 / occupancy | 255 → 16.67%(理论)、16.51%(实测) | 255 → 16.67% / 16.48% |
+| `Block Limit` registers / smem / warps | 2 / 3 / 12 | 2 / 3 / 12 |
+| Warp cycles per issued instruction | 6.49 | 6.24 |
+
+stall 拆解(dense,单位是每条已发射指令的周期,合计 6.49):
+`math_pipe_throttle` 2.50、`wait` 1.57、`not_selected` 0.32、
+`long_scoreboard` 0.29、`barrier` 0.25、`short_scoreboard` 0.20。
+`Local Memory Spilling Requests` 为 0。
+
+结论:kernel 已经 tensor pipe 主导(tensor 管线 78.2% of peak),最大的 stall
+是管线本身占满。剩下那 ~22% 要靠把 softmax / scaling 的 ALU 工作与 mma 重叠
+才能吃到——和 sm90 的 H1/H4 同级,属于重写。**varlen packed kernel 与 dense
+是同一个模板、同一套资源画像**,varlen 开发期记的那份高 spill(REG 255 /
+stack 208 B)同样是 sm_89 目标下的数字,sm_120 上最差只有 84 B 且不执行。
+
+### C-1 的判决实验:head_dim=64 是不带 spill 的对照组
+
+`-maxrregcount=168` 在两种 head_dim 上的代价完全不同,正好构成一组对照:
+
+| | 寄存器 | spill(st/ld) | 理论 occupancy | 实测 occupancy | Compute (SM) | Duration |
+|---|---|---|---|---|---|---|
+| d64 基线 | 187-216 | 0 | 16.67% | 16.47% | 67.9% | 1.53 ms |
+| d64 `-maxrregcount=168` | 168 | 12-88 B | **25%** | 24.51% | 69.4% | 1.50 ms |
+| d128 基线 | 255 | 12-84 B | 16.67% | 16.51% | 76.7% | 2.69 ms |
+| d128 `-maxrregcount=168` | 168 | ~2350 B | 25% | — | — | 3× 变慢 |
+
+head_dim=64 那一行是关键:寄存器压下去几乎不花 spill,occupancy 实打实涨了
+**49%**(16.5% → 24.5%),吞吐只动了 2%。**这个 kernel 不是 occupancy 受限的。**
+head_dim=128 想拿同样的 occupancy 要付 ~2350 B spill,于是 3× 变慢。两条腿
+都不通,C-1 的 launch_bounds 方向到此为止。
+
+bench 两路分开报(3 轮交替中位数,base = 无约束):
+
+| 路径 | head_dim | 配置数 | 相对基线 |
+|---|---|---|---|
+| dense(`qattn_sm120_*` + `qattn_sm89_*`,6 个 kernel) | 128 | 24 | +190% ~ +207% |
+| dense | 64 | 12 | −0.4% ~ +3.2% |
+| varlen(`fwd_varlen`,sm120_varlen 实例) | 128 | 36 | +185% ~ +205% |
+| varlen | 64 | 36 | −5.6% ~ +9.7%(中位 +1.5%) |
+
+sm89 家族的 varlen 实例(`sm89_varlen`,fp32+fp16 inst_buf)在 cc 12.0 上够不
+着:`sageattn_varlen` resolve 到 sm120,而 `fwd_varlen` 对每个 arch 只接受它
+自己的默认 `pv_accum_dtype`。那一组要等 Ada 实机。
+
+### 前处理 kernel(d128 n4096,ncu SpeedOfLight)
+
+| kernel | Duration | DRAM Throughput | 寄存器 | Achieved Occupancy |
+|---|---|---|---|---|
+| `TransposePadPermuteKernel` | 206.5 µs | 83.8% | 26 | 63.6% |
+| `QuantPerThreadKInt8Kernel` | 140.9 µs | 87.2% | 54 | 68.3% |
+| `QuantPerThreadQInt8Kernel` | 126.5 µs | 93.8% | 34 | 83.6% |
+| `MeanScaleKernel` | 122.6 µs | 94.4% | 40 | 95.8% |
+| `at::native::reduce_kernel`(`k.mean`) | 121.0 µs | 89.1% | 50 | 64.5% |
+
+五个都贴在 DRAM roofline 上(84-94%),单 kernel 调优没有空间,**只能删掉多余
+的字节**。dense 与 varlen 用的是同一批 kernel(只有 smooth_k 的均值不同:
+dense 走 ATen `reduce_kernel`,varlen 走 `SegmentMeanKernel`),所以这个结论
+两路通用。已落地一处(见下),还剩两处提案:
+
+1. transpose 与 MeanScale 是对 V 的两趟(读 V → 写 fp16 V^T → 读 V^T →
+   写 fp8),融成一个 kernel 后是读 V → 读 V → 写 fp8,少搬 28% 的字节,
+   n=4096 上省 ~90 µs(全流程 2.6%)。要新写 kernel,且要保证按 channel 的
+   amax 与 16-token permute 补位逐位一致。
+2. varlen 的 fp8 零填充(占 0.4-1.8%):让 `MeanScaleKernel` 对空序列写零而
+   不是提前 return,`quant_v_fp8_varlen` 就能跟 dense 一样换成 `at::empty`。
+   动的是一段有明确正确性理由的提前返回,收益又在 2% 以内,没做。
+
+### dense 补齐 vs varlen packed(3 轮交替中位数,单位 ms,括号是相对 dense 的加速)
+
+dense 那一列是把同一批 token 补齐到 `seq_len` 后跑 `sageattn`,即没有 packed
+布局的调用方今天付的价。`b1` 那两行只有一个序列,偏斜档位在它上面退化成等长。
+
+| shape | causal | dense | equal | .5-1x | .25-1x | .1-1x |
+|---|---|---|---|---|---|---|
+| d64 b4 h32 n1024 | 0 | 0.176 | 0.190 (0.93×) | 0.158 (1.12×) | 0.151 (1.17×) | 0.156 (1.13×) |
+| d64 b4 h32 n4096 | 0 | 1.865 | 1.962 (0.95×) | 1.341 (1.39×) | 1.144 (1.63×) | 1.231 (1.52×) |
+| d64 b8 h32 n4096 | 0 | 3.924 | 4.084 (0.96×) | 3.210 (1.22×) | 1.991 (1.97×) | 1.685 (2.33×) |
+| d64 b16 h8 n2048 | 0 | 0.582 | 0.603 (0.96×) | 0.378 (1.54×) | 0.294 (1.98×) | 0.286 (2.04×) |
+| d64 b2 h16 n16384 | 0 | 6.108 | 6.683 (0.91×) | 4.714 (1.30×) | 4.160 (1.47×) | 5.350 (1.14×) |
+| d64 b1 h16 n32768 | 0 | 12.275 | 12.751 (0.96×) | — | — | — |
+| d128 b4 h32 n1024 | 0 | 0.391 | 0.396 (0.99×) | 0.313 (1.25×) | 0.297 (1.32×) | 0.304 (1.28×) |
+| d128 b4 h32 n4096 | 0 | 3.474 | 3.494 (0.99×) | 2.462 (1.41×) | 2.080 (1.67×) | 2.142 (1.62×) |
+| d128 b8 h32 n4096 | 0 | 7.349 | 7.431 (0.99×) | 5.833 (1.26×) | 3.681 (2.00×) | 3.240 (2.27×) |
+| d128 b16 h8 n2048 | 0 | 1.103 | 1.088 (1.01×) | 0.728 (1.51×) | 0.578 (1.91×) | 0.561 (1.97×) |
+| d128 b2 h16 n16384 | 0 | 11.261 | 11.360 (0.99×) | 8.041 (1.40×) | 7.011 (1.61×) | 9.319 (1.21×) |
+| d128 b1 h16 n32768 | 0 | 22.005 | 21.764 (1.01×) | — | — | — |
+
+causal=1 的 12 行同形状(等长 0.93-1.03×,偏斜最高 2.25×),完整 120 行在
+scratchpad 的 `varlen_state_table.txt`。等长时 packed 与 dense 打平,偏斜越大
+收益越大,批次越大收益越大——`b8 h32 n4096` 在 .1-1x 上是 2.3×。
+偏斜列不单调(`b2 h16 n16384` 的 .1-1x 比 .25-1x 慢)是因为最长序列被钉死在
+`seq_len`、batch 只有 2,随机抽到的总 token 反而更多。
+
+### 落地的优化
+
+`quant_v_fp8` 里 fp8 V 缓冲的 `at::zeros`:量化 kernel 只写到 64 对齐边界,
+所以 `pad_multiple=128` 且 kv_len 的 128 对齐边界更大时,尾巴必须先清零。
+sm89 / sm120 的 `pad_multiple` 是 64,两个边界重合,kernel 覆盖每一个字节,
+那次 memset 是纯浪费。改成两边界重合时走 `at::empty`。
+
+- golden `--check`:`ok=2578 diff=0`,equiv 265/265(逐位不变);本机 sm86
+  双门禁 `ok=1493 diff=0` + `548 passed / 138 skipped`
+- nsys:`FillFunctor<Float8_e4m3fn>` kernel 从时间线上消失,其余 kernel 不变;
+  单次迭代 GPU kernel 合计 n=1024 −1.74%、n=4096 −0.44%,随 seq 增大趋近 0
+- **dense 墙钟**:官方网格(b4 h32,24 配置)−2.0% ~ +1.25%,没过阈值;换到
+  V 字节占比更高的形状(b8 h32 n4096 causal=1、b16 h8 n2048 causal=1)有
+  −3.3% ~ −4.4%,过了阈值
+- **varlen 墙钟**:120 配置 −4.4% ~ +5.4%,散在两侧,就是噪声。**这是预期的**
+  ——`quant_v_fp8_varlen` 的 `at::zeros` 没动,那边空序列不产生任何写入,
+  它的 slab 必须靠分配时的零来兜底,主机侧又不能读 `cu_seqlens` 判断有没有
+  空序列(会引入 D2H 同步,cudagraph / compile 路径不接受)
+
+一句话:这个优化只对 dense 生效,varlen 那一路的同名 memset 不是冗余的。
+
 ## 6. 性能决策点
 
 | 项 | 机器 | 命令/指标 | 决策 |
@@ -214,3 +391,6 @@ sm120 的 `pv_accum_dtype="fp32+fp16"` 拿不到 Ada 上那 2× 的速度,只剩
       退之前要确认 sm89(Ada)那一侧还需要它
 - [ ] bench/ 脚本迁移到 torch.ops.sageattention.*(除 `bench_varlen.py` 外,
       其余还 import 已删除的 pybind 模块)
+- [ ] 按 §5c 的 profiling 结论排下一步:transpose + MeanScale 融成一趟
+      (少搬 28% 的 V 字节,seq ≤ 2048 上值得),以及 attention kernel 的
+      softmax / mma 重叠(重写级,和 sm90 H1/H4 同一类)
