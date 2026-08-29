@@ -222,6 +222,28 @@ def _quant_v_fp8_fake(
     return v_fp8, v_scale, vm
 
 
+def _quant_v_fp8_varlen_fake(
+    value,
+    cu_seqlens_k,
+    *,
+    max_seqlen_k,
+    v_layout="mma_k16",
+    scale_max=448.0,
+    smooth_v=False,
+    pad_multiple=64,
+):
+    # the padded V^T axis is blk_total blocks of pad_multiple tokens, which
+    # reads (total_tokens, batch_size) only -- both static shapes
+    b = cu_seqlens_k.size(0) - 1
+    h, d = value.size(1), value.size(2)
+    padded = _blk_total(value.size(0), b, pad_multiple) * pad_multiple
+    dev = value.device
+    v_fp8 = torch.empty((h, d, padded), dtype=torch.float8_e4m3fn, device=dev)
+    v_scale = torch.empty((b, h, d), dtype=torch.float32, device=dev)
+    vm = torch.empty((b, h, d), dtype=torch.float32, device=dev) if smooth_v else None
+    return v_fp8, v_scale, vm
+
+
 def _sub_mean_v_fake(value, *, tensor_layout="HND"):
     seq_dim, _ = _seq_nh_dims(tensor_layout)
     vm_shape = list(value.shape)
@@ -245,6 +267,7 @@ def _register() -> None:
     torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)
     torch.library.register_fake("sageattention::quant_qk_varlen")(_quant_qk_varlen_fake)
     torch.library.register_fake("sageattention::quant_v_fp8")(_quant_v_fp8_fake)
+    torch.library.register_fake("sageattention::quant_v_fp8_varlen")(_quant_v_fp8_varlen_fake)
     torch.library.register_fake("sageattention::sub_mean_v")(_sub_mean_v_fake)
 
 

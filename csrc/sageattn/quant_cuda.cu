@@ -288,6 +288,77 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(c
     return {v_fp8, v_scale, std::nullopt};
 }
 
+// quant_v_fp8's packed [total_tokens, heads, head_dim] counterpart. The two
+// kernels are the same ones (a null cu_seqlens is what makes them dense); the
+// addressing is what changes. The transposed value loses its batch dimension
+// and its padded axis becomes the block algebra of varlen.h: blk_total blocks
+// of pad_multiple tokens, sequence b's slab starting at pad_offset. Every
+// sequence's slab is zero from its length to its end, which is the premise the
+// sm89 V load runs on - that load has no bound predicate, and its 16-token
+// permute groups have to stay inside one sequence.
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_varlen_cuda(const at::Tensor& value,
+                                                                                      const at::Tensor& cu_seqlens_k,
+                                                                                      c10::SymInt       max_seqlen_k,
+                                                                                      c10::string_view  v_layout,
+                                                                                      double            scale_max,
+                                                                                      bool              smooth_v,
+                                                                                      int64_t           pad_multiple)
+{
+    const c10::cuda::CUDAGuard device_guard(value.device());
+    TORCH_CHECK(SAGEATTN_BUILD_VARLEN != 0, "sageattention was built without varlen support (SAGE_BUILD_VARLEN=OFF)");
+    const VLayout vl = parse_v_layout(v_layout);
+    TORCH_CHECK(vl != VLayout::kSeq,
+                "quant_v_fp8_varlen produces transposed layouts "
+                "(\"mma_k16\" / \"linear\"); the fp16 PV path takes V unquantized");
+    TORCH_CHECK(pad_multiple == 64 || pad_multiple == 128, "pad_multiple must be 64 or 128, got ", pad_multiple);
+    TORCH_CHECK(value.dim() == 3, "packed value must be 3-D [total_tokens, heads, head_dim]");
+    check_cu_seqlens(cu_seqlens_k, value, "cu_seqlens_k");
+
+    const int64_t batch_size   = cu_seqlens_k.size(0) - 1;
+    const int64_t total_k      = value.size(0);
+    const int64_t num_kv_heads = value.size(1);
+    const int64_t head_dim     = value.size(2);
+    const int64_t max_k        = max_seqlen_k.guard_int(__FILE__, __LINE__);
+    const int64_t padded_total = sage::blk_total(total_k, batch_size, pad_multiple) * pad_multiple;
+
+    // [heads, head_dim, padded_total]. at::empty is enough: the transpose
+    // writes each sequence's slab up to its 64-aligned length and the
+    // quantization pass below reads exactly that far, so the part a
+    // pad_multiple=128 slab leaves over is never touched (the dense path makes
+    // the same trade).
+    at::Tensor        value_t = at::empty({num_kv_heads, head_dim, padded_total}, value.options());
+    const QuantVarlen varlen{cu_seqlens_k.data_ptr<int32_t>(), batch_size, max_k, pad_multiple};
+    // tensor_layout is unused on the varlen path (the strides carry the
+    // layout); pass the HND flag so the argument still has a legal value.
+    const int layout_int = static_cast<int>(TensorLayout::kHND);
+    if (vl == VLayout::kMmaK16) {
+        transpose_pad_permute_cuda(value, value_t, layout_int, varlen);
+    }
+    else {
+        transpose_pad_cuda(value, value_t, layout_int, varlen);
+    }
+
+    // zeros, not empty, for the same reason as the dense path plus one more:
+    // the fp8 tail of every sequence's slab (from its 64-aligned length to the
+    // end of the blocks varlen.h gave it) is never written, and the attention
+    // kernel reads whole 64-token tiles. A NaN-encoded garbage byte there
+    // would poison PV through 0 * NaN.
+    at::Tensor v_fp8 = at::zeros(value_t.sizes(), value_t.options().dtype(at::kFloat8_e4m3fn));
+    // zeros as well: an empty sequence produces no statistics at all, and an
+    // uninitialized entry would make the op's output run-to-run unstable
+    // (opcheck's test_aot_dispatch_dynamic compares eager against traced).
+    at::Tensor v_scale = at::zeros({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+
+    if (smooth_v) {
+        at::Tensor value_mean = at::zeros({batch_size, num_kv_heads, head_dim}, value.options().dtype(at::kFloat));
+        mean_scale_fuse_quant_cuda(
+            value_t, v_fp8, value_mean, v_scale, /*num_tokens=*/0, static_cast<float>(scale_max), layout_int, varlen);
+        return {v_fp8, v_scale, value_mean};
+    }
+    scale_fuse_quant_cuda(value_t, v_fp8, v_scale, /*num_tokens=*/0, static_cast<float>(scale_max), layout_int, varlen);
+    return {v_fp8, v_scale, std::nullopt};
+}
+
 std::tuple<at::Tensor, at::Tensor> sub_mean_v_cuda(const at::Tensor& value, c10::string_view tensor_layout)
 {
     const c10::cuda::CUDAGuard device_guard(value.device());
@@ -320,6 +391,13 @@ TORCH_LIBRARY_FRAGMENT(sageattention, m)
     m.def("quant_v_fp8(Tensor value, *, str tensor_layout=\"HND\", "
           "str v_layout=\"mma_k16\", float scale_max=448.0, bool smooth_v=False, "
           "int pad_multiple=64) -> (Tensor v_fp8, Tensor v_scale, Tensor? v_mean)");
+    // v_fp8 is [heads, head_dim, blk_total(total_k, batch, pad) * pad]: the
+    // padded axis is a static shape (varlen.h, Property 2), so a cudagraph
+    // replay that rewrites cu_seqlens cannot resize it. v_scale / v_mean keep
+    // their batch dimension - they are per (sequence, head, channel).
+    m.def("quant_v_fp8_varlen(Tensor value, Tensor cu_seqlens_k, *, SymInt max_seqlen_k, "
+          "str v_layout=\"mma_k16\", float scale_max=448.0, bool smooth_v=False, "
+          "int pad_multiple=64) -> (Tensor v_fp8, Tensor v_scale, Tensor? v_mean)");
     m.def("sub_mean_v(Tensor value, *, str tensor_layout=\"HND\") "
           "-> (Tensor v_smoothed, Tensor v_mean)");
 }
@@ -329,5 +407,6 @@ TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
     m.impl("quant_qk", TORCH_FN(sage::quant_qk_cuda));
     m.impl("quant_qk_varlen", TORCH_FN(sage::quant_qk_varlen_cuda));
     m.impl("quant_v_fp8", TORCH_FN(sage::quant_v_fp8_cuda));
+    m.impl("quant_v_fp8_varlen", TORCH_FN(sage::quant_v_fp8_varlen_cuda));
     m.impl("sub_mean_v", TORCH_FN(sage::sub_mean_v_cuda));
 }

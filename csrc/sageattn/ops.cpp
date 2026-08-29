@@ -39,6 +39,7 @@
 #include "config.h"
 #include "plan.h"
 #include "sageattn_build_config.h"
+#include "varlen_check.h"
 
 #if SAGEATTN_BUILD_SM80
 #include "../qattn/attn_cuda_sm80.h"
@@ -153,13 +154,32 @@ void sub_mean(const at::Tensor& input, const at::Tensor& mean, at::Tensor& outpu
     sub_mean_cuda(input, mean, output, layout_flag(tensor_layout));
 }
 
-void transpose_pad_v(const at::Tensor& input, at::Tensor& output, c10::string_view tensor_layout, bool permute)
+// cu_seqlens switches the packed layout on: 3-D [total_tokens, heads,
+// head_dim] in, [heads, head_dim, blk_total * pad_multiple] out. It is the one
+// piece of the fp8 V pipeline that is pure fp16 arithmetic, so it is also the
+// only piece whose packed addressing can be checked on a pre-sm_89 device -
+// hence the argument here and not only inside quant_v_fp8_varlen.
+void transpose_pad_v(const at::Tensor&                input,
+                     at::Tensor&                      output,
+                     c10::string_view                 tensor_layout,
+                     bool                             permute,
+                     const std::optional<at::Tensor>& cu_seqlens,
+                     c10::SymInt                      max_seqlen,
+                     int64_t                          pad_multiple)
 {
+    QuantVarlen varlen;
+    if (cu_seqlens.has_value()) {
+        check_cu_seqlens(*cu_seqlens, input, "cu_seqlens");
+        varlen.cu_seqlens = cu_seqlens->data_ptr<int32_t>();
+        varlen.batch_size = cu_seqlens->size(0) - 1;
+        varlen.max_seqlen = max_seqlen.guard_int(__FILE__, __LINE__);
+        varlen.pad_tokens = pad_multiple;
+    }
     if (permute) {
-        transpose_pad_permute_cuda(input, output, layout_flag(tensor_layout));
+        transpose_pad_permute_cuda(input, output, layout_flag(tensor_layout), varlen);
     }
     else {
-        transpose_pad_cuda(input, output, layout_flag(tensor_layout));
+        transpose_pad_cuda(input, output, layout_flag(tensor_layout), varlen);
     }
 }
 
@@ -431,7 +451,8 @@ TORCH_LIBRARY(sageattention, m)
           "Tensor(b!) scale, int block_size, int warp_block_size, str tensor_layout) -> ()");
     m.def("sub_mean(Tensor input, Tensor mean, Tensor(a!) output, str tensor_layout) -> ()");
     m.def("transpose_pad_v(Tensor input, Tensor(a!) output, str tensor_layout, "
-          "bool permute) -> ()");
+          "bool permute, Tensor? cu_seqlens=None, *, SymInt max_seqlen=0, "
+          "int pad_multiple=64) -> ()");
     m.def("scale_fuse_quant(Tensor input, Tensor(a!) output, Tensor(b!) scale, "
           "int num_tokens, float scale_max, str tensor_layout) -> ()");
     m.def("mean_scale_fuse_quant(Tensor input, Tensor(a!) output, Tensor(b!) mean, "

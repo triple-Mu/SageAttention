@@ -16,7 +16,14 @@ import pytest
 import torch
 from torch.library import opcheck
 
-from conftest import cos_sim, rel_l1, requires_backend, requires_varlen
+from conftest import (
+    cos_sim,
+    rel_l1,
+    requires_backend,
+    requires_cuda,
+    requires_fp8_cast,
+    requires_varlen,
+)
 from sageattention import sageattn, sageattn_varlen
 
 DEV = "cuda"
@@ -242,6 +249,141 @@ def test_quant_qk_varlen_empty_sequence():
         )
         base = blk_offset(cu_list, seq, BLKK) * 4
         assert torch.equal(got[3][:, base : base + 4], ref[3][0, :, :4])
+
+
+# --------------------------------------------------------- quant_v_fp8_varlen
+# The fp8 V path keeps a second coordinate system: the transposed value is
+# zero-padded per sequence, because the sm89 V load has no bound predicate.
+
+# fp8 tensors have no comparison support in opcheck's schema/autograd utils;
+# the same three the dense fp8 opchecks run.
+NO_SCHEMA_FP8 = ("test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic")
+
+V_PAD = 64  # sm89 / sm120 padded V^T block (plan.cpp v_pad_of)
+
+
+def pad_offset(cu, b, pad):
+    """csrc/sageattn/varlen.h: sequence b's first padded token slot."""
+    return blk_offset(cu, b, pad) * pad
+
+
+def blk_total(total, batch, pad):
+    """csrc/sageattn/varlen.h: the padded axis length of the whole batch."""
+    return total // pad + batch
+
+
+def rand_packed(lens, heads=2, head_dim=64, seed=17):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    return torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+
+def one_sequence(packed, cu_list, b):
+    """Sequence b as a dense batch of one, [1, heads, n, head_dim]."""
+    return packed[cu_list[b] : cu_list[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+
+
+@requires_cuda
+@pytest.mark.parametrize("permute", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("lens", [[128], [37, 128, 1, 300], [64, 0, 64]], ids=str)
+def test_transpose_pad_v_varlen_matches_per_sequence_dense(permute, head_dim, lens):
+    """The transpose is the only fp16-in/fp16-out stage of the fp8 V pipeline,
+    so it is the one whose packed addressing can be checked on a pre-sm_89
+    device. Each sequence's slab must equal the dense transpose of that
+    sequence, zero fill included, and nothing past the written prefix may move
+    (the buffer starts as NaN)."""
+    cu_list = cu_of(lens)
+    total, batch, heads = cu_list[-1], len(lens), 2
+    packed = rand_packed(lens, heads, head_dim)
+    cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
+
+    padded_total = blk_total(total, batch, V_PAD) * V_PAD
+    out = torch.full(
+        (heads, head_dim, padded_total), float("nan"), device=DEV, dtype=torch.float16
+    )
+    OPS.transpose_pad_v(packed, out, "HND", permute, cu, max_seqlen=max(lens), pad_multiple=V_PAD)
+
+    for b, n in enumerate(lens):
+        base = pad_offset(cu_list, b, V_PAD)
+        written = cdiv(n, 64) * 64
+        # a sequence never writes past the blocks varlen.h gave it
+        assert out[:, :, base + written : pad_offset(cu_list, b + 1, V_PAD)].isnan().all(), (
+            f"sequence {b} spilled"
+        )
+        if n == 0:
+            continue
+
+        ref = torch.empty((1, heads, head_dim, written), device=DEV, dtype=torch.float16)
+        OPS.transpose_pad_v(one_sequence(packed, cu_list, b), ref, "HND", permute)
+        slab = out[:, :, base : base + written]
+        assert torch.equal(slab, ref[0]), f"sequence {b}"
+        # mma_k16 permutes inside 16-token groups, so its zero fill starts there
+        bound = cdiv(n, 16) * 16 if permute else n
+        assert (slab[:, :, bound:] == 0).all(), f"sequence {b} tail is not zero"
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
+@pytest.mark.parametrize("smooth_v", [False, True])
+def test_quant_v_fp8_varlen_matches_per_sequence_dense(v_layout, smooth_v):
+    lens = [37, 128, 1, 300]
+    cu_list = cu_of(lens)
+    packed = rand_packed(lens, seed=23)
+    cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
+
+    kw = dict(v_layout=v_layout, scale_max=448.0, smooth_v=smooth_v, pad_multiple=V_PAD)
+    got = OPS.quant_v_fp8_varlen(packed, cu, max_seqlen_k=max(lens), **kw)
+
+    for b, n in enumerate(lens):
+        ref = OPS.quant_v_fp8(one_sequence(packed, cu_list, b), tensor_layout="HND", **kw)
+        base = pad_offset(cu_list, b, V_PAD)
+        written = cdiv(n, V_PAD) * V_PAD
+        slab = got[0][:, :, base : base + written].view(torch.uint8)
+        assert torch.equal(slab, ref[0][0].view(torch.uint8)), f"v_fp8 sequence {b}"
+        assert torch.equal(got[1][b], ref[1][0]), f"v_scale sequence {b}"
+        if smooth_v:
+            assert torch.equal(got[2][b], ref[2][0]), f"v_mean sequence {b}"
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("smooth_v", [False, True])
+def test_quant_v_fp8_varlen_tail_is_zero(smooth_v):
+    """The white-box invariant the sm89 V load runs on: it reads whole CTA_K
+    tiles straight out of the slab with no predicate, so every byte from a
+    sequence's length to the end of its blocks has to be a zero fp8 - not
+    stale, and above all not a NaN encoding (0 * NaN would poison PV)."""
+    lens = [37, 128, 0, 1, 300]
+    cu_list = cu_of(lens)
+    packed = rand_packed(lens, seed=29)
+    cu = torch.tensor(cu_list, device=DEV, dtype=torch.int32)
+
+    v_fp8 = OPS.quant_v_fp8_varlen(
+        packed, cu, max_seqlen_k=max(lens), smooth_v=smooth_v, pad_multiple=V_PAD
+    )[0].view(torch.uint8)
+
+    for b, n in enumerate(lens):
+        base, end = pad_offset(cu_list, b, V_PAD), pad_offset(cu_list, b + 1, V_PAD)
+        assert (v_fp8[:, :, base + n : end] == 0).all(), f"sequence {b}"
+
+
+@requires_fp8_cast
+@pytest.mark.parametrize("v_layout", ["mma_k16", "linear"])
+@pytest.mark.parametrize("smooth_v", [False, True])
+def test_opcheck_quant_v_fp8_varlen(v_layout, smooth_v):
+    lens = [37, 128, 300]
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+    opcheck(
+        OPS.quant_v_fp8_varlen.default,
+        (rand_packed(lens, seed=31), cu),
+        dict(
+            max_seqlen_k=max(lens),
+            v_layout=v_layout,
+            scale_max=448.0,
+            smooth_v=smooth_v,
+            pad_multiple=V_PAD,
+        ),
+        test_utils=NO_SCHEMA_FP8,
+    )
 
 
 # ------------------------------------------------------------- fwd_varlen
