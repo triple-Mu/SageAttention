@@ -396,12 +396,13 @@ def gpu_uuid(device):
     return str(torch.cuda.get_device_properties(device).uuid)
 
 
-def check_exclusive(device, allow_shared):
-    """Refuse to measure on a GPU another process is computing on. Returns the
-    record of what was found (also stored in the meta block)."""
-    uuid = gpu_uuid(device)
-    if allow_shared:
-        return {"status": "skipped", "reason": "--allow-shared", "foreign": []}
+def compute_apps():
+    """uuid (without the "GPU-" prefix) -> [{"pid", "used_mib"}].
+
+    Must be called *before* CUDA is initialized: our own context would show up
+    as just another compute app, and it cannot be filtered out by PID -- inside
+    a container NVML reports host PIDs while ``os.getpid()`` returns the PID of
+    the container's namespace, so the two never compare equal."""
     raw = run_cmd(
         [
             "nvidia-smi",
@@ -415,17 +416,24 @@ def check_exclusive(device, allow_shared):
             "verified. Timings on a shared GPU are meaningless; pass "
             "--allow-shared to measure anyway."
         )
-    foreign = []
+    apps = {}
     for line in raw.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
             continue
         pid, mem, uu = parts[0], parts[1], parts[2]
-        if uu.removeprefix("GPU-") != uuid:
-            continue
-        if pid.isdigit() and int(pid) == os.getpid():
-            continue
-        foreign.append({"pid": pid, "used_mib": mem})
+        apps.setdefault(uu.removeprefix("GPU-"), []).append({"pid": pid, "used_mib": mem})
+    return apps
+
+
+def check_exclusive(device, allow_shared, apps):
+    """Refuse to measure on a GPU another process is computing on. ``apps`` is
+    the pre-CUDA-init snapshot from ``compute_apps()``. Returns the record of
+    what was found (also stored in the meta block)."""
+    if allow_shared:
+        return {"status": "skipped", "reason": "--allow-shared", "foreign": []}
+    uuid = gpu_uuid(device)
+    foreign = apps.get(uuid, [])
     if foreign:
         listed = ", ".join(f"pid {f['pid']} ({f['used_mib']} MiB)" for f in foreign)
         raise SystemExit(
@@ -861,10 +869,11 @@ def main():
             file=sys.stderr,
         )
 
+    apps = compute_apps() if not args.allow_shared else {}
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device")
     torch.cuda.set_device(args.device)
-    exclusive = check_exclusive(args.device, args.allow_shared)
+    exclusive = check_exclusive(args.device, args.allow_shared, apps)
     be = detect_backend(None if args.side == "auto" else args.side)
     meta = build_meta(be, args, args.device, exclusive)
     if meta["arch"] is None:
