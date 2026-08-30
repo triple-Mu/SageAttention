@@ -82,22 +82,24 @@ Sm100WsMode sm100_ws_mode()
     return mode;
 }
 
-// Heuristic for kAuto, judged per call (qo_len is a runtime value). The ws
-// kernel wins only on head_dim 128 with long rows: r3/r4 B200 sweeps have it
-// 1.006-1.027x faster at qo_len >= 16384 non-causal, but slower at
-// s <= 4096 (grid.x = qo_len/256, half the classic kernel's, so small grids
-// underfill the 148-SM wave) and 8-9% slower on d64 (only 384 of the 512
-// TMEM columns used). Causal crosses over later (auto/old 0.987-0.991 at
-// s16384, >= 1.006 at s32768; r4 bench, logs-w4), hence the higher causal
-// cut. Both are the measured all-positive lower bounds of their sweeps.
+// Heuristic for kAuto. After G1 (raw-domain softmax) the ws kernel wins on
+// every measured d128 shape, so head_dim alone decides; the r3/r4-era qo_len
+// cuts (16384/32768) are retired. Wave11 B200 sweeps (dfaebb4, logs-w11):
+// 22-point bench + crossover-gap grid + long-row four-state sweep cover
+// qo_len 1024..131072 x causal both x b{1,4}, ws/old 1.09-1.37 with the
+// worst point 1.0911 (b1 s6144 non-causal); the old short-seq loss went away
+// with the r5 epilogue TMA store, the old long-seq loss with G1. d64 stays
+// out: still 7-9% slower (only 384 of the 512 TMEM columns used). The
+// (tensor_layout, is_causal) parameters stay as the hook for re-cutting if a
+// future regression needs it.
 bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout, int is_causal)
 {
+    (void)tensor_layout;
+    (void)is_causal;
     if (query.dim() != 4) {
         return false;  // malformed input: let the classic parse report it
     }
-    const int64_t head_dim = query.size(3);
-    const int64_t qo_len   = (tensor_layout == 0) ? query.size(1) : query.size(2);
-    return head_dim == 128 && qo_len >= (is_causal ? 32768 : 16384);
+    return query.size(3) == 128;
 }
 
 }  // namespace
