@@ -1,0 +1,96 @@
+# sass_area.py --pairs over the area-probe cubins (build_area_probes.sh,
+# nvcc 13.3, production flags -O3 --use_fast_math). Static counts, NOP excluded.
+# f32x2 legality on sm_100a (ptxas 13.3): add/mul/fma.rn.f32x2 -> single
+# FADD2/FMUL2/FFMA2 SASS; max.f32x2 / min.f32x2 rejected ("Unexpected
+# instruction types"), so FMNMX(3) pairs are excluded from the packable set.
+### area_sm89.cubin
+
+== _ZN4sage4sm8924qk_int_sv_f8_attn_kernelILj128ELj64ELj32ELj64ELj128EL8DataType1EL16QuantGranularity3ELS3_3EfLb1E6__halfL11ComputeUnit1EL8MaskMode1ELb0ELb1ELb0ELb0EEEvPKaS8_S8_PT9_PfPKfSD_SD_SD_jjjljlljllljljlf
+  total instrs (no NOP): 3922
+  MUFU.EX2 f32: 204   MUFU.EX2.F16: 0   other MUFU: 5
+  MUFU.EX2 input producers: {'FFMA': 192, 'FADD': 12}
+  FMNMX(+3) (fmax): 228   FFMA: 600   FMUL: 389   FADD: 200
+  E1 XU-chain area = (EX2 204 + feederFFMA 192 + FMAX 228) / 3922 = 15.91%
+  P3 packable: 744 of 1189 f32 ALU instrs in adjacent independent same-op pairs = 18.97% of kernel (saves 9.48% if merged); by op {'FFMA': 414, 'FADD': 106, 'FMUL': 224}
+
+== _ZN4sage4sm8924qk_int_sv_f8_attn_kernelILj128ELj64ELj32ELj64ELj128EL8DataType1EL16QuantGranularity3ELS3_3EfLb1E6__halfL11ComputeUnit1EL8MaskMode0ELb0ELb1ELb0ELb1EEEvPKaS8_S8_PT9_PfPKfSD_SD_SD_jjjljlljllljljlf
+  total instrs (no NOP): 4085
+  MUFU.EX2 f32: 204   MUFU.EX2.F16: 0   other MUFU: 5
+  MUFU.EX2 input producers: {'FFMA': 192, 'FADD': 9, 'IMAD': 1, 'MOV': 2}
+  FMNMX(+3) (fmax): 228   FFMA: 600   FMUL: 389   FADD: 200
+  E1 XU-chain area = (EX2 204 + feederFFMA 192 + FMAX 228) / 4085 = 15.28%
+  P3 packable: 594 of 1189 f32 ALU instrs in adjacent independent same-op pairs = 14.54% of kernel (saves 7.27% if merged); by op {'FFMA': 260, 'FADD': 80, 'FMUL': 254}
+
+== _ZN4sage4sm8924qk_int_sv_f8_attn_kernelILj128ELj64ELj32ELj64ELj128EL8DataType1EL16QuantGranularity3ELS3_3EfLb1E6__halfL11ComputeUnit1EL8MaskMode1ELb0ELb1ELb0ELb1EEEvPKaS8_S8_PT9_PfPKfSD_SD_SD_jjjljlljllljljlf
+  total instrs (no NOP): 4185
+  MUFU.EX2 f32: 204   MUFU.EX2.F16: 0   other MUFU: 5
+  MUFU.EX2 input producers: {'FFMA': 192, 'FADD': 12}
+  FMNMX(+3) (fmax): 228   FFMA: 600   FMUL: 389   FADD: 200
+  E1 XU-chain area = (EX2 204 + feederFFMA 192 + FMAX 228) / 4185 = 14.91%
+  P3 packable: 522 of 1189 f32 ALU instrs in adjacent independent same-op pairs = 12.47% of kernel (saves 6.24% if merged); by op {'FFMA': 222, 'FADD': 82, 'FMUL': 218}
+
+== _ZN3cub16_V_300304_SM_8906detail11EmptyKernelIvEEvv
+  total instrs (no NOP): 3
+  MUFU.EX2 f32: 0   MUFU.EX2.F16: 0   other MUFU: 0
+  MUFU.EX2 input producers: {}
+  FMNMX(+3) (fmax): 0   FFMA: 0   FMUL: 0   FADD: 0
+  E1 XU-chain area = (EX2 0 + feederFFMA 0 + FMAX 0) / 3 = 0.00%
+  P3 packable: 0 of 0 f32 ALU instrs in adjacent independent same-op pairs = 0.00% of kernel (saves 0.00% if merged); by op {}
+### area_sm90a.cubin
+
+== _ZN4sage4sm9025qk_int8_sv_f8_attn_kernelILj64ELj128ELj128ELj128EL16QuantGranularity3ELS2_3E6__halfL8MaskMode0ELb0ELb1EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 1802
+  MUFU.EX2 f32: 132   MUFU.EX2.F16: 0   other MUFU: 3
+  MUFU.EX2 input producers: {'FFMA': 128, 'FADD': 4}
+  FMNMX(+3) (fmax): 140   FFMA: 264   FMUL: 196   FADD: 132
+  E1 XU-chain area = (EX2 132 + feederFFMA 128 + FMAX 140) / 1802 = 22.20%
+  P3 packable: 400 of 592 f32 ALU instrs in adjacent independent same-op pairs = 22.20% of kernel (saves 11.10% if merged); by op {'FFMA': 192, 'FADD': 82, 'FMUL': 126}
+
+== _ZN4sage4sm9025qk_int8_sv_f8_attn_kernelILj64ELj128ELj128ELj128EL16QuantGranularity3ELS2_3E6__halfL8MaskMode1ELb0ELb1EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 1874
+  MUFU.EX2 f32: 132   MUFU.EX2.F16: 0   other MUFU: 3
+  MUFU.EX2 input producers: {'FFMA': 128, 'FADD': 4}
+  FMNMX(+3) (fmax): 140   FFMA: 264   FMUL: 196   FADD: 132
+  E1 XU-chain area = (EX2 132 + feederFFMA 128 + FMAX 140) / 1874 = 21.34%
+  P3 packable: 386 of 592 f32 ALU instrs in adjacent independent same-op pairs = 20.60% of kernel (saves 10.30% if merged); by op {'FFMA': 198, 'FADD': 76, 'FMUL': 112}
+
+== _ZN3cub16_V_300304_SM_9006detail11EmptyKernelIvEEvv
+  total instrs (no NOP): 3
+  MUFU.EX2 f32: 0   MUFU.EX2.F16: 0   other MUFU: 0
+  MUFU.EX2 input producers: {}
+  FMNMX(+3) (fmax): 0   FFMA: 0   FMUL: 0   FADD: 0
+  E1 XU-chain area = (EX2 0 + feederFFMA 0 + FMAX 0) / 3 = 0.00%
+  P3 packable: 0 of 0 f32 ALU instrs in adjacent independent same-op pairs = 0.00% of kernel (saves 0.00% if merged); by op {}
+### area_sm100a.cubin
+
+== _ZN4sage5sm10031qk_int8_sv_f8_attn_kernel_sm100ILj128ELj128ELj128ELj64EL16QuantGranularity3ELS2_3E13__nv_bfloat16L8MaskMode1ELb1ELb0ELb1EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 3244
+  MUFU.EX2 f32: 258   MUFU.EX2.F16: 0   other MUFU: 3
+  MUFU.EX2 input producers: {'FFMA': 256, 'FADD': 2}
+  FMNMX(+3) (fmax): 130   FFMA: 260   FMUL: 457   FADD: 259
+  E1 XU-chain area = (EX2 258 + feederFFMA 256 + FMAX 130) / 3244 = 19.85%
+  P3 packable: 430 of 976 f32 ALU instrs in adjacent independent same-op pairs = 13.26% of kernel (saves 6.63% if merged); by op {'FMUL': 198, 'FFMA': 232}
+
+== _ZN4sage5sm10031qk_int8_sv_f8_attn_kernel_sm100ILj128ELj128ELj128ELj64EL16QuantGranularity2ELS2_2E6__halfL8MaskMode0ELb0ELb1ELb0EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 2977
+  MUFU.EX2 f32: 258   MUFU.EX2.F16: 0   other MUFU: 2
+  MUFU.EX2 input producers: {'FFMA': 256, 'FADD': 2}
+  FMNMX(+3) (fmax): 130   FFMA: 260   FMUL: 515   FADD: 258
+  E1 XU-chain area = (EX2 258 + feederFFMA 256 + FMAX 130) / 2977 = 21.63%
+  P3 packable: 510 of 1033 f32 ALU instrs in adjacent independent same-op pairs = 17.13% of kernel (saves 8.57% if merged); by op {'FMUL': 262, 'FFMA': 246, 'FADD': 2}
+
+== _ZN4sage5sm10031qk_int8_sv_f8_attn_kernel_sm100ILj128ELj128ELj128ELj128EL16QuantGranularity2ELS2_2E13__nv_bfloat16L8MaskMode0ELb0ELb0ELb1EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 3283
+  MUFU.EX2 f32: 258   MUFU.EX2.F16: 0   other MUFU: 2
+  MUFU.EX2 input producers: {'FFMA': 256, 'FADD': 2}
+  FMNMX(+3) (fmax): 130   FFMA: 260   FMUL: 643   FADD: 258
+  E1 XU-chain area = (EX2 258 + feederFFMA 256 + FMAX 130) / 3283 = 19.62%
+  P3 packable: 628 of 1161 f32 ALU instrs in adjacent independent same-op pairs = 19.13% of kernel (saves 9.56% if merged); by op {'FMUL': 390, 'FFMA': 238}
+
+== _ZN4sage5sm10031qk_int8_sv_f8_attn_kernel_sm100ILj128ELj128ELj128ELj128EL16QuantGranularity3ELS2_3E6__halfL8MaskMode1ELb1ELb1ELb0EEEv14CUtensorMap_stS5_S5_PKfS7_S7_PT5_Pflljjjjf
+  total instrs (no NOP): 3654
+  MUFU.EX2 f32: 258   MUFU.EX2.F16: 0   other MUFU: 3
+  MUFU.EX2 input producers: {'FFMA': 256, 'FADD': 2}
+  FMNMX(+3) (fmax): 130   FFMA: 260   FMUL: 777   FADD: 259
+  E1 XU-chain area = (EX2 258 + feederFFMA 256 + FMAX 130) / 3654 = 17.62%
+  P3 packable: 728 of 1296 f32 ALU instrs in adjacent independent same-op pairs = 19.92% of kernel (saves 9.96% if merged); by op {'FMUL': 494, 'FFMA': 234}
