@@ -1,0 +1,168 @@
+# sm100 varlen 支持设计(只设计,未实现)
+
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准。
+
+## 0. 结论
+
+1. **先做旧 128 线程 kernel 的 varlen,WS kernel 悬置到 Phase B**。旧 kernel 的 8 处改动全部有 sm90 varlen 的逐行对应物;WS kernel 的 varlen 需要动 16-warp choreography 的 trip 计算,收益上限只有 dense 实测的 +1.07% geomean(`bench/FINAL_PASS_REPORT.md` L9),且仅命中 d128 长序列段。
+2. **sm90 的 rank-4 tensor map batch=1 技巧可直接搬**,不需要 device-side tensormap(cuTensorMapReplace / tcgen05 时代的新设施)。sm90 与 sm100 共用同一个 host 侧 builder `create_tensor_map_4D`(csrc/tma.cuh:47-119)和同一条 `cp.async.bulk.tensor.4d` 指令(csrc/tcgen05.cuh:149 `using ::load_async_4D`;WS 的 u32 变体 csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu:193-205),`make_qkv_tensor_maps_varlen`(csrc/qattn/launch_utils.cuh:571-603)对 CTA_Q=CTA_K=128 是模板参数,原样可用。
+3. **quant 侧零新增 kernel**。`quant_qk_varlen` / `quant_v_fp8_varlen` / `segment_mean_varlen` 全部 arch 无关、几何参数化;sm100 需要的 (blk_q=128, warp_q=32) 已被 sm89/sm120 varlen 测试覆盖,(blk_k=128, warp_k=128) 已被 sm90 varlen 测试覆盖,V 的 linear 布局 + varlen 组合已有单测(test/test_varlen.py:343-406)。
+4. **工作量:Phase A 约 4 个会话**(1 拆分+SASS gate、1-2 实现、1-2 B200 验证+bench);Phase B(WS varlen)另加 2-3 个会话,建议等 Phase A bench 数据说明长序列 varlen 是否真实存在后再立项。
+5. 数值上 sm100 比 sm90 简单:sm100 不做 dequant scale 折进 sm_scale 的优化(逐元素乘,qk_int_sv_f8_cuda_sm100.cu:423),所以多 mask 一个 tile 不改变结果位,delta==0 的 dense 位等价(test_varlen.py:541-556 用 `torch.equal` 钉死)自动成立;sm90 为此专门做的 first_masked_tile 数值论证(qk_int_sv_f8_sm90_impl.cuh:138-151)在 sm100 只剩性能意义。
+
+## 1. 现状与 fallback 代价
+
+设计内拒绝在 plan.cpp:315-321:backend 解析到 `kSm100F8` 且 `varlen=true` 时直接置 `plan.error = "varlen is not supported by the sm100 backend"`。该行为被 test/test_varlen_utils.py:329-331(`test_varlen_rejects_sm100`)与 test/HARDWARE_CHECKLIST.md:99-103 钉死,B200 实机确认过报错可读(2026-08-29)。
+
+B200 上 `sageattn_varlen` 今天落在哪,取决于两个开关:
+
+| 条件 | 结果 | 代价 |
+|---|---|---|
+| `SAGEATTN_SM100_TCGEN05=1`(跑 sm100 的标准姿势) | plan 解析到 kSm100F8 → `ValueError`(sageattention/_plan.py:110-111) | varlen 完全不可用,dense 与 varlen 无法共存于同一进程配置 |
+| 未设 TCGEN05,构建含 sm89 家族 PTX(如 `8.9+PTX`) | plan.cpp:297-299 forced_fallback → `kSm89F8`,走 sm89_varlen kernel(fwd_varlen_cuda.cu:172-194),默认 per_warp + fp32+fp16 | mma.sync 路径:无 TMA、无 tcgen05、PTX JIT 上 sm_100;仓内无 B200 varlen fallback 实测数字,量化留给 M4 bench |
+| 未设 TCGEN05,构建无 sm89 PTX | `backend_serves` 检查报错(fwd_varlen_cuda.cu:97-104;plain cubin 8.9/12.x 与 cc 10.0 major 不合,plan.cpp:48-62) | varlen 完全不可用 |
+
+即:B200 生产姿势(TCGEN05=1)下 varlen 是硬错误,没有静默 fallback。dense 参照系:sm100 old kernel 对 cudnn 是 0.738(FINAL_PASS_REPORT L9),sm89 kernel 在 B200 上的比值没有仓内记录。
+
+## 2. 可移植资产:sm90 varlen 方案清单
+
+sm100 复用的机制与出处,实施时逐条对照:
+
+| 机制 | 出处 | sm100 适配点 |
+|---|---|---|
+| 闭式偏移(blk_offset/pad_offset/blk_total,两个 Property) | csrc/sageattn/varlen.h:56-101 | 直接用,kBlockQ=kBlockK=128 |
+| SeqlenInfo(offset/seqlen/blk base/delta,签名 delta) | csrc/sageattn/seqlen_info.cuh:40-72 | `SeqlenInfo<true, 128, 128>` |
+| rank-4 batch=1 tensor map(序列偏移走 token 坐标,cudagraph 安全) | launch_utils.cuh:564-603 | 模板参数 `<128, 128, HEAD_DIM>` 原样用 |
+| varlen 布局解析(packed 3-D、scale 无 batch 维、padded_k) | launch_utils.cuh:362-521(kSVF8TMA 族) | 原样用 |
+| scale 形状检查(blk_total 代数) | launch_utils.cuh:713-726 | Q_BLOCKS = blk_total(total_q,B,128)*4 |
+| `#ifdef SAGE_VARLEN` 独立 TU + 独立 namespace(dense SASS 不动) | qk_int_sv_f8_sm90_impl.cuh:24-31;qk_int_sv_f8_cuda_sm90_varlen.cu:26-27 | 需先把 sm100 kernel 拆出 impl header(见 §3.1) |
+| 空 grid 尾块提前退出 + 零 trip 零填充路径 | sm90_impl.cuh:123-127, 153-188 | 结构照搬,thread=row 使零填充更短 |
+| bottom-right causal:签名 trip + first_masked_tile | sm90_impl.cuh:129-151 | 照搬;无 fold ⇒ 无数值约束(§3.3) |
+| K 尾 tile 跨序列读 + mask 清除;V 靠 slab 永不跨序列 | sm90_impl.cuh:381-385, 479-484 | 照搬 |
+| dead row(无可见 key 的行)强制 O=0 / lse=-inf | sm90_impl.cuh:616-650 | thread=row,可用 d_rcp=0 简化(§3.3 第 7 条) |
+| launcher:grid.x=ceil(max_seqlen_q/CTA_Q)、padded_k 钉死、stride_batch_o=0 | qk_int_sv_f8_cuda_sm90_varlen.cu:88-150 | 克隆改名 |
+| fwd_varlen 分发(per-backend case + pv 断言) | csrc/sageattn/fwd_varlen_cuda.cu:146-248 | 加 kSm100F8 case(pv=="fp32") |
+
+TMA 对 packed 布局的约束只有两条,均已满足:batch stride 16 字节对齐(launch_utils.cuh:568-570 注释;packed q/k 强制 CHECK_CONTIGUOUS,launch_utils.cuh:382-383,stride_seq = heads*head_dim 字节,hd∈{64,128} 恒对齐)、各维 <2^32 / stride <2^40(tma.cuh:75-88 预检)。越界读由 TMA 填 0(int8),被 kv_len mask 或 V slab 零填充吸收。不需要逐序列 tensor map,也就不需要 device-side 修改 descriptor。
+
+## 3. 旧 128 线程 kernel:varlen 路径
+
+### 3.1 前置:impl header 拆分
+
+sm100 kernel 体当前直接住在 csrc/qattn/qk_int_sv_f8_cuda_sm100.cu(不像 sm90 已拆 impl header)。varlen TU 复用 kernel 体的前提是先拆出 `qk_int_sv_f8_sm100_impl.cuh`(纯移动:kernel 模板 + 文件头注释,launcher 留原 TU),再新建 `qk_int_sv_f8_cuda_sm100_varlen.cu`:
+
+```cpp
+#define SAGE_VARLEN 1
+#define SAGEATTN_ARCH_NS sm100_varlen   // 单 so ODR,同 sm90 模式
+#include "qk_int_sv_f8_sm100_impl.cuh"
+```
+
+sm90 先例证明纯移动保 SASS 逐字节不变(sm90_impl.cuh:19-31)。注意 WS 文件头(_ws.cu:44-46)明确为保 SASS gate 而选择注释复刻不提取——那是针对跨 kernel 共享 helper 的决定,不否定同一 kernel 体的纯移动拆分;两条硬规则照 memory 执行:共享 body 加 `#ifdef` 时不提局部变量、gate 失败时按单 TU 二分。
+
+`SAGE_SM100_DEVICE_ONLY`(ptxas probe 模式,qk_int_sv_f8_cuda_sm100.cu:66-99)随 kernel 体一起进 impl header,probe TU 不受影响。
+
+### 3.2 kernel 内 8 处 `#ifdef SAGE_VARLEN` 改动点
+
+对照 dense 行号(qk_int_sv_f8_cuda_sm100.cu)与 sm90 对应物:
+
+| # | 位置(dense) | 改动 | sm90 对应 |
+|---|---|---|---|
+| 1 | :140-146 签名 | `qo_len/kv_len` 换成 `cu_seqlens_q/k + q_scale_stride_h + k_scale_stride_h + lse_stride_h`(独立 TU,dense 参数区不动) | impl.cuh:78-92 |
+| 2 | :231-235 之后 | `SeqlenInfo<true,128,128>`;`cta_idx_q*128 >= qo_len` 整块退出(在 :297 barrier init、:308 TMA、:332 tmem_alloc 之前,块内 uniform) | :114-127 |
+| 3 | :348-349 | trip 计算改签名 bottom-right:`kv_bound = causal ? min(kv_len, (cta+1)*128 + delta) : kv_len`,`num_iterations = div_ceil(int32)`;加 `first_masked_tile`(clamp 到 num_iterations-1);**并把这段提前到 :308 的 TMA 之前**,以支持第 4 条的零 trip 退出 | :129-151 |
+| 4 | 同上 | `num_iterations <= 0` 时:每 thread 给自己的 row(`q_idx < qo_len` 时)写 head_dim 个零 + lse=-INFINITY,然后整块 return(仍在 barrier/TMA/TMEM 之前)。thread=row,无 sm90 那套 fragment 展开 | :153-188 |
+| 5 | :312-314(prologue)、:389(K prefetch)、:547(V prefetch) | TMA 坐标:Q `(0, offset_q + cta*128, head, 0)`;K `(0, offset_k + iter*128, kv_head, 0)`;V `((blk_k_base + iter)*128, 0, kv_head, 0)`;batch 坐标恒 0 | :309-325, :381-388, :479-488 |
+| 6 | :249-278 scale 索引 | 改为 `[heads, blocks]` 寻址:Q = `head_id*q_scale_stride_h + (blk_q_base + cta_idx_q)*per_cta + …`(per_warp per_cta=4、per_thread=32,行内项 row_id/32、row_id%8 不变);K base = `kv_head_id*k_scale_stride_h + blk_k_base*k_scale_per_cta`。dense 版依赖 `gridDim.x`(:254, :260)与 `div_ceil(kv_len,…)`(:267, :273),varlen 下 grid 开到 max_seqlen、块又有前置序列,两处都必须换参数 | :212-234 |
+| 7 | :425-438 mask | 谓词换签名 shifted 行:`kv_idx > q_idx + delta \|\| kv_idx >= kv_len`(int32);触发条件从 `if constexpr (is_last)` 换成 varlen 侧 `if (iter >= first_masked_tile)`(runtime、块内 uniform;dense 分支保留原文本)。process_tile 的 prefetch 仍按 is_last 剥离 | :404-431, :534-549 |
+| 8 | :561-601 epilogue | O 指针基址 `offset_q`、lse 改 `[heads, total_q]`:`head_id*lse_stride_h + offset_q + q_idx`;causal 下 dead row(`q_idx + delta < 0`)强制 `d_rcp = 0`(O 自然清零,无 NaN 风险:TMA OOB 填 0、V slab 零填充,全链路有限值)且 lse=-INFINITY | :616-650, :678-684, :729-733 |
+
+改动点 3/7 的数值论证:sm100 的 dequant 是逐元素 `s = int2float(RS)*dequant_scale_j`(:423),不存在 sm90 的"未 mask tile 折 scale 进 sm_scale"分叉(sm90_impl.cuh:347-359),所以对一个无越界元素的 tile 跑 mask 谓词不改任何位。delta==0 时 first_masked_tile 恒等于 num_iterations-1,mask 元素集合与 dense is_last 完全一致,`torch.equal` 级 dense 等价自动成立。
+
+### 3.3 host 侧与接线
+
+| 项 | 内容 |
+|---|---|
+| launcher | 新 `sm100_varlen::qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn`,克隆 sm90 varlen launcher(qk_int_sv_f8_cuda_sm90_varlen.cu:37-159):CTA_Q=CTA_K=128、NUM_THREADS=128;padded_k 钉 `blk_total(total_k,B,128)*128`(:90-101 同款);scale 检查 `SAGEATTN_CHECK_QK_SCALE_SHAPES_VARLEN(blk_total(total_q,B,128)*4, blk_total(total_k,B,128))`;`make_qkv_tensor_maps_varlen<128,128,HD>`;grid `(div_ceil(max_seqlen_q,128), num_qo_heads, batch_size)`;stride_batch_o 传 0。**不接 SAGEATTN_SM100_WS 开关**(dense launcher :706-721 的路由 varlen 入口不复制,Phase A 无 WS varlen 可路由) |
+| 头文件 | 新 `csrc/qattn/attn_cuda_sm100_varlen.h`(仿 attn_cuda_sm90_varlen.h) |
+| plan.cpp | 删 :315-321 的拒绝块。smooth_v 降级(:346-349)、`v_pad_multiple==blk_k` 恒等式(fwd_cuda.cu:149-153,sm100 v_pad=128=blk_k,plan.cpp:211/236)均已就绪 |
+| fwd_varlen_cuda.cu | include 加 SM100 分支(:40-51 处);switch 加 `kSm100F8` case,`TORCH_CHECK(plan.pv == PVAccum::kFp32)`(:146-248 同款) |
+| CMakeLists.txt | `SAGE_BUILD_VARLEN` 下向 `SAGE_SRC_SM100` 追加 varlen TU(:137-139 sm90 同款;sm100 是 accel 组,gencode sm_100a+sm_110a 自动继承) |
+| Python | sageattention/varlen.py:41 `_VARLEN_BACKENDS` 加 "sm100";docstring :182-198 改口径 |
+| 测试更新 | test/test_varlen_utils.py:329-331 反转断言(或改为"不再拒绝");:344-345 的 sm100 豁免删除;test/HARDWARE_CHECKLIST.md:99-103、:673 行改状态 |
+
+sm110(cc 11.0)随 plan.cpp:294 与 fatbin 的 sm_110a 条目自动获得同样支持,无额外工作。
+
+## 4. WS kernel(C1,512 线程双 Q tile):varlen 路径
+
+### 4.1 结构差异与改动点
+
+WS 的 CTA 覆盖 256 行(2×128 tile),varlen 语义全部可表达,改动点(qk_int_sv_f8_cuda_sm100_ws.cu):
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | :344-359 签名 | 同旧 kernel 第 1 条 |
+| 2 | :492 `__syncthreads` 之前 | SeqlenInfo + 整块退出:`cta_idx_q*256 >= qo_len` 或 `trip_count(1) == 0` → 前 256 线程按 thread=row 零填 O(行有效时)+ lse=-INFINITY 后整 CTA return。必须在 barrier init(:456-473)与 tmem_alloc(:487-491)之前,512 线程一致 |
+| 3 | :501-507 trip_count | 签名 bottom-right:`trip(tile) = div_ceil(max(0, min(kv_len, (2bx+tile+1)*128 + delta)), 128)`;再 `trip0 = max(trip0, 1)`(见 4.2) |
+| 4 | :540-541 | qblk clamp 改按序列自己的块数:`min(2bx+tile, div_ceil(qo_len,128)-1)`,再加 `blk_q_base` 基址;Q/K scale 寻址同旧 kernel 第 6 条(:543-566 两处 `num_ctas_k` 换 k_scale_stride_h) |
+| 5 | :638-654 is_oob | 谓词加 delta(signed);触发条件从 is_last 换 `iter >= first_masked_tile(tile)`(runtime;softmax_step 的 is_last 只管 mask,:602-655,无 prefetch 耦合,替换安全) |
+| 6 | :1138-1175 load warp | TMA 坐标:Q0/Q1 加 offset_q,K 加 offset_k,V 换 `(blk_k_base + i)*128`,batch 坐标 0 |
+| 7 | :864-913 correction epilog + :781-787 softmax lse | dead row(`q_idx + delta < 0`):epilog 里 `d_rcp = 0`,lse 写 -INFINITY;O/lse 寻址换 packed 形式(同旧 kernel 第 8 条) |
+| 8 | :1192-1288 launcher | 克隆 + grid `(div_ceil(max_seqlen_q, 256), heads, batch)`;quant 块保持 128 行(scale 检查同旧 kernel varlen launcher) |
+
+### 4.2 trip0==0 的处理:clamp,不改 choreography
+
+bottom-right 下可能出现 `trip0 == 0 < trip1`(tile 0 整块 128 行都无可见 key,仅 causal 且 delta 足够负时)。mma warp 的 prologue 无条件做 QK00/PV00(:1022-1036),softmax0/correction 的 barrier 计数都假定 tile 0 至少一轮;按 tile 跳过会改 16-warp choreography,直接威胁 barrier_ledger.md 的死锁自由证明。
+
+方案:**clamp `trip0 = max(trip0, 1)`,让 tile 0 跑一轮全 mask 的废轮**,dead-row 覆盖(第 7 条)把它的全部 128 行输出清洗掉。论证:
+
+- choreography 完全不变:clamp 后仍满足 `trip0 >= 1` 且 `trip1 - trip0 ∈ {0, 1}`(两 tile 的 kv bound 差 128,ceil 差 ≤1;clamp 只在 trip1>=1 时把差从 1 收到 ≤1),现有 steady loop(:1042-1072)+ S1-only 轮(:1075-1093)+ tail(:1096-1106)照跑;
+- 数值安全:全 mask 行的 P 元素是 `exp2(+8.807)≈448`(-5e6 sentinel 与 row_max 相消,只剩 S_FP8_OFFSET,正好顶到 e4m3 饱和值)而非 0,O0 是废值,但 trip0==0 ⇔ tile 0 的最后一行也无可见 key ⇔ 全 128 行都是 dead row,epilog 的 `d_rcp=0` 覆盖全 tile,废值不落地;lse 由 softmax 侧统一写 -INFINITY;
+- 代价:仅该 CTA 一轮 KV tile 的废功,且只在极端 ragged causal 批出现;
+- kv_len==0(trip1==0)不会走到这里,第 2 条整块退出已拦截。
+
+废轮的 K scale 读块 0:trip1>=1 ⇒ kv_len>=1 ⇒ 序列至少有一个已写 scale 块,不越界。
+
+### 4.3 判断:Phase B 缓做
+
+- 收益上限:dense 实测 WS 只在 d128、非 causal >=16k / causal >=32k 段赢 0.6~2.7%,geomean +1.07%(FINAL_PASS_REPORT L9);varlen 工作负载以中短序列为主,命中概率更低;
+- 风险不对称:choreography 相关改动的验证成本高(ws_stress.py SWEEP + 8000×2 定点是 sm100 通则,HANDOFF.md L22),寄存器预算(softmax 192 区间)加 SeqlenInfo/delta 计算后需重过 ptxas gate;
+- 依赖:FINAL_PASS_REPORT L45 已注明 sm100 varlen 等 C1 定型,C1 的下一个 lever(ld 与首消费点间填独立工作)可能再动 softmax 结构。
+
+Phase A 落地后 varlen 入口 plan 恒走旧 kernel,`SAGEATTN_SM100_WS` 只影响 dense,文档写明即可。
+
+## 5. quant 侧现状(设计问题 2)
+
+| 组件 | 现状 | sm100 需要的组合 | 覆盖证据 |
+|---|---|---|---|
+| `quant_qk_varlen`(csrc/sageattn/quant_cuda.cu:168-266) | arch 无关,blk/warp 全参数化,scale 输出 `[heads, blk_total 代数]`,per_warp/per_thread 双支 | blk_q=128, warp_q=32, blk_k=128, warp_k=128(plan.cpp:208-213),默认 gran=per_warp(plan.cpp:111-114) | Q 侧几何 = sm89/sm120 varlen(test_varlen_sm89/sm120.py 各 62 例已上机);K 侧 blk_k=128 双 gran = sm90 varlen(test_varlen_sm90.py:25 GEOM);DISPATCH_BLOCK_SIZE 本就含 64/128(csrc/dispatch_utils.h:86-98)。四元组本身在 test_varlen_sm100.py 里补 |
+| smooth_k:`segment_mean_varlen`(:274-292)+ fuse_sub_mean varlen 实例(:239-242, :250-258) | chunked kernel,布局无关 | blk_k=128 的 fuse_sub_mean varlen 实例 | 编译已有(同 DISPATCH);dense 的 128 实例即 sm100 dense 日常路径,varlen 例进新测试文件 |
+| `quant_v_fp8_varlen`(:390-474) | slab 按 pad_multiple 零填充(v_fp8 at::zeros,:421-426),fused/两段两路 bit 等价,融合门限 sm100=24576(:60-65) | v_layout="linear"(permute=False,:419)、pad_multiple=128、scale_max=448 | linear×varlen 与 pad=128 尾零已有单测(test/test_varlen.py:343-360, :366-406);128 slab 对齐 = sm90 已上机路径 |
+| scale 布局对 CTA_Q=128/CTA_K=128 | launcher 检查即 blk_total 代数(launch_utils.cuh:713-726),kernel 侧 per_warp 4/块、per_thread 32/块(Q)与 1 或 4/块(K) | 与 dense sm100 kernel 的行内索引(row_id/32、(j%8)/2)完全同构,只换块基址 | §3.2 第 6 条 |
+
+结论:quant/mean/V 链路一行 CUDA 不用写,Python 侧 `sageattn_varlen`(sageattention/varlen.py:240-299)按 plan 参数自动出正确几何。
+
+## 6. 实施顺序、milestone 与 gate(设计问题 3)
+
+顺序:**先旧 kernel(Phase A M1→M4),WS(Phase B)悬置**。
+
+| 里程碑 | 内容 | gate | 场地 | 会话 |
+|---|---|---|---|---|
+| M1 | impl header 拆分(纯移动) | dense sm100 TU 的 sm_100a/sm_110a SASS 逐字节等同(gensass 流程,memory「验证基建」);全 arch 构建绿 | 本机(nvcc 13.3 可编 sm_100a,无需硬件) | 1 |
+| M2 | varlen TU(§3.2 八处)+ launcher/头/plan/dispatch/CMake/Python(§3.3)+ test_varlen_sm100.py 编写 | 本机全量编译;ptxas 无 spill 告警(test_ptxas_gate 模式);pytest 非 GPU 部分绿(plan 表、错误串) | 本机 | 1-2 |
+| M3 | B200 correctness | `pytest test/test_varlen_sm100.py test/test_varlen.py -q` 全绿。test_varlen_sm100.py 套 sm90 文件的 gate 组(HARDWARE_CHECKLIST :103-108 口径):等长 batch 对 dense sm100 kernel `torch.equal`(golden 即 dense 同 kernel 体,无需新 golden dir)、ragged 非 causal 逐段对 dense、CAUSAL_RAGGED 四组 bottom-right、空 KV 段、dead row O==0/lse==-inf、opcheck、双 gran × 双 hd × causal | ComputeLab b200x4(--sqsh pytorch_26.07-py3,完毕 cancel) | 与 M4 合计 1-2 |
+| M4 | bench + 文档 | `bench/bench_varlen.py`(packed vs padded dense,equal/ragged .25/.1 三 profile × 5 shape × causal)+ 同机 fallback 对照(TCGEN05 off → sm89 backend);口径按 BENCH_PROTOCOL(独占、双向交替、geomean>0.5%、方向一致);ncu 过滤 `-k regex:qk_int8_sv_f8_attn_kernel_sm100`;更新 HARDWARE_CHECKLIST/HANDOFF | 同 M3 分配 | — |
+| Phase B(悬置) | WS varlen(§4)| 上述全部 + `ws_stress.py` SWEEP + 8000×2 定点 + ptxas 预算复核 + bench 证明命中段存在 | B200 | 2-3 |
+
+Phase A 合计约 4 个会话(±1,取决于 M3 一次过与否)。
+
+## 7. 风险(设计问题 4)
+
+| 风险 | 内容 | 缓解 |
+|---|---|---|
+| bottom-right causal × 双 Q tile 的 trip 计算 | WS 两 tile trips 必须保持 `trip1-trip0 ∈ {0,1}` 且 ≥1,否则 16-warp choreography 死锁 | §4.2 clamp 方案不改 choreography,barrier_ledger.md 证明沿用;CAUSAL_RAGGED(test_varlen.py:632-637,含 delta=-999)+ 新 256 行粒度用例钉死;Phase A 不碰此风险 |
+| 空序列 / 尾 tile × TMA OOB | K 尾 tile 越过序列尾读到下一序列 token(需 mask 清除)、越过 total_k(TMA 填 0);空 K 序列 trip=0 走不到 mask | 三层既有先例:mask 谓词含 `kv_idx>=kv_len`、V 走 slab 永不跨序列(varlen.h Property 1 + pad=blk_k=128,fwd_cuda.cu:149-153 恒等式)、零 trip 提前退出(§3.2 第 4 条);退出必须在 barrier init/TMA/tmem_alloc 之前且块内 uniform,WS 版还要在唯一一次 `__syncthreads`(:492)之前 |
+| dead row 数值 | 全 mask 行的 P=exp2(+8.807)≈448 不为 0(sentinel 相消只剩 offset),不覆盖就输出 KV tile 的伪平均 | `d_rcp=0` + lse=-INFINITY 强制覆盖(§3.2 第 8 条);test_varlen.py:665-669 精确断言 O 全零、lse 恒 -inf;全链路有限值(TMA 填 0、slab 零填充),无 0×NaN |
+| impl 拆分动 dense SASS | 提取即改 dense TU 文本 | M1 独立成会话,gensass 双 arch 逐字节 gate;`#ifdef` 不提局部变量、失败按单 TU 二分(memory 两条硬规则);varlen TU 本身不受 gate 约束(新 namespace 新 kernel) |
+| grid 开到 max_seqlen 的空转 | ragged 批中大量 CTA 秒退,B200 148 SM 波次利用率下降 | 与 sm90/sm89 varlen 同构的既有代价,M4 ragged profile 直接量化;不在本设计内优化(persistent/动态调度另立项) |
+| WS 寄存器预算 | softmax 192 区间加 SeqlenInfo/first_masked_tile 后可能 spill | Phase B 前置 ptxas 核对;预算恒等式 static_assert(:377-381)保总量 |
+| 构建时长/OOM | sm100 fatbin 加第三个 TU(sm_100a+sm_110a) | 并发乘积 ≤16(memory「编译 OOM 教训」) |
