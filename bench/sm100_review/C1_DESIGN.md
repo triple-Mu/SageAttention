@@ -55,8 +55,8 @@ q_scale 块索引 clamp 防越界读),与 cutedsl 同策略。
 | setmaxnreg | 192/192/96/32(L169-172) | **192/192/88/40** | 实测:correction 区 ptxas 上限 77-78 reg(88 下余 10);裸 mbarrier 版 mma/load 需 ~38,32 时 ptxas 把溢出压栈(24B spill)。总和仍恰 64K,kernel 内 static_assert 锁死 |
 | mma_corr pipeline | 共享 2-stage ring,o0/o1 交替 | 每 O tile 专用 1-stage ×2 | S1-only 轮打破交替后共享 ring 的 slot=item%2 错位;专用 pipe 语义等价(账本 §1)且 phase 记账是纯标量 |
 | mma_s 尾部 dummy commit | L745-746(softmax 末段多等一拍) | 无 | 本实现 softmax 末段不等 mma_s,计数天然平衡(账本 §3);少两次 commit |
-| softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | 换成现 kernel 的逐元素序(:412-474 照抄) | M0-M2 bit-exact 硬闸;packed 化留给 M3 后再评估(需重开 golden 口径) |
-| softmax 寄存器策略 | 整行 128 f32 驻留 | 照抄:单遍读、整行驻留(见 §3;初版两遍读实测 0.887× 已回退,见 §6.1) | dequant 后行驻留 128 reg + 状态 ~30,ptxas 收在 189/192、零 spill;每 KV 块每线程 4 次 32 列 tmem_ld(两遍版是 7 次) |
+| softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | 逐元素值序照抄现 kernel(:412-474);round 3 起 dequant mul 与 exp2 输入 fma 走 f32x2 packed 指令,per-lane IEEE 语义与标量逐位一致(§6.3),不是 cutedsl 那种改值域的 packed 化 | bit-exact 硬闸保持;cutedsl 式常量域改写仍留给 M3 后(需重开 golden 口径) |
+| softmax 寄存器策略 | 整行 128 f32 驻留 | 照抄:单遍读、整行驻留(见 §3;初版两遍读实测 0.887× 已回退,见 §6.1) | 行驻留 128 reg + 状态 ~30,ptxas 收在 170-173/192、零 spill(§6.3);每 KV 块每线程 2 次 64 列 tmem_ld(round 2 是 4 次 x32,两遍版 7 次) |
 | vec 提前信号(max 后、exp2 前发) | L1104-1109 | 照抄(全部 S 读已完成,别名列 [0,2) 已死) | correction 的 O rescale 藏进 softmax 的 exp2 段,是重叠收益主源 |
 | k_scale smem 预载(sKScale) | L544-552(per-block gran) | 不搬,保持现 kernel 逐块 global 读 | 我们默认 per-thread gran(每 tile 4 标量);M2 若 long_scoreboard 热点再加 |
 | q_scale 粒度 | BLKQ=64/WARPQ=16 契约 | 现 kernel 的 BLKQ=128 契约,块索引改 2bx+tile + clamp | 量化侧零改动 |
@@ -97,16 +97,18 @@ host 侧),SASS 恒等由此保证。
 
 | 区 | 预算 | ptxas 区内峰值(4 实例最大) | 余量 |
 |---|---|---|---|
-| softmax(warp 0-7) | 192 | R188 → 189(两遍读旧版 172;整行驻留 +17) | 3 |
+| softmax(warp 0-7) | 192 | 173(round 2 单遍驻留 189;round 3 f32x2 pack 后 170-173,§6.3) | 19 |
 | correction(warp 8-11) | 88 | R77 → 78 | 10 |
 | mma/load(warp 12-15) | 40 | 线性段混入冷块不可直读;40 下 0 spill,32 下 24B spill | ~2-6 |
 | 合计 | 2·192+88+40 = 512/线程列 ×128 = 64K | — | 恰满 |
 
-softmax 区细账(单遍驻留版):RS_f32 整行 128 + RP_u32 打包 32(pack 每出
-1 word 杀 4 个 RS_f32,联合活跃度自 max 点后单调降)+ 标量状态
+softmax 区细账(单遍驻留版):行驻留 128(round 3 起是 uint32_t 数组,
+raw→f32 原位覆盖,LDTM in-flight 块与驻留行共用)+ RP_u32 打包 32(pack
+每出 1 word 杀 4 个行元素,联合活跃度自 max 点后单调降)+ 标量状态
 (row_max/denom/相位/4 个 barrier 地址/tmem_row/scale 组)~30,强制平台
-≈ 158,其余是 ptxas 调度自由度。cutedsl 同形(整行 f32 + 32 P word)同样
-收在 192(其账面 ~190)。
+≈ 158,其余是 ptxas 调度自由度;f32x2 的寄存器对约束反而帮 ptxas 收敛
+(189→170-173)。cutedsl 同形(整行 f32 + 32 P word)同样收在 192
+(其账面 ~190)。
 
 偏离任务书的 192/192/96/32 的原因:zero-spill 门禁与 32-reg mma/load 区冲突
 (裸 mbarrier 记账 + 描述符循环不变量 ~38 live)。88/40 调剂后四实例
@@ -181,14 +183,78 @@ A5 判负的「批量发射后集中 wait」模式。方案取舍:
 预期信号(下轮上机):`long_scoreboard` 回落、ws/old 转正;golden 双 gate
 输出应与两遍版逐位一致(值恒等论证 §3)。
 
+### 6.2 M2 第二轮实测(round 2):单遍驻留落地,仍慢 5.3%
+
+数据(B200;22 点全表在主控 scratchpad,此处只记口径与结论):
+
+- cdsl_bench 22 点,ws/old d128 几何均值 **0.947**(0/22 翻正);长序列
+  non-causal ≈0.98,短序列/causal 0.83-0.93;d64 0.89-0.90。
+- ncu b4h32s16384 non-causal d128:duration 16.86 ms(old 16.31 ms);
+  Active/scheduler 3.43、Eligible 0.77;`long_scoreboard` 仍是最大 stall
+  项。注意 per-issue 口径的 stall 比值因总发射数下降不可直接跨版本比,
+  绝对口径 duration 相对 round 1(0.887×)已改善。
+- 归因:softmax 每 KV 块 4 条 ld+wait 串行 tcgen05.ld(每条 32 列),
+  4 段暴露延迟;softmax 区寄存器 189/192(余 3),批量/交错方向没有
+  寄存器空间。
+
+### 6.3 round 3:宽 tcgen05.ld + f32x2 pack(已实现,待上机)
+
+两个独立 commit,每个都过 §5 门禁(nvcc 13.3,4 实例 × sm_100a/sm_110a,
+全部 0 spill / 0 stack / 入口 128 reg):
+
+1. **S drain 加宽 4×x32 → 2×x64**(commit 58a6a11)。
+   - x128(整行一条 ld)不可行:`tcgen05.ld.32x32b.x128` 单条指令自身
+     128 个 dst + 地址操作数超过 `__launch_bounds__(512,1)` 钉死的 128
+     入口寄存器目标,ptxas 报 C7602;该检查用函数级目标,setmaxnreg 区
+     预算(192)救不了(实测)。x64 是可行上限(指令脚印 65)。
+   - raw→f32 原位转换(uint32_t 行数组 + 位转换),LDTM in-flight 块与
+     驻留行共用寄存器;逐元素值序不变(bit-exact 保持)。
+   - SASS:softmax 区 LDTM 8→4/实例,区内峰值 189 不变,无 MOV 膨胀。
+   - 预期:暴露 TMEM-load 延迟链 4→2 段,`long_scoreboard` 相应回落。
+2. **f32x2 pack**(commit d405309;prescreen P3 的 go 判据落地,
+   bench/microbench/PRESCREEN_REPORT.md)。
+   - dequant mul 与 exp2 输入 fma 逐相邻列对 pack 成
+     `mul/fma.rn.ftz.f32x2`(相邻两列共享 k_scale,乘数是 splat);
+     per-lane 是独立 IEEE fp32 运算,舍入/ftz 与标量 `mul.ftz.f32` /
+     `fma.rn.ftz.f32` 一致 → 逐位一致。max 链(无 max.f32x2)与 d_sum
+     串行加法链保持标量原序。
+   - PTX 层对账:add/max 计数不变,mul 3672 = 2648 标量 + 512×2 packed,
+     fma 1040 = 16 标量 + 512×2 packed——严格 1:1 lane 替换。
+   - sm_100a SASS:FMUL2.FTZ / FFMA2.FTZ 各 128/实例,splat scale 折成
+     单寄存器广播、零 MOV 开销;静态指令 -4.8%~-7.0%;softmax 区寄存器
+     峰值 189→170-173(余量 3→19+)。sm_110a 无 packed f32 ALU,ptxas
+     拆回两条标量,中性。
+   - 预期:FMA pipe issue 压力 -5~7%;XU(MUFU)不动,收益上限受 XU
+     串行链约束(§6 基线画像)。
+
+方向 3(chunk 交错,2-outstanding)按 round 3 任务书跳过:方向 1 已可行,
+且 SASS 显示 ptxas 在 peeled 实例里已自发把两条 x64 背靠背发射
+(2 outstanding)——PTX 级 per-ld wait 不钉死 SASS 调度。若下轮
+`long_scoreboard` 仍主导,f32x2 后的 19+ 寄存器余量已够源级交错立项,
+先例是本观察 + cutedsl 的 4×x32 批量发射(其 2.31× 实测即此模式);重开
+前仍须遵守 A5 规则(先复现定位挂死)。
+
+资源与静态指令表(round 2 → round 3,sm_100a;sm_110a 同为 0 spill):
+
+| 实例 | 总指令 | softmax 区 LDTM | softmax 区寄存器峰值 |
+|---|---|---|---|
+| hd64 per-thread causal+lse | 4872→4608 | 8→4 | 189→173 |
+| hd64 per-warp 非 causal | 3904→3624 | 8→4 | 189→170 |
+| hd128 per-warp 非 causal | 4576→4312 | 8→4 | 189→170 |
+| hd128 per-thread causal+lse | 5224→4960 | 8→4 | 189→173 |
+
+上机判据(叠加不变):golden 双 gate 逐位一致(两处改动的值恒等论证在
+kernel 注释与本节;硬件 FMUL2/FFMA2 的 per-lane IEEE 语义由 golden gate
+终审);bench 22 点 ws/old 转正;ncu `long_scoreboard` 显著回落。
+
 M2 若仍不达标的定位顺序:
 1. vec/corr 1-stage 串扰:`smsp__warp_issue_stalled_barrier` 分角色看;若
    correction 卡 vec,考虑 vec 双缓冲(TMEM 有空列:d64 显然,d128 可借
    P 区错峰,需重开别名论证)。
 2. mma warp 发射间隙:`sm__pipe_tensor_op_cycles_active` 占空;若 QK/PV 间
    有大空洞,检查 s_empty 到达延迟(softmax 关键路径)。
-3. softmax 4 条串行 ld 链仍是热点:fragment 级双缓冲(2 outstanding)重开
-   前必须先复现并定位 A5 挂死(HARDWARE_CHECKLIST 规则)。
+3. softmax 2 条串行 x64 ld 链仍是热点:源级交错(2 outstanding)按 §6.3
+   方向 3 段的先例与 A5 规则立项。
 
 ## 7. 风险与回退
 
@@ -200,7 +266,7 @@ M2 若仍不达标的定位顺序:
 | in-order UMMA 假设(H2) | P 被下一发 QK 踩,数值错但不挂 | 与 CUTLASS FMHA 同假设,风险极低;若疑,临时在 QK 前多等一拍 corr_full(牺牲重叠的诊断开关) |
 | 尾 CTA 白算拖平均 | 短序列加速比差 | 已知代价(cutedsl 同);不单独修,归入 M2 评估 |
 | 88 reg correction 将来加逻辑顶破 | 新增代码后 spill 复现 | 余量 10;M3 改 epilogue 时重跑 §5 门禁 |
-| 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | 单遍驻留后余量仅 3(§4);softmax 区任何改动都要重跑 §5 门禁,顶破时先看 exp2/pack 融合段可否再压,再考虑 correction 让 reg |
+| 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | round 3 f32x2 后余量 19+(§6.3);softmax 区任何改动都要重跑 §5 门禁,顶破时先看 exp2/pack 融合段可否再压,再考虑 correction 让 reg |
 
 挂死 triage(继承 quant-occupancy/sqsh 战场经验 + 本设计专项):
 
