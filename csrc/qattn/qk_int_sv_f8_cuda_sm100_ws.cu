@@ -41,17 +41,27 @@
 //   O0 [256,256+HD)          128xHD f32 PV acc, tile 0
 //   O1 [256+HD,256+2*HD)     tile 1 (d64 leaves [384,512) unused)
 //
-// Bit-exactness contract: every float op sequence of softmax / correction /
-// epilogue is copied verbatim from qk_int_sv_f8_cuda_sm100.cu
-// (line references at each block). Copies are annotated instead of extracted
-// into a shared header so the existing kernel's TU keeps byte-identical
-// device text (SASS gate). The epilogue stages the converted output through
+// Numerics contract (G1, C1_DESIGN.md section 9): correction and epilogue
+// float op sequences are still copied verbatim from
+// qk_int_sv_f8_cuda_sm100.cu (line references at each block; copies are
+// annotated instead of extracted into a shared header so the existing
+// kernel's TU keeps byte-identical device text - SASS gate). The softmax
+// step departs from the 128-thread kernel's value sequence: the S row stays
+// in the raw integer domain, the block row max is a balanced FMNMX tree
+// scaled back per k-scale class (bit-identical to the old serial fold -
+// rounding is monotone - so row_max / vec / o_scale / the correction
+// rescale factors are still bitwise those of the old kernel), the exp2
+// argument fuses the dequant into one fma (P moves by a rounding
+// placement, <= 1 ulp of the argument), and d_sum accumulates in 4 packed
+// f32x2 chains (reassociation). From G1 on this kernel is accuracy-gated
+// against fp32 SDPA (cos_sim > 0.99, rel_l1 < 0.06), not golden-bitwise
+// gated; the numerical analysis and the golden re-dump flow are in
+// C1_DESIGN.md section 9. The epilogue stages the converted output through
 // sO and TMA-stores it (r5 lever B) - same values, same bytes, different
 // transport. Softmax reads each S row once - two x64
 // tcgen05.ld per KV block (the widest form ptxas accepts under the
 // 128-register entry target) issued back to back under one collective
-// wait::ld - and keeps the whole dequanted row in registers (the
-// 128-thread kernel's value sequence, :407-449). History: a two-pass
+// wait::ld - and keeps the whole raw row in registers. History: a two-pass
 // variant (re-reading TMEM for the exp2 pass) doubled the tcgen05.ld
 // traffic and lost 11% end to end; the round-2 single-pass version
 // chained four x32 loads and still stalled on long_scoreboard; round 3
@@ -70,6 +80,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cfloat>
 #include <stdint.h>
 #include <type_traits>
 
@@ -373,6 +384,59 @@ f32x2_fma(float& d0, float& d1, float a0, float a1, float b0, float b1, float c0
 #endif
 }
 
+__device__ __forceinline__ void f32x2_add(float& d0, float& d1, float a0, float a1, float b0, float b1)
+{
+#ifdef SAGE_TCGEN05_ENABLED
+    asm("{\n"
+        ".reg .b64 a, b, d;\n"
+        "mov.b64 a, {%2, %3};\n"
+        "mov.b64 b, {%4, %5};\n"
+        "add.rn.ftz.f32x2 d, a, b;\n"
+        "mov.b64 {%0, %1}, d;\n"
+        "}"
+        : "=f"(d0), "=f"(d1)
+        : "f"(a0), "f"(a1), "f"(b0), "f"(b1));
+#else
+    d0 = a0 + b0;
+    d1 = a1 + b1;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Balanced fmax reduction trees over the raw S row (G1). fmax over floats is
+// exact (no rounding), associative and commutative, so the tree result equals
+// the serial fold for any operand order; the raw row holds only exact
+// int32->f32 values and the -inf mask sentinel (no NaN source), and FMNMX
+// drops a NaN operand anyway. Compile-time recursion so ptxas sees one
+// balanced expression tree (critical path log2(N) instead of N).
+// ---------------------------------------------------------------------------
+
+// Contiguous tree over N words holding f32 bits.
+template<uint32_t N>
+__device__ __forceinline__ float tree_fmax(const uint32_t* r)
+{
+    if constexpr (N == 1) {
+        return __uint_as_float(r[0]);
+    }
+    else {
+        return fmaxf(tree_fmax<N / 2>(r), tree_fmax<N / 2>(r + N / 2));
+    }
+}
+
+// Tree over one per-thread k-scale class: class c owns columns
+// {8k + 2c, 8k + 2c + 1}; the caller passes r offset by 2c and the template
+// walks class-element indices [I0, I0+N) at column offset 8*(i/2) + i%2.
+template<uint32_t I0, uint32_t N>
+__device__ __forceinline__ float tree_fmax_cls(const uint32_t* r)
+{
+    if constexpr (N == 1) {
+        return __uint_as_float(r[8 * (I0 / 2) + (I0 % 2)]);
+    }
+    else {
+        return fmaxf(tree_fmax_cls<I0, N / 2>(r), tree_fmax_cls<I0 + N / 2, N / 2>(r));
+    }
+}
+
 }  // namespace ws
 
 // ---------------------------------------------------------------------------
@@ -673,13 +737,24 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         // (4+ outstanding, hang root cause unlocated): it is the exact
         // schedule ptxas already emitted for r3's peeled instance, which
         // the r3 stress runs (2x8000 launches) covered clean; this change
-        // only pins that schedule at PTX level. Each raw word is
-        // dequanted+masked in place and folded into m_local; the whole
-        // row then stays in registers, so nothing touches TMEM between
-        // the vec store (aliases S cols [0,2)) and the P store. The
-        // per-element dequant/max/exp2/d_sum/pack value sequences are
-        // those of the 128-thread kernel (:407-449, :459-474; see file
-        // header). is_last folds the causal/OOB mask exactly like :431-444.
+        // only pins that schedule at PTX level.
+        //
+        // G1 (C1_DESIGN.md section 9): the row stays in the RAW integer
+        // domain - no dequanted row is materialized. The block row max is a
+        // balanced FMNMX tree over the raw row scaled back per k-scale class
+        // (bit-identical to the old serial dequant+fold, see below), and the
+        // exp2 argument is ONE packed fma per pair from the raw word:
+        //   p = exp2(raw * (local_sm_scale*dequant) - row_max)
+        // where -row_max already carries the S_FP8_OFFSET fold. d_sum
+        // accumulates in 4 independent packed f32x2 chains. This replaces
+        // the 128-thread kernel's per-element value sequence (:420-474):
+        // row_max/vec/o_scale stay bit-identical, but P moves by the
+        // rounding-placement difference of the fused dequant and d_sum is
+        // reassociated - the kernel is accuracy-gated, not golden-bitwise
+        // gated, from G1 on. The whole row stays in registers, so nothing
+        // touches TMEM between the vec store (aliases S cols [0,2)) and the
+        // P store. is_last folds the causal/OOB mask like :431-444, in the
+        // raw domain (-inf sentinel).
         // -------------------------------------------------------------------
         auto softmax_step = [&](auto is_last_t, uint32_t iter) {
             constexpr bool is_last = decltype(is_last_t)::value;
@@ -693,61 +768,21 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 dequant_scale[cls] = q_scale * k_scale_pref[cls];
             }
 
-            // dequant + fused mask for the S column pair (j, j+1), j even
-            // (value sequence mirrors :420-444). The two columns of a pair
-            // share one k-scale at both granularities ((j%8)/2 is equal for
-            // j and j+1 when j is even), so the packed multiplier is a splat;
-            // the dequant itself is one mul.rn.ftz.f32x2 whose lanes are
-            // bit-identical to the two scalar muls it replaces (see the
-            // f32x2 helper comment). The causal/OOB mask select stays scalar.
-            auto s_of_pair = [&](uint32_t raw0, uint32_t raw1, uint32_t j, float& s0, float& s1) {
-                float dequant_scale_j;
-                if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-                    dequant_scale_j = dequant_scale[(j % 8) / 2];
-                }
-                else {
-                    dequant_scale_j = dequant_scale[0];
-                }
-                ws::f32x2_mul(s0,
-                              s1,
-                              __int2float_rz(static_cast<int32_t>(raw0)),
-                              __int2float_rz(static_cast<int32_t>(raw1)),
-                              dequant_scale_j,
-                              dequant_scale_j);
-                if constexpr (is_last) {
-                    auto is_oob = [&](uint32_t kv_idx) {
-                        if constexpr (mask_mode == MaskMode::kCausal) {
-                            return (kv_idx > q_idx) || (kv_idx >= kv_len);
-                        }
-                        else {
-                            return kv_idx >= kv_len;
-                        }
-                    };
-                    const uint32_t kv_idx = iter * CTA_K + j;
-                    if (is_oob(kv_idx)) {
-                        s0 = -5000000.0f;
-                    }
-                    if (is_oob(kv_idx + 1)) {
-                        s1 = -5000000.0f;
-                    }
-                }
-            };
-
             ws::wait_bar(bar_full, s_full_phase);
             s_full_phase ^= 1;
 
-            // ---- load + dequant + mask + row max, whole row retained
-            //      (:407-449; per-element op order unchanged - same ascending
-            //      column order as the chunked versions, so every float op
-            //      sees the same inputs in the same order). The row array is
-            //      uint32_t so each f32 result can overwrite its raw word in
-            //      place: the ld's in-flight block and the retained row share
-            //      registers instead of stacking a separate staging array.
-            //      r4: both x64 lds issue back to back under one collective
-            //      wait so their TMEM-load latencies can overlap (PTX-level
-            //      structure; SASS reality per arch in C1_DESIGN.md 6.4). ----
+            // ---- load + convert + mask, whole raw row retained. The row
+            //      array is uint32_t so each f32 word overwrites its raw
+            //      word in place: the ld's in-flight block and the retained
+            //      row share registers. r4: both x64 lds issue back to back
+            //      under one collective wait so their TMEM-load latencies
+            //      can overlap (PTX-level structure; SASS reality per arch
+            //      in C1_DESIGN.md 6.4). Masked lanes become -inf, which
+            //      every consumer folds correctly: the fmax tree ignores it
+            //      (unless the whole class is masked, absorbed by the -5e6
+            //      floor below), and the exp2 argument becomes -inf -> p = 0
+            //      exactly (c_raw > 0 by the FLT_MIN clamp below). ----
             uint32_t RS_row[CTA_K];
-            float    m_local = -5000000.0f;
 #pragma unroll
             for (uint32_t c = 0; c < CTA_K / 64; c++) {
                 ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
@@ -766,21 +801,52 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             }
             tcgen05::tmem_ld_wait();
 #pragma unroll
-            for (uint32_t c = 0; c < CTA_K / 64; c++) {
-#pragma unroll
-                for (uint32_t jj = 0; jj < 64; jj += 2) {
-                    float s0, s1;
-                    s_of_pair(RS_row[c * 64 + jj], RS_row[c * 64 + jj + 1], c * 64 + jj, s0, s1);
-                    m_local                 = max(m_local, s0);  // fold order still ascending j
-                    m_local                 = max(m_local, s1);
-                    RS_row[c * 64 + jj]     = __float_as_uint(s0);
-                    RS_row[c * 64 + jj + 1] = __float_as_uint(s1);
+            for (uint32_t j = 0; j < CTA_K; j++) {
+                float raw = __int2float_rz(static_cast<int32_t>(RS_row[j]));  // exact, |S| < 2^24
+                if constexpr (is_last) {
+                    const uint32_t kv_idx = iter * CTA_K + j;
+                    bool           oob;
+                    if constexpr (mask_mode == MaskMode::kCausal) {
+                        oob = (kv_idx > q_idx) || (kv_idx >= kv_len);
+                    }
+                    else {
+                        oob = kv_idx >= kv_len;
+                    }
+                    if (oob) {
+                        raw = __uint_as_float(0xff800000u);  // -inf
+                    }
                 }
+                RS_row[j] = __float_as_uint(raw);
             }
 
-            // ---- online softmax update (mirrors :454-458) ----
+            // ---- block row max (G1): balanced fmax tree in the raw domain,
+            //      one multiply per k-scale class back to the dequant domain.
+            //      rnd(x*d) is monotone in x for d >= 0, so the class max of
+            //      rounded products equals the rounded product of the class
+            //      max: m_deq is bit-identical to the old serial fold over
+            //      the dequanted row. The -5e6 floor reproduces the old
+            //      m_local init (a masked/-5e6-sentinel lane could win the
+            //      old fold the same way), and also absorbs the one NaN
+            //      corner - d * (-inf) with a zero-amax d = 0 - because
+            //      fmaxf drops a NaN operand. row_max / o_scale / the vec
+            //      hand-off therefore stay bit-identical to the 128-thread
+            //      kernel (:454-458). ----
+            float m_deq;
+            if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+                m_deq = dequant_scale[0] * ws::tree_fmax_cls<0, 32>(&RS_row[0]);
+#pragma unroll
+                for (uint32_t cls = 1; cls < kNumKScales; cls++) {
+                    m_deq = fmaxf(m_deq, dequant_scale[cls] * ws::tree_fmax_cls<0, 32>(&RS_row[2 * cls]));
+                }
+            }
+            else {
+                m_deq = dequant_scale[0] * ws::tree_fmax<CTA_K>(RS_row);
+            }
+            m_deq = fmaxf(m_deq, -5000000.0f);
+
+            // ---- online softmax update (expressions of :454-458) ----
             const float m_prev  = row_max;
-            row_max             = max(row_max, fmaf(m_local, local_sm_scale, -S_FP8_OFFSET));
+            row_max             = max(row_max, fmaf(m_deq, local_sm_scale, -S_FP8_OFFSET));
             const float o_scale = math::ptx_exp2(m_prev - row_max);
             denom *= o_scale;
 
@@ -796,46 +862,89 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_vfull);
 
-            // ---- p = exp2(fma(s, scale, -row_max)), d_sum, e4m3 pack from
-            //      the retained row (p / d_sum / pack value sequences match
-            //      :459-474; the pack is fused per 4 columns so each row
-            //      quad dies as its RP word is born - liveness only falls
-            //      from here). The exp2 arguments are computed as two
-            //      fma.rn.ftz.f32x2 per quad, each lane bit-identical to the
-            //      scalar fmaf it replaces (see the f32x2 helper comment);
-            //      MUFU exp2 and the d_sum adds stay scalar - d_sum is a
-            //      serial chain and keeps its ascending-b add order. ----
+            // ---- p = exp2(fma(raw, c_raw, -row_max)), d_sum, e4m3 pack from
+            //      the retained raw row (G1 domain fold). With
+            //      c_raw = local_sm_scale * dequant_scale the exp2 argument
+            //      is ONE packed fma straight from the raw word - the old
+            //      per-element dequant multiply is gone - and -row_max
+            //      already carries the S_FP8_OFFSET fold (row_max =
+            //      c*m - offset, so -row_max = offset - c*m: the same
+            //      constant-domain form as cutedsl's LOG2_448 neg_off,
+            //      L1111-1113). P moves by the rounding placement -
+            //      rnd(c*d) then fma, vs rnd(raw*d) then fma - i.e. <= 1 ulp
+            //      of the argument; quantified in C1_DESIGN.md section 9.
+            //      The FLT_MIN clamp (peeled step only, where masked -inf
+            //      lanes exist) keeps c_raw > 0 so -inf * c_raw stays -inf
+            //      (a zero-amax block has dequant = 0, and -inf * 0 = NaN);
+            //      for live lanes the clamped product |raw|*FLT_MIN <= 2e-32
+            //      vanishes into the addend, and c_raw is only ever 0 when
+            //      every product underflows anyway.
+            //      d_sum: 4 independent packed f32x2 chains, quad w feeding
+            //      chain pair (w & 1), then 3 packed folds + 1 scalar fold -
+            //      add depth 16+3 instead of 128 (cutedsl L1160-1183 same
+            //      structure); pure reassociation of the same IEEE adds.
+            //      The pack is fused per 4 columns so each raw quad dies as
+            //      its RP word is born - liveness only falls from here. ----
+            float c_raw[kNumKScales];
+#pragma unroll
+            for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+                c_raw[cls] = local_sm_scale * dequant_scale[cls];
+                if constexpr (is_last) {
+                    c_raw[cls] = fmaxf(c_raw[cls], FLT_MIN);
+                }
+            }
             const float neg_row_max = -row_max;
-            float       d_sum       = 0.0f;
-            uint32_t    RP_u32[CTA_K / 4];
+            float       acc[8];  // 4 packed f32x2 d_sum accumulators
+#pragma unroll
+            for (uint32_t k = 0; k < 8; k++) {
+                acc[k] = 0.0f;
+            }
+            uint32_t RP_u32[CTA_K / 4];
 #pragma unroll
             for (uint32_t w = 0; w < CTA_K / 4; w++) {
+                // quad w = columns 4w..4w+3; pairs share a k-scale class
+                // ((j%8)/2 equal for j, j+1 with j even), classes {0,1} on
+                // even w and {2,3} on odd w
+                float c01, c23;
+                if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+                    c01 = c_raw[((4 * w) % 8) / 2];
+                    c23 = c_raw[((4 * w + 2) % 8) / 2];
+                }
+                else {
+                    c01 = c_raw[0];
+                    c23 = c_raw[0];
+                }
                 float a[4];
                 ws::f32x2_fma(a[0],
                               a[1],
                               __uint_as_float(RS_row[4 * w]),
                               __uint_as_float(RS_row[4 * w + 1]),
-                              local_sm_scale,
-                              local_sm_scale,
+                              c01,
+                              c01,
                               neg_row_max,
                               neg_row_max);
                 ws::f32x2_fma(a[2],
                               a[3],
                               __uint_as_float(RS_row[4 * w + 2]),
                               __uint_as_float(RS_row[4 * w + 3]),
-                              local_sm_scale,
-                              local_sm_scale,
+                              c23,
+                              c23,
                               neg_row_max,
                               neg_row_max);
                 float p[4];
 #pragma unroll
                 for (uint32_t b = 0; b < 4; b++) {
                     p[b] = math::ptx_exp2(a[b]);
-                    d_sum += p[b];
                 }
+                const uint32_t k0 = (w & 1) * 4;
+                ws::f32x2_add(acc[k0], acc[k0 + 1], acc[k0], acc[k0 + 1], p[0], p[1]);
+                ws::f32x2_add(acc[k0 + 2], acc[k0 + 3], acc[k0 + 2], acc[k0 + 3], p[2], p[3]);
                 floatx4_to_e4m3x4(&RP_u32[w], &p[0], &p[2]);
             }
-            denom += d_sum;
+            ws::f32x2_add(acc[0], acc[1], acc[0], acc[1], acc[4], acc[5]);
+            ws::f32x2_add(acc[2], acc[3], acc[2], acc[3], acc[6], acc[7]);
+            ws::f32x2_add(acc[0], acc[1], acc[0], acc[1], acc[2], acc[3]);
+            denom += acc[0] + acc[1];
 
             // ---- P -> TMEM (TS A-operand layout, mirrors :493-499; cols
             //      [32,64) alias S but the row is already in registers), then
