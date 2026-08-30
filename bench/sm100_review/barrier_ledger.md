@@ -88,7 +88,8 @@ is the single arrival, performed by hardware when all previously issued
 Full account of the warp-specialized kernel's synchronization. Roles:
 softmax0 = warps 0-3 (tile 0), softmax1 = warps 4-7 (tile 1), correction =
 warps 8-11 (both O tiles), mma = warp 12 (single elected thread), load =
-warp 13 (single elected thread); warps 14/15 idle. `trip0/trip1` are the
+warp 13 (single elected thread), epilogue = warp 14 (single elected thread,
+TMA-stores the sO staging tiles; r5 lever B); warp 15 idle. `trip0/trip1` are the
 per-tile KV block counts (causal: `min(2bx+1, kblk)` / `min(2bx+2, kblk)`;
 else both `kblk`). Steps are indexed `j = 0 .. trip_t-1` per tile `t`.
 
@@ -105,12 +106,12 @@ threads of a warpgroup arrives once (init count 128 = one completion).
 | mma_s0 / mma_s1 | 1 per tile | `tcgen05.commit` after QK_t chain | arrive x128 by softmax_t (S drained **and** P stored) | softmax_t, ph `j&1` | mma before PV_t(j), ph `j&1` |
 | s0_corr / s1_corr (vec) | 1 per tile | arrive x128 by softmax_t (vec stored) | arrive x128 by correction (vec read) | correction, ph `j&1`, j = 0..trip_t | softmax_t at step end, ph `j&1`, j = 0..trip_t-1 |
 | mma_corr | 2 = 1 per O tile | `tcgen05.commit` after PV_t chain | arrive x128 by correction (rescale stored) | correction, ph `j&1` | mma before PV_t(j), j>=1, ph `(j-1)&1` |
-| corr_epi | 2 (**M3 only**) | arrive x128 by correction (O_t staged to sO) | arrive x32 by epilogue warp (TMA store retired) | epilogue warp | correction |
+| epi_full | 2 = 1 per O tile, one-shot | arrive x128 by correction (O_t staged to sO, after `fence.proxy.async`) | — (sO never reused; no empty barrier) | epilogue warp, ph 0 | — |
 | tmem_dealloc | 1 | 384 arrivals (softmax0/1 + correction, after each thread's last TMEM op) | — | mma warp (all 32), ph 0, then collective dealloc | — |
 
-corr_epi does not exist in the M0-M2 kernel (correction stores O to global
-directly, mirroring the 128-thread epilogue); it is reserved for the M3
-smem+TMA-store epilogue together with warp 14 and an sO double buffer.
+epi_full is the as-built shape of the §8 corr_epi design (r5 lever B): each
+staging tile is filled exactly once per CTA, so the planned empty barrier
+(buffer reuse acquire) has no waiter and is dropped.
 
 Deviation from the cutedsl blueprint: cutedsl's `mma_corr` is one shared
 2-stage ring carrying o0/o1 items alternately. Here each O tile owns a
@@ -178,7 +179,15 @@ epilog(0) ; epilog(1) ; arrive dealloc
 where `rescale(t,j)` = [w] vec_full#j, ld vec, ld_wait, arrive vec_empty#j,
 o_scale=exp2(v0-v1), [w] corr_full#(j-1), ld/mul/st O_t, st_wait, fence,
 arrive corr_empty#(j-1); and `epilog(t)` = [w] vec_full#trip_t, ld denom,
-arrive vec_empty#trip_t, [w] corr_full#(trip_t-1), O_t -> global.
+arrive vec_empty#trip_t, [w] corr_full#(trip_t-1), O_t -> sO[t] (swizzled
+STS), `fence.proxy.async`, arrive epi_full[t].
+
+epilogue warp 14 (elected thread):
+```
+[w] epi_full[0] ph0 -> TMA store sO[0] boxes -> commit_group
+[w] epi_full[1] ph0 -> TMA store sO[1] boxes -> commit_group
+cp.async.bulk.wait_group.read 0     -- sO must outlive the bulk reads
+```
 
 ## 3. Count check (per CTA)
 
@@ -193,6 +202,7 @@ arrive vec_empty#trip_t, [w] corr_full#(trip_t-1), O_t -> global.
 | vec_empty[t] | trip_t + 1 | trip_t (softmax_t) | final completion unconsumed — harmless |
 | corr_full[t] | trip_t | trip_t (correction: trip_t-1 rescales + epilog) | 1:1 |
 | corr_empty[t] | trip_t - 1 | trip_t - 1 (mma, PV_t(j), j>=1) | 1:1 |
+| epi_full[t] | 1 (128 arrivals) | 1 (epilogue warp, ph 0) | 1:1 |
 | dealloc | 1 (384 arrivals) | 1 (mma warp, ph 0) | 1:1 |
 
 Degenerate traces:
@@ -239,7 +249,9 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
 | H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
 | H10 | `tmem_dealloc` while any warp still touches TMEM | 384 dealloc arrivals, each after the thread's last TMEM op (+ fence); the final PV retired transitively before correction's epilog arrivals (H7); mma warp waits ph 0 then deallocs collectively |
-| H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale is written pre-`__syncthreads` and read by correction over the generic proxy — plain sync suffices. No hand-written smem feeds an MMA in this kernel (Q/K/V arrive via TMA, P via TMEM), so no `fence.proxy.async` is needed in the kernel body — the probe that does hand-fill smem (p0c) carries it |
+| H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale is written pre-`__syncthreads` and read by correction over the generic proxy — plain sync suffices. The one generic->async edge in the kernel body is correction's sO staging feeding the bulk-store engine: every thread issues `fence.proxy.async.shared::cta` after its STS and before its epi_full arrival, and the epilogue warp's TMA store is ordered behind the barrier wait (SS-twin lesson applied) |
+| H12 | epilogue TMA store reads sO[t] before all 128 correction threads staged it | epi_full[t] completes only after 128 arrivals, each preceded by that thread's STS + `fence.proxy.async` |
+| H13 | CTA exit reclaims smem while a bulk store still reads sO | epilogue warp ends with `cp.async.bulk.wait_group.read 0` (the CUTLASS `tma_store_wait<0>` tail); global visibility of the stores is the kernel-completion fence's job |
 
 ## 6. H3: the vec0/S0[0,2) alias chain, in full
 
@@ -312,17 +324,24 @@ i = 1..trip0-1, S1-only rounds, tail). Induction over spine positions:
 Every wait depends only on strictly-earlier witness events, and the only
 other blocking construct — setmaxnreg.inc's TRY_ALLOC retry — resolves
 once the two dec warpgroups execute their unconditional dec (the first
-statement of their branches). The kernel is deadlock-free.
+statement of their branches). The epilogue warp (r5) adds no cycle: its
+only waits are epi_full[t] (completed by correction's epilog, shown live
+above) and the bulk-group drain (hardware DMA, always completes), and no
+other role waits on it. The kernel is deadlock-free.
 
-## 8. corr_epi (M3, design only)
+## 8. epi_full / TMA-store epilogue (as built, r5 lever B)
 
-Planned shape when the epilogue moves to smem + TMA store: correction
-converts O_t to DTypeOut into sO[t] (2 x CTA_Q x head_dim staging buffers;
-+64KB at d128 on top of the current 96KB dynamic smem — fits under 227KB),
-arrives `corr_epi_full[t]` (x128); warp 14 waits, issues
-`cp.async.bulk.tensor` store + `commit_group`, waits the group read-visible
-(`cp.async.bulk.wait_group.read`), arrives `corr_epi_empty[t]` (x32). Two
-stages = one per O tile, each used once per CTA (phases 0 only).
-Correction's generic-proxy writes to sO need
-`fence.proxy.async.shared::cta` before the arrive (the bulk-store engine
-reads through the async proxy) — same lesson as the SS twin.
+Correction converts O_t to DTypeOut into sO[t] — head_dim/64 boxes of
+CTA_Q x 64 in the CU_TENSOR_MAP_SWIZZLE_128B layout (16B unit u of row r at
+r*128 + (u ^ (r%8))*16), +64KB at d128 / +32KB at d64 on top of the
+96KB/48KB dynamic smem (160KB/80KB total, under 227KB) — then per thread
+`fence.proxy.async.shared::cta` (the bulk-store engine reads through the
+async proxy; SS-twin lesson) and arrives `epi_full[t]` (x128). Warp 14
+waits ph 0, issues one `cp.async.bulk.tensor.4d` store per box +
+`commit_group` per tile, and drains with `cp.async.bulk.wait_group.read 0`
+before exit (smem lifetime, H13). Deviations from the original design
+sketch: no `corr_epi_empty` (each buffer is written once per CTA — nothing
+ever re-acquires it) and no sO double-buffer pressure for the same reason.
+The old per-row `q_idx < qo_len` store guard is replaced by the tensor
+map's dim1 = qo_len bound: the TMA store clips OOB rows (tail CTA's tile 1
+stores nothing).

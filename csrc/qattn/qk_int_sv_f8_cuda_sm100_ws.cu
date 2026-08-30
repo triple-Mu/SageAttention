@@ -21,10 +21,11 @@
 // from the CUTLASS sm100 FMHA example). Warp roles (core_sm100.py L141-148):
 //   warps  0- 3  softmax0    (tile 0: S drain, online softmax, P pack)
 //   warps  4- 7  softmax1    (tile 1)
-//   warps  8-11  correction  (O rescale by o_scale; final epilogue math)
+//   warps  8-11  correction  (O rescale by o_scale; final epilogue math,
+//                             staged to sO in the TMA swizzle layout)
 //   warp  12     mma         (single elected thread issues every tcgen05.mma)
-//   warp  13     load        (single elected thread issues every TMA)
-//   warp  14     epilogue    (idle until M3: TMA-store epilogue)
+//   warp  13     load        (single elected thread issues every TMA load)
+//   warp  14     epilogue    (TMA-stores the sO staging tiles)
 //   warp  15     empty
 // setmaxnreg budgets 192/192/88/40 per warpgroup: 128*(192+192+88+40)
 // = 65536 registers, exactly one CTA's worth (SM register file); see the
@@ -40,11 +41,13 @@
 //   O0 [256,256+HD)          128xHD f32 PV acc, tile 0
 //   O1 [256+HD,256+2*HD)     tile 1 (d64 leaves [384,512) unused)
 //
-// Bit-exactness contract (M0-M2): every float op sequence of softmax /
-// correction / epilogue is copied verbatim from qk_int_sv_f8_cuda_sm100.cu
+// Bit-exactness contract: every float op sequence of softmax / correction /
+// epilogue is copied verbatim from qk_int_sv_f8_cuda_sm100.cu
 // (line references at each block). Copies are annotated instead of extracted
 // into a shared header so the existing kernel's TU keeps byte-identical
-// device text (SASS gate). Softmax reads each S row once - two x64
+// device text (SASS gate). The epilogue stages the converted output through
+// sO and TMA-stores it (r5 lever B) - same values, same bytes, different
+// transport. Softmax reads each S row once - two x64
 // tcgen05.ld per KV block (the widest form ptxas accepts under the
 // 128-register entry target) issued back to back under one collective
 // wait::ld - and keeps the whole dequanted row in registers (the
@@ -204,6 +207,52 @@ load_async_4D(uint32_t dst, void const* const src_tma_map, uint32_t bar, int c0,
                  : "memory");
 }
 
+// TMA bulk-tensor store (S2G), u32 smem source. Unlike tma.cuh's
+// store_async_4D this takes the inner coordinate too: the O staging tile is
+// stored as head_dim/64 boxes of 64 columns (the widest inner box a
+// 128B-swizzled fp16/bf16 tensor map admits), so c0 is 0 or 64.
+// Completion is tracked through the bulk async-group (commit/wait below),
+// not an mbarrier.
+__device__ __forceinline__ void
+store_async_4D(void const* dst_tma_map, uint32_t src, int c0, int c1, int c2, int c3)
+{
+    asm volatile("cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
+                 " [%0, {%2, %3, %4, %5}], [%1];\n" ::"l"(dst_tma_map),
+                 "r"(src),
+                 "r"(c0),
+                 "r"(c1),
+                 "r"(c2),
+                 "r"(c3)
+                 : "memory");
+}
+
+__device__ __forceinline__ void store_commit_group()
+{
+    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+// Wait until at most N committed bulk store groups are still *reading* their
+// smem source. The epilogue warp must drain to 0 before the CTA exits: smem
+// is reclaimed at CTA exit, so an in-flight bulk read would race it (same
+// reason CUTLASS epilogues end with tma_store_wait<0>). Global visibility of
+// the stores themselves is covered by the kernel-completion fence.
+template<int N>
+__device__ __forceinline__ void store_wait_group_read()
+{
+    asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(N) : "memory");
+}
+
+// st.shared.v4 with a u32 shared-space address (16B unit of the sO staging
+// tile; see the ws:: header comment for why u32 addresses).
+__device__ __forceinline__ void sts_128b(uint32_t addr, uint4 v)
+{
+    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"r"(addr),
+                 "r"(v.x),
+                 "r"(v.y),
+                 "r"(v.z),
+                 "r"(v.w));
+}
+
 // tcgen05.cuh tcgen05_commit(), u32 form
 __device__ __forceinline__ void commit_bar(uint32_t bar)
 {
@@ -345,14 +394,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     qk_int8_sv_f8_attn_kernel_sm100_ws(const __grid_constant__ CUtensorMap tensorMapQ,
                                        const __grid_constant__ CUtensorMap tensorMapK,
                                        const __grid_constant__ CUtensorMap tensorMapV,
+                                       const __grid_constant__ CUtensorMap tensorMapO,
                                        const float* __restrict__ Q_scale,
                                        const float* __restrict__ K_scale,
                                        const float* __restrict__ V_scale,
-                                       DTypeOut* O,
                                        float* __restrict__ Lse,
-                                       const int64_t  stride_batch_o,
-                                       const int64_t  stride_h_o,
-                                       uint32_t       stride_seq_o,
                                        const uint32_t qo_len,
                                        const uint32_t kv_len,
                                        const uint32_t qo_per_kv_head,
@@ -368,8 +414,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     // --- warp roles ---
     constexpr uint32_t kMmaWarp  = 12;
     constexpr uint32_t kLoadWarp = 13;
-    // warps 14 (epilogue, reserved for the M3 TMA-store path) and 15 (empty)
-    // dealloc registers and exit.
+    constexpr uint32_t kEpiWarp  = 14;  // TMA-stores the sO staging tiles
+    // warp 15 (empty) deallocs registers and exits.
     // Budgets sum to exactly 512 regs/thread-column = 64K/SM. The cutedsl
     // split is 192/192/96/32; this kernel moves 8 regs from correction (ptxas
     // ceiling 77) to the mma/load group (raw-mbarrier bookkeeping needs ~38
@@ -396,11 +442,17 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     constexpr uint32_t num_tiles_pv_inner = CTA_K / 32;
     constexpr uint32_t num_tiles_o        = head_dim / 32;
 
-    // --- smem plan: Q double tile + shared K/V 4-slot ring ---
+    // --- smem plan: Q double tile + shared K/V 4-slot ring + O staging ---
     constexpr uint32_t SMEM_Q_BYTES  = CTA_Q * head_dim;  // per tile
     constexpr uint32_t SMEM_KV_BYTES = CTA_K * head_dim;  // per ring slot (K tile or V^T tile)
     constexpr uint32_t kKvStages     = 4;                 // cutedsl kv_stage=4 (8-bit inputs)
-    static_assert(2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES <= 227 * 1024, "smem budget exceeded");
+    // O staging (r5 lever B / M3): per tile, head_dim/64 boxes of
+    // CTA_Q x 64 DTypeOut in the TMA 128B-swizzle layout, TMA-stored by the
+    // epilogue warp. Used once per tile per CTA (no double-buffer pressure).
+    constexpr uint32_t SMEM_O_BOX_BYTES = CTA_Q * 64 * sizeof(DTypeOut);  // 128B rows
+    constexpr uint32_t SMEM_O_BYTES     = (head_dim / 64) * SMEM_O_BOX_BYTES;  // per tile
+    static_assert(2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES + 2 * SMEM_O_BYTES <= 227 * 1024,
+                  "smem budget exceeded");
 
     // --- smem descriptors + MMA instruction descriptors (same as the
     //     128-thread kernel; parity-tested in bench/sm100_review) ---
@@ -428,9 +480,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     const uint32_t warp_idx   = threadIdx.x / 32;
     const uint32_t warp_group = warp_idx / 4;
 
+    // Dynamic smem layout: sQ (2 tiles) | KV ring (4 slots) | sO (2 staging
+    // tiles). Each role derives u32 addresses from smem_ with these
+    // compile-time offsets (no named pointers: a 64-bit generic base carried
+    // across the setmaxnreg boundary spills, see the ws:: helper comment).
     extern __shared__ __align__(1024) int8_t smem_[];
-    int8_t*                                  sQ      = smem_;                     // 2 tiles
-    int8_t*                                  sKVring = smem_ + 2 * SMEM_Q_BYTES;  // 4 slots
+    int8_t*                                  sQ = smem_;
 
     // --- barriers (roles/counts: bench/sm100_review/barrier_ledger.md).
     //     One array so every role addresses them as a single u32 base plus
@@ -447,7 +502,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         kBarCorrFull  = 18,  // +tile: tcgen05.commit after PV chain
         kBarCorrEmpty = 20,  // +tile: 128 correction arrivals = rescale stored
         kBarDealloc   = 22,  // 384 arrivals (softmax0/1 + correction)
-        kNumBars      = 23,
+        kBarEpiFull   = 23,  // +tile: 128 correction arrivals = O_t staged to sO
+                             // (one-shot per tile; sO is never reused, so there
+                             // is no matching empty barrier)
+        kNumBars      = 25,
     };
     __shared__ __align__(8) uint64_t bars[kNumBars];
     __shared__ __align__(4) uint32_t tmem_addr_slot;
@@ -463,6 +521,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::init_barrier(&bars[kBarVecEmpty + t], 128);
             tcgen05::init_barrier(&bars[kBarCorrFull + t], 1);
             tcgen05::init_barrier(&bars[kBarCorrEmpty + t], 128);
+            tcgen05::init_barrier(&bars[kBarEpiFull + t], 128);
         }
 #pragma unroll
         for (uint32_t s = 0; s < 4; s++) {
@@ -815,7 +874,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
     // =========================================================================
     // correction warpgroup (warps 8-11): O rescale per KV block, then the
-    // register->global epilogue (M0-M2; M3 moves the store to smem+TMA).
+    // final epilogue math staged to sO (TMA-stored by the epilogue warp, r5
+    // lever B; M0-M2 stored register->global here directly).
     // =========================================================================
     else if (warp_group == 2) {
         ws::warpgroup_reg_dealloc<kNumRegsCorrection>();
@@ -823,8 +883,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         const uint32_t trip0     = trip_count(0);
         const uint32_t trip1     = trip_count(1);
         const uint32_t lane_row  = threadIdx.x % 128;  // O row within a tile == TMEM lane
-        const uint32_t batch_id  = blockIdx.z;
-        const uint32_t head_id   = blockIdx.y;
         const uint32_t tmem_lane = tmem_addr_slot + ((warp_idx % 4) * 32 << 16);
 
         // per-tile pipeline state as scalars; the lambdas take everything by
@@ -884,7 +942,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             ws::arrive_bar(bar_cempty);
         };
 
-        // final O_t = O_t * d_rcp (* v_scale) -> global (mirrors :567-599)
+        // final O_t = O_t * d_rcp (* v_scale) -> sO staging tile in the TMA
+        // 128B-swizzle layout; the epilogue warp TMA-stores it (r5 lever B).
+        // Value sequence per element (mul d_rcp, mul v_scale, cvt rn) is that
+        // of :572-599 - only the destination changed, and the TMA store moves
+        // the converted bytes verbatim, so the output bits are unchanged. The
+        // old per-row q_idx < qo_len guard is now the tensor map's bounding
+        // box (dim1 = qo_len): OOB rows of a box are clipped by the TMA store,
+        // never written - same observable effect.
         auto epilog = [&](uint32_t bar_vfull,
                           uint32_t bar_vempty,
                           int&     vphase,
@@ -892,61 +957,75 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                           uint32_t bar_cfull,
                           int&     cphase,
                           uint32_t tmem_o_row,
-                          uint32_t q_idx) {
+                          uint32_t sO_tile,
+                          uint32_t bar_efull) {
             float denom_t, rmax_unused;
             read_vec(bar_vfull, bar_vempty, vphase, vec_addr, denom_t, rmax_unused);
             ws::wait_bar(bar_cfull, cphase);
             cphase ^= 1;
 
-            const float d_rcp      = math::ptx_rcp(denom_t);
-            const bool  row_valid  = q_idx < qo_len;
-            DTypeOut*   O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
-                                   + static_cast<int64_t>(head_id) * stride_h_o
-                                   + static_cast<int64_t>(q_idx) * stride_seq_o;
+            const float d_rcp = math::ptx_rcp(denom_t);
+            // 128B-swizzle addressing: the 16B unit u of row r lives at
+            // r*128 + (u ^ (r%8))*16 within its 64-column box (the standard
+            // swizzle atom the tensor map's CU_TENSOR_MAP_SWIZZLE_128B
+            // expects; conflict-free STS.128 across the warp's 32 rows).
+            const uint32_t swz_phase = lane_row & 7;
+            const uint32_t row_base  = sO_tile + lane_row * 128;
 
-            // The scale/convert/store loops of :572-599 are fused per element
-            // pair here so only one 32-word array is live (the second array
-            // pushed the region past the 96-reg budget - measured spills).
-            // Per-element op sequence (mul d_rcp, mul v_scale, cvt) is
-            // unchanged and elements are independent, so bits are unchanged.
 #pragma unroll
             for (uint32_t c = 0; c < num_tiles_o; c++) {
                 uint32_t RO_u32[32];
                 tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_o_row + c * 32);
                 tcgen05::tmem_ld_wait();
 
+                // 32 columns -> 4 16B units, each 4 half2/bf162 words
 #pragma unroll
-                for (uint32_t jj = 0; jj < 16; jj++) {
-                    float lo = __uint_as_float(RO_u32[2 * jj]) * d_rcp;
-                    float hi = __uint_as_float(RO_u32[2 * jj + 1]) * d_rcp;
-                    if constexpr (fuse_v_scale) {
-                        lo *= sV_scale[c * 32 + 2 * jj];
-                        hi *= sV_scale[c * 32 + 2 * jj + 1];
-                    }
-                    if (row_valid) {
+                for (uint32_t u = 0; u < 4; u++) {
+                    uint4 unit;
+                    uint32_t* w = reinterpret_cast<uint32_t*>(&unit);
+#pragma unroll
+                    for (uint32_t p = 0; p < 4; p++) {
+                        const uint32_t jj = u * 4 + p;  // half2 index within the 32-col chunk
+                        float          lo = __uint_as_float(RO_u32[2 * jj]) * d_rcp;
+                        float          hi = __uint_as_float(RO_u32[2 * jj + 1]) * d_rcp;
+                        if constexpr (fuse_v_scale) {
+                            lo *= sV_scale[c * 32 + 2 * jj];
+                            hi *= sV_scale[c * 32 + 2 * jj + 1];
+                        }
                         const float2 o2 = make_float2(lo, hi);
                         if constexpr (std::is_same<DTypeOut, half>::value) {
-                            ((half2*)(O_lane_ptr + c * 32 + 2 * jj))[0] = __float22half2_rn(o2);
+                            const half2 h2 = __float22half2_rn(o2);
+                            w[p]           = *reinterpret_cast<const uint32_t*>(&h2);
                         }
                         else {
-                            ((nv_bfloat162*)(O_lane_ptr + c * 32 + 2 * jj))[0] = __float22bfloat162_rn(o2);
+                            const nv_bfloat162 b2 = __float22bfloat162_rn(o2);
+                            w[p]                  = *reinterpret_cast<const uint32_t*>(&b2);
                         }
                     }
+                    // box = 64-col half of the tile; unit index within the box row
+                    const uint32_t box   = c / 2;
+                    const uint32_t u_box = (c % 2) * 4 + u;
+                    ws::sts_128b(row_base + box * SMEM_O_BOX_BYTES + ((u_box ^ swz_phase) << 4), unit);
                 }
             }
+            // generic-proxy sO writes -> async-proxy bulk-store visibility
+            // (SS-twin lesson), then hand the tile to the epilogue warp.
+            tcgen05::fence_async_shared();
+            ws::arrive_bar(bar_efull);
         };
 
         const uint32_t vec0_addr   = tmem_lane + TMEM_COL_S0 + TMEM_COL_VEC;
         const uint32_t vec1_addr   = tmem_lane + TMEM_COL_S1 + TMEM_COL_VEC;
         const uint32_t tmem_o0_row = tmem_lane + TMEM_COL_O0;
         const uint32_t tmem_o1_row = tmem_lane + TMEM_COL_O1;
-        const uint32_t q_idx0      = blockIdx.x * (2 * CTA_Q) + lane_row;
+        const uint32_t sO_u32      = ws::smem_u32(smem_) + 2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES;
 
         const uint32_t bars_u32 = ws::smem_u32(bars);
         const uint32_t vf0 = bars_u32 + kBarVecFull * 8, ve0 = bars_u32 + kBarVecEmpty * 8;
         const uint32_t vf1 = vf0 + 8, ve1 = ve0 + 8;
         const uint32_t cf0 = bars_u32 + kBarCorrFull * 8, ce0 = bars_u32 + kBarCorrEmpty * 8;
         const uint32_t cf1 = cf0 + 8, ce1 = ce0 + 8;
+        const uint32_t ef0 = bars_u32 + kBarEpiFull * 8, ef1 = bars_u32 + (kBarEpiFull + 1) * 8;
 
         discard_vec(vf0, ve0, vec0_full_phase);
         discard_vec(vf1, ve1, vec1_full_phase);
@@ -957,8 +1036,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         for (uint32_t j = trip0; j < trip1; j++) {  // causal S1-only rounds
             rescale(vf1, ve1, vec1_full_phase, vec1_addr, cf1, ce1, corr1_full_phase, tmem_o1_row);
         }
-        epilog(vf0, ve0, vec0_full_phase, vec0_addr, cf0, corr0_full_phase, tmem_o0_row, q_idx0);
-        epilog(vf1, ve1, vec1_full_phase, vec1_addr, cf1, corr1_full_phase, tmem_o1_row, q_idx0 + CTA_Q);
+        epilog(vf0, ve0, vec0_full_phase, vec0_addr, cf0, corr0_full_phase, tmem_o0_row, sO_u32, ef0);
+        epilog(vf1, ve1, vec1_full_phase, vec1_addr, cf1, corr1_full_phase, tmem_o1_row, sO_u32 + SMEM_O_BYTES, ef1);
 
         tcgen05::tcgen05_fence_before_sync();  // order the epilogue tmem_lds before dealloc
         ws::arrive_bar(bars_u32 + kBarDealloc * 8);
@@ -983,7 +1062,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 int corr0_empty_phase = 0, corr1_empty_phase = 0;
 
                 // one u32 base for every barrier and smem operand address
-                // (see the ws:: helper comment; sKVring == sQ + 2 Q tiles)
+                // (see the ws:: helper comment; the ring sits at sQ + 2 Q tiles)
                 const uint32_t bars_u32 = ws::smem_u32(bars);
                 const uint32_t sQ_u32   = ws::smem_u32(sQ);
                 const uint32_t ring_u32 = sQ_u32 + 2 * SMEM_Q_BYTES;
@@ -1200,7 +1279,34 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 }
             }
         }
-        // warps 14 (epilogue, M3) and 15 (empty): nothing to do, exit
+        else if (warp_idx == kEpiWarp) {
+            // Epilogue warp (r5 lever B): one TMA bulk store per staged O box.
+            // The producers (correction) issued fence.proxy.async before their
+            // arrivals, so the bulk-store engine sees the staged bytes; the
+            // final wait_group.read keeps sO alive until the engine is done
+            // reading it (CTA exit reclaims smem).
+            if (tcgen05::elect_one()) {
+                const uint32_t bars_u32 = ws::smem_u32(bars);
+                const uint32_t sO_u32   = ws::smem_u32(smem_) + 2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES;
+                const uint32_t q_base   = blockIdx.x * (2 * CTA_Q);
+#pragma unroll
+                for (uint32_t t = 0; t < 2; t++) {
+                    ws::wait_bar(bars_u32 + (kBarEpiFull + t) * 8, 0);
+#pragma unroll
+                    for (uint32_t b = 0; b < head_dim / 64; b++) {
+                        ws::store_async_4D(&tensorMapO,
+                                           sO_u32 + t * SMEM_O_BYTES + b * SMEM_O_BOX_BYTES,
+                                           b * 64,
+                                           q_base + t * CTA_Q,
+                                           blockIdx.y,
+                                           blockIdx.z);
+                    }
+                    ws::store_commit_group();
+                }
+                ws::store_wait_group_read<0>();
+            }
+        }
+        // warp 15 (empty): nothing to do, exit
     }
 }
 
@@ -1269,6 +1375,21 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
 
                         QKVTensorMaps tma_maps = make_qkv_tensor_maps<CTA_Q, CTA_K, HEAD_DIM>(query, key, value, qkv);
 
+                        // O tensor map for the TMA-store epilogue: 64-column
+                        // boxes (128B rows = the widest inner box a
+                        // 128B-swizzled 2-byte tensor map admits), dim1 bound
+                        // qo_len so the tail CTA's OOB rows are clipped by the
+                        // store itself.
+                        CUtensorMap tma_map_o =
+                            create_tensor_map_4D<CTA_Q, 64>(reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                                                            batch_size,
+                                                            num_qo_heads,
+                                                            qo_len,
+                                                            HEAD_DIM,
+                                                            stride_batch_o,
+                                                            stride_h_o,
+                                                            stride_seq_o);
+
                         auto* kernel = qk_int8_sv_f8_attn_kernel_sm100_ws<CTA_Q,
                                                                           CTA_K,
                                                                           NUM_THREADS,
@@ -1279,9 +1400,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
                                                                           mask_mode,
                                                                           RETURN_LSE,
                                                                           true>;
-                        // 2 Q tiles + 4-slot KV ring (barriers/v_scale are static smem)
-                        size_t smem_bytes =
-                            2 * CTA_Q * HEAD_DIM * sizeof(int8_t) + 4 * CTA_K * HEAD_DIM * sizeof(int8_t);
+                        // 2 Q tiles + 4-slot KV ring + 2 O staging tiles
+                        // (barriers/v_scale are static smem)
+                        size_t smem_bytes = 2 * CTA_Q * HEAD_DIM * sizeof(int8_t)
+                                            + 4 * CTA_K * HEAD_DIM * sizeof(int8_t)
+                                            + 2 * CTA_Q * HEAD_DIM * sizeof(DTypeOut);
                         sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, 2 * CTA_Q), num_qo_heads, batch_size);
@@ -1289,14 +1412,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
                             tma_maps.q,
                             tma_maps.k,
                             tma_maps.v,
+                            tma_map_o,
                             reinterpret_cast<float*>(query_scale.data_ptr()),
                             reinterpret_cast<float*>(key_scale.data_ptr()),
                             reinterpret_cast<float*>(value_scale.data_ptr()),
-                            reinterpret_cast<DTypeOut*>(output.data_ptr()),
                             (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-                            stride_batch_o,
-                            stride_h_o,
-                            stride_seq_o,
                             qo_len,
                             kv_len,
                             qo_per_kv_head,

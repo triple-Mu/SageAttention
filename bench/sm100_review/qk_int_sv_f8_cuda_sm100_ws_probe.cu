@@ -50,36 +50,36 @@ template __global__ void qk_int8_sv_f8_attn_kernel_sm100_ws<
     128u, 128u, 512u, 128u, QuantGranularity::kPerThread, QuantGranularity::kPerThread, half,
     MaskMode::kCausal, /*return_lse=*/true, /*fuse_v_scale=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
-    const float *__restrict__, half *, float *__restrict__, const int64_t, const int64_t,
-    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const float *__restrict__, const float *__restrict__, const float *__restrict__,
+    float *__restrict__, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=128, non-causal, per-warp quant, bf16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100_ws<
     128u, 128u, 512u, 128u, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp, nv_bfloat16,
     MaskMode::kNone, /*return_lse=*/false, /*fuse_v_scale=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
-    const float *__restrict__, nv_bfloat16 *, float *__restrict__, const int64_t, const int64_t,
-    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const float *__restrict__, const float *__restrict__, const float *__restrict__,
+    float *__restrict__, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=64, non-causal, per-warp quant, fp16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100_ws<
     128u, 128u, 512u, 64u, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp, half,
     MaskMode::kNone, /*return_lse=*/false, /*fuse_v_scale=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
-    const float *__restrict__, half *, float *__restrict__, const int64_t, const int64_t,
-    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const float *__restrict__, const float *__restrict__, const float *__restrict__,
+    float *__restrict__, const uint32_t, const uint32_t, const uint32_t, float);
 
 // HD=64, causal + lse, per-thread quant, bf16 out
 template __global__ void qk_int8_sv_f8_attn_kernel_sm100_ws<
     128u, 128u, 512u, 64u, QuantGranularity::kPerThread, QuantGranularity::kPerThread, nv_bfloat16,
     MaskMode::kCausal, /*return_lse=*/true, /*fuse_v_scale=*/true>(
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
-    const __grid_constant__ CUtensorMap, const float *__restrict__, const float *__restrict__,
-    const float *__restrict__, nv_bfloat16 *, float *__restrict__, const int64_t, const int64_t,
-    uint32_t, const uint32_t, const uint32_t, const uint32_t, float);
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const float *__restrict__, const float *__restrict__, const float *__restrict__,
+    float *__restrict__, const uint32_t, const uint32_t, const uint32_t, float);
 
 }  // namespace sm100
 }  // namespace sage
