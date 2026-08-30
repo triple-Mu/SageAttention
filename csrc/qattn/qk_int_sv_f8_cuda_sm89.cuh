@@ -670,35 +670,15 @@ __global__ void qk_int_sv_f8_attn_kernel(const int8_t* __restrict__ Q,
         // compute_fp16_sv_permuted<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V,
         // V_SMEM_STRIDE / PACK_SIZE_V, 4>(
         //   smem_V, RS_f16, RO, denom, V_smem_offset_mma);
-        if constexpr (!use_inst_buf) {
-            compute_fp8_sv<num_warps_q,
-                           num_warps_k,
-                           num_tiles_q,
-                           num_tiles_k,
-                           num_tiles_v,
-                           swizzle_mode_V,
-                           V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS_f8, RO);
-        }
-        else {
-            if constexpr (!use_pv_fp16_accum) {
-                compute_fp8_sv_inst_buf<num_warps_q,
-                                        num_warps_k,
-                                        num_tiles_q,
-                                        num_tiles_k,
-                                        num_tiles_v,
-                                        swizzle_mode_V,
-                                        V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS_f8, RO);
-            }
-            else {
-                compute_fp8_sv_inst_buf_fp16_accum<num_warps_q,
-                                                   num_warps_k,
-                                                   num_tiles_q,
-                                                   num_tiles_k,
-                                                   num_tiles_v,
-                                                   swizzle_mode_V,
-                                                   V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS_f8, RO);
-            }
-        }
+        compute_fp8_sv<num_warps_q,
+                       num_warps_k,
+                       num_tiles_q,
+                       num_tiles_k,
+                       num_tiles_v,
+                       swizzle_mode_V,
+                       V_SMEM_STRIDE / PACK_SIZE_V,
+                       use_inst_buf,
+                       use_pv_fp16_accum>(smem_V, RS_f8, RO);
 
         __syncthreads();
 
