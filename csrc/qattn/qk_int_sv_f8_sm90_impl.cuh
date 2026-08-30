@@ -337,26 +337,37 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #endif
 
     int phase = 1;
-#ifdef SAGE_VARLEN
-    for (int32_t iter = 1; iter < num_iterations; iter++) {
-#else
-    for (uint32_t iter = 1; iter < num_iterations; iter++) {
-#endif
+
+    // -------------------------------------------------------------------------
+    // Per-KV-tile body (the sm100 kernel's process_tile peel). `iter` is the
+    // index of the tile being processed; the non-last body prefetches tile
+    // iter + 1 and folds the K dequant scale into sm_scale, while the peeled
+    // last body (is_last_t) multiplies it into S under the causal/OOB mask
+    // instead and issues no TMA.
+    // -------------------------------------------------------------------------
+    auto process_tile = [&](auto is_last_t, auto iter) {
+        constexpr bool is_last = decltype(is_last_t)::value;
+
         phase ^= 1;
 
+        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + iter * k_scale_advance_offset];
 #ifdef SAGE_VARLEN
-        // Iteration `iter` processes tile iter - 1 and prefetches tile iter.
         // With delta == 0 first_masked_tile is num_iterations - 1, so this is
-        // false throughout and the loop is the dense one: the same single FMUL
-        // folding the dequant scale into sm_scale, the same unmasked S.
-        const bool tile_masked = (iter - 1 >= first_masked_tile);
-
-        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (iter - 1) * k_scale_advance_offset];
-        sm_scale            = tile_masked ? original_sm_scale : original_sm_scale * dequant_scale;
-#else
-        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (iter - 1) * k_scale_advance_offset];
-        sm_scale            = original_sm_scale * dequant_scale;
+        // false for every non-last tile and the loop is the dense one: the
+        // same single FMUL folding the dequant scale into sm_scale, the same
+        // unmasked S. (Dead in the peeled body, whose mask is unconditional.)
+        const bool tile_masked = (iter >= first_masked_tile);
 #endif
+        if constexpr (is_last) {
+            sm_scale = original_sm_scale;
+        }
+        else {
+#ifdef SAGE_VARLEN
+            sm_scale = tile_masked ? original_sm_scale : original_sm_scale * dequant_scale;
+#else
+            sm_scale = original_sm_scale * dequant_scale;
+#endif
+        }
 
         // wait for K
         wait(&barrier_K, phase);
@@ -376,19 +387,23 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         wgmma::warpgroup_wait<0>();
 
         // load K
-        if (threadIdx.x == 0) {
-            expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
+        if constexpr (!is_last) {
+            if (threadIdx.x == 0) {
+                expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
 #ifdef SAGE_VARLEN
-            // A tile that runs off the end of this sequence reads the next
-            // one's keys; the epilogue's kv_idx >= kv_len test masks them, and
-            // past total_tokens the tensor map's out-of-bounds fill takes over.
-            load_async_4D(sK, &tensorMapK, &barrier_K, 0, seq_info.offset_k + iter * CTA_K, kv_head_id, 0);
+                // A tile that runs off the end of this sequence reads the next
+                // one's keys; the epilogue's kv_idx >= kv_len test masks them,
+                // and past total_tokens the tensor map's out-of-bounds fill
+                // takes over.
+                load_async_4D(sK, &tensorMapK, &barrier_K, 0, seq_info.offset_k + (iter + 1) * CTA_K, kv_head_id, 0);
 #else
-            load_async_4D(sK, &tensorMapK, &barrier_K, 0, iter * CTA_K, kv_head_id, batch_id);
+                load_async_4D(sK, &tensorMapK, &barrier_K, 0, (iter + 1) * CTA_K, kv_head_id, batch_id);
 #endif
+            }
         }
 
-        // convert RS to float
+        // convert RS to float; only the peeled tile folds the dequant scale
+        // here (its sm_scale above stays unscaled)
         float RS_f32[num_tiles_q][num_tiles_k][8];
 #pragma unroll
         for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -396,19 +411,70 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
                 for (uint32_t e = 0; e < 8; e++) {
-                    RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]);
+                    if constexpr (is_last) {
+                        RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]) * dequant_scale;
+                    }
+                    else {
+                        RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]);
+                    }
                 }
             }
         }
 
+        if constexpr (is_last) {
+            // masking
+#pragma unroll
+            for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+                for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+                    for (uint32_t e = 0; e < 8; e++) {
 #ifdef SAGE_VARLEN
-        // The extra masked tile bottom-right alignment can produce. It is the
-        // epilogue's arithmetic minus the kv_len bound, which cannot bite here:
-        // every key of a tile before the last is below (num_iterations - 1) *
-        // CTA_K <= kv_bound <= kv_len. Reached only when delta pushes the
-        // diagonal band across a CTA_K boundary; with delta == 0 the branch is
-        // dead and this loop is the dense one.
-        if constexpr (mask_mode == MaskMode::kCausal) {
+                        // Signed throughout: the bottom-right shift can push the
+                        // row bound below zero, and an unsigned compare would wrap
+                        // it into "mask nothing" exactly where everything is masked.
+                        const int32_t q_idx  = Q_idx_mask_base + static_cast<int32_t>(fq * 64 + 8 * ((e % 4) / 2));
+                        const int32_t kv_idx = iter * static_cast<int32_t>(CTA_K)
+                                               + static_cast<int32_t>(fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4)
+                                                                      + e % 2);
+
+                        bool is_out_of_bounds;
+
+                        if constexpr (mask_mode == MaskMode::kCausal) {
+                            is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= static_cast<int32_t>(kv_len));
+                        }
+                        else {
+                            is_out_of_bounds = (kv_idx >= static_cast<int32_t>(kv_len));
+                        }
+#else
+                        const uint32_t q_idx  = Q_idx_lane_base + fq * 64 + 8 * ((e % 4) / 2);
+                        const uint32_t kv_idx = iter * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4) + e % 2;
+
+                        bool is_out_of_bounds;
+
+                        if constexpr (mask_mode == MaskMode::kCausal) {
+                            is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= kv_len);
+                        }
+                        else {
+                            is_out_of_bounds = (kv_idx >= kv_len);
+                        }
+#endif
+
+                        if (is_out_of_bounds) {
+                            RS_f32[fq][fk][e] = -5000000.0f;
+                        }
+                    }
+                }
+            }
+        }
+#ifdef SAGE_VARLEN
+        else if constexpr (mask_mode == MaskMode::kCausal) {
+            // The extra masked tile bottom-right alignment can produce. It is
+            // the peeled body's arithmetic minus the kv_len bound, which cannot
+            // bite here: every key of a tile before the last is below
+            // (num_iterations - 1) * CTA_K <= kv_bound <= kv_len. Reached only
+            // when delta pushes the diagonal band across a CTA_K boundary; with
+            // delta == 0 the branch is dead and this loop is the dense one.
             if (tile_masked) {
 #pragma unroll
                 for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -417,7 +483,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 #pragma unroll
                         for (uint32_t e = 0; e < 8; e++) {
                             const int32_t q_idx  = Q_idx_mask_base + static_cast<int32_t>(fq * 64 + 8 * ((e % 4) / 2));
-                            const int32_t kv_idx = (iter - 1) * static_cast<int32_t>(CTA_K)
+                            const int32_t kv_idx = iter * static_cast<int32_t>(CTA_K)
                                                    + static_cast<int32_t>(fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4)
                                                                           + e % 2);
 
@@ -474,144 +540,32 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         }
 
         // load V
-        if (threadIdx.x == 0) {
-            expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
+        if constexpr (!is_last) {
+            if (threadIdx.x == 0) {
+                expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
 #ifdef SAGE_VARLEN
-            // Unlike K, V never crosses into the next sequence: the slab of
-            // sequence b spans blk_offset(b + 1) - blk_offset(b) >=
-            // ceil(kv_len / CTA_K) blocks (varlen.h, Property 1), and iter
-            // never reaches that many.
-            load_async_4D(sV, &tensorMapV, &barrier_V, (seq_info.blk_k_base + iter) * CTA_K, 0, kv_head_id, 0);
+                // Unlike K, V never crosses into the next sequence: the slab of
+                // sequence b spans blk_offset(b + 1) - blk_offset(b) >=
+                // ceil(kv_len / CTA_K) blocks (varlen.h, Property 1), and
+                // iter + 1 never reaches that many.
+                load_async_4D(sV, &tensorMapV, &barrier_V, (seq_info.blk_k_base + iter + 1) * CTA_K, 0, kv_head_id, 0);
 #else
-            load_async_4D(sV, &tensorMapV, &barrier_V, iter * CTA_K, 0, kv_head_id, batch_id);
+                load_async_4D(sV, &tensorMapV, &barrier_V, (iter + 1) * CTA_K, 0, kv_head_id, batch_id);
 #endif
-        }
-    }
-
-    {
-        phase ^= 1;
-
-        float dequant_scale = q_scale * K_scale_base_ptr[k_scale_off + (num_iterations - 1) * k_scale_advance_offset];
-        sm_scale            = original_sm_scale;
-
-        // wait for K
-        wait(&barrier_K, phase);
-
-        // compute QK^T
-        wgmma::warpgroup_arrive();
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-            int8_t* sQ_local = sQ + fq * 64 * head_dim;
-            wgmma::wgmma_s8s8s32<CTA_K, 0, head_dim>(RS[fq], sQ_local, sK);
-#pragma unroll
-            for (int k_it = 1; k_it < num_tiles_qk_inner; k_it++) {
-                wgmma::wgmma_s8s8s32<CTA_K, 1, head_dim>(RS[fq], &sQ_local[k_it * 32], &sK[k_it * 32]);
             }
         }
-        wgmma::warpgroup_commit_batch();
-        wgmma::warpgroup_wait<0>();
+    };
 
-        // convert RS to float
-        float RS_f32[num_tiles_q][num_tiles_k][8];
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-            for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-#pragma unroll
-                for (uint32_t e = 0; e < 8; e++) {
-                    RS_f32[fq][fk][e] = __int2float_rz(RS[fq][fk][e]) * dequant_scale;
-                }
-            }
-        }
-
-        // masking
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-            for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-#pragma unroll
-                for (uint32_t e = 0; e < 8; e++) {
 #ifdef SAGE_VARLEN
-                    // Signed throughout: the bottom-right shift can push the
-                    // row bound below zero, and an unsigned compare would wrap
-                    // it into "mask nothing" exactly where everything is masked.
-                    const int32_t q_idx  = Q_idx_mask_base + static_cast<int32_t>(fq * 64 + 8 * ((e % 4) / 2));
-                    const int32_t kv_idx = (num_iterations - 1) * static_cast<int32_t>(CTA_K)
-                                           + static_cast<int32_t>(fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4) + e % 2);
-
-                    bool is_out_of_bounds;
-
-                    if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= static_cast<int32_t>(kv_len));
-                    }
-                    else {
-                        is_out_of_bounds = (kv_idx >= static_cast<int32_t>(kv_len));
-                    }
-#else
-                    const uint32_t q_idx = Q_idx_lane_base + fq * 64 + 8 * ((e % 4) / 2);
-                    const uint32_t kv_idx =
-                        (num_iterations - 1) * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (e / 4) + e % 2;
-
-                    bool is_out_of_bounds;
-
-                    if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= kv_len);
-                    }
-                    else {
-                        is_out_of_bounds = (kv_idx >= kv_len);
-                    }
-#endif
-
-                    if (is_out_of_bounds) {
-                        RS_f32[fq][fk][e] = -5000000.0f;
-                    }
-                }
-            }
-        }
-
-        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, row_max, denom, sm_scale);
-
-        // accumulate denom on thread basis
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-            for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-                denom[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
-                denom[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
-            }
-        }
-
-        uint32_t RS_f8[num_tiles_q][num_tiles_pv_inner][4];
-        RS_f32_to_f8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
-
-        // wait for V
-        wait(&barrier_V, phase);
-
-        float RO_tmp[num_tiles_q][num_tiles_v][8];
-        wgmma::warpgroup_arrive();
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-            wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_tmp[fq], RS_f8[fq][0], &sV[0]);
-#pragma unroll
-            for (uint32_t v_it = 1; v_it < num_tiles_pv_inner; v_it++) {
-                wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_tmp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
-            }
-        }
-
-        wgmma::warpgroup_commit_batch();
-        wgmma::warpgroup_wait<0>();
-
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-            for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-#pragma unroll
-                for (uint32_t e = 0; e < 8; e++) {
-                    RO[fq][fv][e] += RO_tmp[fq][fv][e];
-                }
-            }
-        }
+    for (int32_t iter = 0; iter + 1 < num_iterations; iter++) {
+        process_tile(std::false_type{}, iter);
     }
+#else
+    for (uint32_t iter = 0; iter + 1 < num_iterations; iter++) {
+        process_tile(std::false_type{}, iter);
+    }
+#endif
+    process_tile(std::true_type{}, num_iterations - 1);  // peeled: fused mask, no prefetch
 
 #ifdef SAGE_VARLEN
     // A row that admitted no key at all - bottom-right causal with kv shorter
