@@ -446,8 +446,10 @@ __device__ __forceinline__ float tree_fmax_cls(const uint32_t* r)
 // Divergence audit invariants (same discipline as the 128-thread kernel):
 //   * every tcgen05::mma_* / tcgen05_commit sits under
 //     `warp_idx == kMmaWarp && elect_one()` (single issuing thread);
-//   * every tcgen05::tmem_ld/st/wait call is warpgroup-uniform: the softmax /
-//     correction loops iterate grid-uniform trip counts;
+//   * every tcgen05::tmem_ld/st/wait call is at least warp-uniform (the
+//     .aligned contract): the softmax / correction loops iterate grid-uniform
+//     trip counts, and the one data-dependent branch around such calls - the
+//     correction rescale's ballot skip - is guarded by a warp vote;
 //   * every cross-warp TMEM producer->consumer hand-off is bracketed by
 //     tcgen05_fence_before_sync(); mbarrier arrive / wait;
 //     tcgen05_fence_after_sync().
@@ -1098,28 +1100,54 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             float m_prev, rmax;
             read_vec(bar_vfull, bar_vempty, vphase, vec_addr, m_prev, rmax);
             const float o_scale = math::ptx_exp2(m_prev - rmax);  // same expr as :456 -> same bits
+            // Ballot skip (cudnn all_alpha_one, prefill_d128_f16_sm100.py
+            // :1719-1731): when every lane of this warp has o_scale == 1.0f
+            // the whole TMEM read-multiply-write below is the identity and is
+            // skipped; the barrier traffic (corr_full wait / corr_empty
+            // arrive) is kept, so the pipeline is unchanged - corr_empty now
+            // means "rescale stored or skipped as the identity". A block that
+            // does not raise the running max hits this exactly: row_max =
+            // max(m_prev, challenger) returns m_prev bit-for-bit, so
+            // m_prev - rmax is +/-0 and ex2.approx(+/-0) = +1.0 by its
+            // special-value table (ex2.approx results rounding to 1.0 for
+            // tiny negative arguments also skip - the multiplier IS 1.0f).
+            // Bit-exactness of the skip: x * 1.0f under mul.rn.ftz.f32x2
+            // returns x for every value x this accumulator can hold. The one
+            // FTZ divergence - a denormal x is flushed by the mul but kept by
+            // the skip - cannot arise: e4m3 values are multiples of 2^-9, so
+            // every PV product is a multiple of 2^-18, every f32 rounding of
+            // a partial sum stays on that grid (|x| < 2^6 is exact, above it
+            // ulp >= 2^-17), the rescale mul itself is FTZ (never stores a
+            // denormal), and adding a non-denormal to a 2^-18-grid value
+            // cannot land in (0, 2^-126) - so O never holds a denormal.
+            // Inf/NaN cannot arise either (|O| <= trips * 128 * 448^2 << f32
+            // max). The branch is warp-uniform (vote), which satisfies the
+            // .aligned contract of the tcgen05.ld/st inside.
+            const bool all_one = __all_sync(0xffffffffu, o_scale == 1.0f);
             ws::wait_bar(bar_cfull, cphase);
             cphase ^= 1;
+            if (!all_one) {
 #pragma unroll
-            for (uint32_t c = 0; c < num_tiles_o; c++) {
-                uint32_t RO_u32[32];
-                tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_o_row + c * 32);
-                tcgen05::tmem_ld_wait();
-                // G5 (cutedsl L1237-1239 same): adjacent columns share the
-                // splat o_scale, so the rescale packs as mul.rn.ftz.f32x2 -
-                // per lane bit-identical to the scalar mul it replaces (see
-                // the f32x2 helper comment), halving the FMUL issue count.
+                for (uint32_t c = 0; c < num_tiles_o; c++) {
+                    uint32_t RO_u32[32];
+                    tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_o_row + c * 32);
+                    tcgen05::tmem_ld_wait();
+                    // G5 (cutedsl L1237-1239 same): adjacent columns share the
+                    // splat o_scale, so the rescale packs as mul.rn.ftz.f32x2 -
+                    // per lane bit-identical to the scalar mul it replaces (see
+                    // the f32x2 helper comment), halving the FMUL issue count.
 #pragma unroll
-                for (uint32_t jj = 0; jj < 32; jj += 2) {
-                    float lo, hi;
-                    ws::f32x2_mul(
-                        lo, hi, __uint_as_float(RO_u32[jj]), __uint_as_float(RO_u32[jj + 1]), o_scale, o_scale);
-                    RO_u32[jj]     = __float_as_uint(lo);
-                    RO_u32[jj + 1] = __float_as_uint(hi);
+                    for (uint32_t jj = 0; jj < 32; jj += 2) {
+                        float lo, hi;
+                        ws::f32x2_mul(
+                            lo, hi, __uint_as_float(RO_u32[jj]), __uint_as_float(RO_u32[jj + 1]), o_scale, o_scale);
+                        RO_u32[jj]     = __float_as_uint(lo);
+                        RO_u32[jj + 1] = __float_as_uint(hi);
+                    }
+                    tcgen05::tmem_st_32x32b_x32(tmem_o_row + c * 32, RO_u32);
                 }
-                tcgen05::tmem_st_32x32b_x32(tmem_o_row + c * 32, RO_u32);
+                tcgen05::tmem_st_wait();
             }
-            tcgen05::tmem_st_wait();
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_cempty);
         };

@@ -177,8 +177,12 @@ for j = trip0 .. trip1-1:   rescale(1,j)                        -- S1-only
 epilog(0) ; epilog(1) ; arrive dealloc
 ```
 where `rescale(t,j)` = [w] vec_full#j, ld vec, ld_wait, arrive vec_empty#j,
-o_scale=exp2(v0-v1), [w] corr_full#(j-1), ld/mul/st O_t, st_wait, fence,
-arrive corr_empty#(j-1); and `epilog(t)` = [w] vec_full#trip_t, ld denom,
+o_scale=exp2(v0-v1), warp vote `all(o_scale==1.0f)`, [w] corr_full#(j-1),
+{ld/mul/st O_t, st_wait} skipped when the vote is unanimous (the multiply is
+the identity; wave14 ballot skip), fence, arrive corr_empty#(j-1) — the
+barrier traffic is unconditional, so every count/phase below is untouched
+and corr_empty#(j-1) now certifies "rescale stored **or** skipped as the
+identity"; and `epilog(t)` = [w] vec_full#trip_t, ld denom,
 arrive vec_empty#trip_t, [w] corr_full#(trip_t-1), O_t -> sO[t] (swizzled
 STS), `fence.proxy.async`, arrive epi_full[t].
 
@@ -244,7 +248,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | **H3** | **QK_t(j+1) overwrites vec_t cols [0,2) before correction read vec_t(j)** | see section 6 |
 | H4 | TMA K/V load overwrites a ring slot still read by an MMA | load waits `kv_empty` of the previous lap; that barrier completes via `tcgen05.commit` issued after the slot's last reader (K_i: QK1(i); V_i: PV1(i)), and commit fires only when those MMAs **retired** |
 | H5 | PV_t(j) reads P_t(j) before all 128 softmax threads stored it | `s_empty#j` completes only after 128 arrivals, each preceded by that thread's P `wait::st` + fence; mma issues `fence::after_thread_sync` after the wait |
-| H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j) |
+| H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j); a warp that ballot-skipped the rescale (wave14) has no in-flight TMEM write to order — its arrival is trivially safe |
 | H7 | correction reads O_t (rescale j / epilog) before PV_t(j-1) finished accumulating | `corr_full#(j-1)` completes when the PV chain retired (tcgen05.commit semantics) |
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
 | H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |

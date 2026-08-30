@@ -763,3 +763,78 @@ causal b4 s1024(0.9997)。新目标线:ws/old 22 点 geomean **1.1436**
 (d128 1.1649;w11 为 1.1308/1.1518),ws/cudnn **0.8412**(d128
 0.8691;w11 为 0.8346/0.8621)。cudnn 同场复测与 w11 偏差 geomean 0.3%
 (BEYOND_CUDNN_PLAN §1.1 目标线仍有效;cudnn 版本 9.24.0)。
+| 项 | 判据 |
+|---|---|
+| golden(`SAGEATTN_SM100_WS=1`,golden-sm100-g1ws) | `diff=0`(§10.2 是逐位论证,不放宽) |
+| golden(WS=0,golden-sm100) | `diff=0`(旧 kernel TU 未动,应逐字节不变) |
+| 压测 | ws_stress 2×8000 零挂死;**另加一个 kv_len > 131072 的 case**(如 s=139264=1088 块)实跑回退分支 |
+| bench 22 点 vs G1(97c5b2b) | 几何均值 >1.005 才算收益成立(>0.5% 口径);无形状 <0.995 |
+| ncu(b4h32s16384c0,对齐 §9.6 口径) | L2 read sectors 回落到 r5 量级(消掉 +14%);步首 long_scoreboard 占比下降为方向性佐证(跨版本比值口径注意 §9.6 的分母陷阱) |
+| 回退 | 任一硬闸失败即整 commit revert(单 commit,无交叉依赖) |
+
+## 11. Phase A(wave14 实现;上机待验收):ballot 全跳 + P 分块交付
+
+BEYOND_CUDNN_PLAN §4.1/§4.3 的两项,各自独立 commit、独立可回退;两项都是
+值序不动的设计,golden-sm100-g1ws 预期 `diff=0`(硬判据,非 accuracy 口径)。
+§4.2 G2 已在基线内(§10),threshold 惰性 max(§4.5)本轮不做。
+
+### 11.1 correction ballot 全跳(cudnn all_alpha_one 同款,去阈值版)
+
+结构照 cudnn DSL(prefill_d128_f16_sm100.py:1719-1731,alpha==1.0 →
+`vote_sync ALL` → 整段跳过 O 的 LDTM/FMUL2/STTM):rescale 里算完
+`o_scale = exp2(m_prev - rmax)` 后加 `__all_sync(0xffffffff, o_scale==1.0f)`,
+全票即跳过该 warp 本轮的全部 O TMEM 读改写与 `wait::st`;corr_full wait、
+fence、corr_empty arrive 原样保留(账本计数/phase 零变化,corr_empty 语义
+扩为「rescale 已写回**或**恒等跳过」)。vote 粒度是 warp(cudnn 同款):
+correction 4 个 warp 各管 32 行,各自独立跳,无跨 warp 协调;warp-uniform
+分支满足 tcgen05.ld/st 的 .aligned 约定(kernel 头部 divergence audit 注释
+已同步)。任务书语境里的「对本 warpgroup ballot」按 DSL 实码落成 per-warp
+——粒度更细,命中是 warpgroup 版的超集。
+
+**o_scale==1.0 精确出现的论证**(为什么 ballot 有的可跳):块 j 没抬高
+running max 时,`row_max = max(m_prev, challenger)` 按 fmaxf 语义返回
+m_prev 本身的位型 → `m_prev - rmax = ±0` → `ex2.approx(±0) = +1.0`
+(PTX 特值表,精确)。±0 歧义(m_prev 与 challenger 同值异号零)两个方向
+都仍给 exp2(±0)=1.0。另外 ex2.approx 对极小负 arg 舍入到 1.0 的命中也一并
+跳——判据是乘数本身 ==1.0f,跳过的乘法就是「×1.0」。
+
+**跳过 = 逐位恒等的论证**(golden 硬判据的依据):`mul.rn.ftz.f32x2(x, 1.0)`
+对 normal/±0/±inf 的 x 逐位返回 x;两个潜在位差源逐一排除:
+
+1. **FTZ denormal**(乘法把 denormal x 刷零、跳过则保留):O 累加器全程
+   不可能持有 denormal。e4m3 值都是 2^-9 的整数倍 → PV 每个乘积是 2^-18
+   的整数倍且在 f32 精确;2^-18 网格对 f32 舍入封闭(|x|<2^6 精确表示,
+   之上 ulp≥2^-17 仍是网格倍数)→ MMA 部分和(任意结合序)恒在网格上,
+   永不落入 (0, 2^-126);rescale 乘法本身 FTZ(不产 denormal);
+   「任意 f32 a + 网格值 b」也造不出 denormal(b≠0 时 |a+b| 只要非零就
+   ≥ 2^-41 量级的网格间距;b=0 时结果=a,归纳不引入新 denormal)。
+   归纳基:首个 PV enable_D=0,O 初值即网格值。
+2. **NaN payload**(FMUL 规范化 vs 跳过保留):O 到不了 ±inf——
+   |O| ≤ trip×128×448² ≈ 2^35(trip≤1024)≪ f32 上限,无 inf 无 NaN。
+
+**触发率**:块 j 抬 max 的概率 iid 下 ~1/(j+1),warp 32 行全不抬
+≈ (j/(j+1))^32;randn s16k(128 块)平均跳过率 ~40-50%,s131k ~80%+
+(BEYOND_CUDNN_PLAN §4.1 估算)。causal 短 trip 段命中低,收益偏长序列。
+
+**预期收益机制**:correction 的 TMEM 列流量占全 kernel ~61%(每块每 tile
+128ld+128st),跳过直接减 TMEM 口争用(与 softmax S drain、MMA 写回同口),
+corr_empty 更早到 → mma 的 `wait_corr_empty` 等待缩短。挂账 +2~5% 长序列
+(TMEM 口压力无 ncu 直读指标,上机 duration 定夺)。
+
+本地门禁(nvcc 13.3,4 实例 × sm_100a/sm_110a):0 spill / 0 stack /
+入口 128 reg;correction 区峰值 76→77(≤87),softmax/entry 区 SASS
+规范化对比逐行不变,mma 尾段 diff 仅 correction 的 out-of-line spin 块
+(P0→P1 谓词重命名 + NOP 排布,§10.3 已记档的布局伪影)。VOTE.ALL 落点
+= rescale 各 inline 站点。
+
+上机判据(B200,口径同 §9.5/§10.4):
+
+| 项 | 判据 |
+|---|---|
+| golden(WS=1,golden-sm100-g1ws) | `diff=0`(上面恒等论证的硬判据;出 diff 即论证被证伪,revert 定位,**不得**降级成 accuracy 口径) |
+| golden(WS=0,golden-sm100) | `diff=0`(旧 TU 未动) |
+| 压测 | ws_stress 2×8000 零挂死(skip 分支是 warp-uniform 条件执行,barrier 计数不变,不新增挂死面) |
+| bench 22 点 vs 上一态 | 几何均值 >1.005 成立才算收益(>0.5% 口径);无形状 <0.995;主看 nc s≥16k |
+| ncu(b4h32s16384c0) | duration 下降为准;佐证:mma 视角 stalled_barrier(wait_corr_empty)回落、softmax 视角 long_scoreboard(S drain 与 corr 的 TMEM 口争用)回落 |
+| 跳过率抽查(可选) | 临时加 `SAGEATTN_DEBUG` printf 或 ncu source counter 不划算;用 §4.1 模型对照 duration 弹性即可,不单独插桩 |
+
