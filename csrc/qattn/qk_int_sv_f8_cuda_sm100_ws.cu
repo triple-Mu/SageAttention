@@ -44,11 +44,14 @@
 // correction / epilogue is copied verbatim from qk_int_sv_f8_cuda_sm100.cu
 // (line references at each block). Copies are annotated instead of extracted
 // into a shared header so the existing kernel's TU keeps byte-identical
-// device text (SASS gate). Softmax reads each S row once and keeps the
-// whole dequanted row in registers (the 128-thread kernel's own structure,
-// :407-449); an earlier two-pass variant (re-reading TMEM for the exp2
-// pass) doubled the tcgen05.ld traffic and lost 11% end to end - the
-// regression analysis and the register account are in
+// device text (SASS gate). Softmax reads each S row once - two x64
+// tcgen05.ld per KV block, the widest form ptxas accepts under the
+// 128-register entry target - and keeps the whole dequanted row in
+// registers (the 128-thread kernel's value sequence, :407-449). History: a
+// two-pass variant (re-reading TMEM for the exp2 pass) doubled the
+// tcgen05.ld traffic and lost 11% end to end; the round-2 single-pass
+// version chained four x32 loads and still stalled on long_scoreboard -
+// the analyses and the register accounts are in
 // bench/sm100_review/C1_DESIGN.md.
 //
 // Pipeline/barrier design and the deadlock-freedom + TMEM alias-hazard
@@ -223,6 +226,30 @@ __device__ __forceinline__ void tmem_ld_32x32b_x2(uint32_t r[2], uint32_t tmem_a
 #endif
 }
 
+// 64-column tcgen05.ld: the softmax S-row drain (tcgen05.cuh stops at x32).
+// One LDTM.x64 moves half the 128-col row, so each KV block exposes two
+// TMEM-load latencies instead of four chained x32 round trips, still with
+// exactly one outstanding tcgen05.ld (stays clear of the batch-issue
+// pattern that hung in the A5 experiment). x64 is the widest feasible
+// form here: the x128 variant is a single instruction whose destination
+// block alone (128 regs + the address operand) exceeds the 128-register
+// entry target that __launch_bounds__(512, 1) pins, and ptxas rejects it
+// with C7602 "Insufficient registers" regardless of the setmaxnreg region
+// budget (measured, nvcc 13.3).
+__device__ __forceinline__ void tmem_ld_32x32b_x64(uint32_t r[64], uint32_t tmem_addr)
+{
+#ifdef SAGE_TCGEN05_ENABLED
+    cuda::ptx::tcgen05_ld_32x32b(*reinterpret_cast<uint32_t(*)[64]>(r), tmem_addr);
+#else
+#pragma unroll
+    for (uint32_t i = 0; i < 64; ++i) {
+        r[i] = 0u;
+    }
+    (void)tmem_addr;
+    __trap();
+#endif
+}
+
 __device__ __forceinline__ void tmem_st_32x32b_x2(uint32_t tmem_addr, const uint32_t r[2])
 {
 #ifdef SAGE_TCGEN05_ENABLED
@@ -308,10 +335,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     constexpr uint32_t TMEM_COLS_TOTAL = 512;  // one CTA/SM by construction; alloc all
     static_assert(TMEM_COL_O1 + head_dim <= TMEM_COLS_TOTAL, "TMEM budget exceeded");
 
-    // --- derived tile counts (identical to the 128-thread kernel) ---
+    // --- derived tile counts (identical to the 128-thread kernel; the
+    //     softmax S drain is a single x128 tcgen05.ld, not tiled) ---
     constexpr uint32_t num_tiles_qk_inner = head_dim / 32;
     constexpr uint32_t num_tiles_pv_inner = CTA_K / 32;
-    constexpr uint32_t num_tiles_s        = CTA_K / 32;
     constexpr uint32_t num_tiles_o        = head_dim / 32;
 
     // --- smem plan: Q double tile + shared K/V 4-slot ring ---
@@ -494,16 +521,19 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         int vec_empty_phase = 0;
 
         // -------------------------------------------------------------------
-        // Per-KV-block softmax step. One pass over the S row: each 32-col
-        // chunk is one tcgen05.ld + wait (the 128-thread kernel's cadence,
-        // NOT the batch-issue/collective-wait pattern that hung in the A5
-        // experiment), dequanted+masked into RS_f32 and folded into m_local;
-        // the whole row then stays in registers, so nothing touches TMEM
+        // Per-KV-block softmax step. One pass over the S row: two x64
+        // tcgen05.ld + wait round trips drain the whole row (two exposed
+        // TMEM-load latencies per KV block; round 2 chained four x32 loads
+        // and long_scoreboard stayed the top stall - see C1_DESIGN.md round
+        // 3, which also records why x128 is rejected by ptxas). Still
+        // exactly one outstanding tcgen05.ld, NOT the batch-issue/
+        // collective-wait pattern that hung in the A5 experiment. Each raw
+        // word is dequanted+masked in place and folded into m_local; the
+        // whole row then stays in registers, so nothing touches TMEM
         // between the vec store (aliases S cols [0,2)) and the P store.
-        // This is the load/max loop of the 128-thread kernel verbatim
-        // (:407-449); the exp2 / d_sum / pack sequences below keep its order
-        // too (see file header). is_last folds the causal/OOB mask exactly
-        // like :431-444.
+        // The per-element dequant/max/exp2/d_sum/pack value sequences are
+        // those of the 128-thread kernel (:407-449, :459-474; see file
+        // header). is_last folds the causal/OOB mask exactly like :431-444.
         // -------------------------------------------------------------------
         auto softmax_step = [&](auto is_last_t, uint32_t iter) {
             constexpr bool is_last = decltype(is_last_t)::value;
@@ -550,19 +580,23 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             s_full_phase ^= 1;
 
             // ---- load + dequant + mask + row max, whole row retained
-            //      (:407-449; m_local update order unchanged) ----
-            float RS_f32[CTA_K];
-            float m_local = -5000000.0f;
+            //      (:407-449; per-element op order unchanged - same ascending
+            //      column order as the four-chunk version, so every float op
+            //      sees the same inputs in the same order). The row array is
+            //      uint32_t so each f32 result can overwrite its raw word in
+            //      place: the ld's in-flight block and the retained row share
+            //      registers instead of stacking a separate staging array. ----
+            uint32_t RS_row[CTA_K];
+            float    m_local = -5000000.0f;
 #pragma unroll
-            for (uint32_t c = 0; c < num_tiles_s; c++) {
-                uint32_t RS_u32[32];
-                tcgen05::tmem_ld_32x32b_x32(RS_u32, tmem_row + c * 32);
+            for (uint32_t c = 0; c < CTA_K / 64; c++) {
+                ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
                 tcgen05::tmem_ld_wait();
 #pragma unroll
-                for (uint32_t jj = 0; jj < 32; jj++) {
-                    const float s       = s_of(RS_u32[jj], c * 32 + jj);
+                for (uint32_t jj = 0; jj < 64; jj++) {
+                    const float s       = s_of(RS_row[c * 64 + jj], c * 64 + jj);
                     m_local             = max(m_local, s);
-                    RS_f32[c * 32 + jj] = s;
+                    RS_row[c * 64 + jj] = __float_as_uint(s);
                 }
             }
 
@@ -597,7 +631,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 float p[4];
 #pragma unroll
                 for (uint32_t b = 0; b < 4; b++) {
-                    p[b] = math::ptx_exp2(fmaf(RS_f32[4 * w + b], local_sm_scale, neg_row_max));
+                    p[b] = math::ptx_exp2(fmaf(__uint_as_float(RS_row[4 * w + b]), local_sm_scale, neg_row_max));
                     d_sum += p[b];
                 }
                 floatx4_to_e4m3x4(&RP_u32[w], &p[0], &p[2]);
