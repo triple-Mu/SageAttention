@@ -570,42 +570,6 @@ template<uint32_t    num_warps_q,
          uint32_t    num_tiles_v,
          SwizzleMode swizzle_mode,
          uint32_t    stride,
-         typename DTypeSVAccum>
-__device__ __forceinline__ void compute_fp16_sv(const smem_t<swizzle_mode, stride>& smem_V,
-                                                uint32_t                            RS_f16[][num_tiles_k][4],
-                                                DTypeSVAccum                        RO[][num_tiles_v][8],
-                                                float                               denom[][2])
-{
-    uint32_t smem_V_row_base = get_warp_idx_k<num_warps_q, num_warps_k>() * (num_tiles_k * 16) + get_lane_id_2d() % 16;
-    uint32_t smem_V_col_base = get_lane_id_2d() / 16;
-#pragma unroll
-    for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-#pragma unroll
-        for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-            // load RV
-            uint32_t RV[4];
-            uint32_t offset_V = (smem_V).get_permuted_offset(smem_V_row_base + fk * 16, smem_V_col_base + fv * 2);
-            smem_V.ldmatrix_m8n8x4_trans(offset_V, RV);
-#pragma unroll
-            for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-                if constexpr (std::is_same<DTypeSVAccum, float>::value) {
-                    mma::mma_sync_m16n16k16_row_col_f16f16f32(RO[fq][fv], RS_f16[fq][fk], RV);
-                }
-                else if constexpr (std::is_same<DTypeSVAccum, half>::value) {
-                    mma::mma_sync_m16n16k16_row_col_f16f16f16((uint32_t*)RO[fq][fv], RS_f16[fq][fk], RV);
-                }
-            }
-        }
-    }
-}
-
-template<uint32_t    num_warps_q,
-         uint32_t    num_warps_k,
-         uint32_t    num_tiles_q,
-         uint32_t    num_tiles_k,
-         uint32_t    num_tiles_v,
-         SwizzleMode swizzle_mode,
-         uint32_t    stride,
          uint32_t    RS_width = 4,
          typename T,
          typename DTypeSVAccum>
