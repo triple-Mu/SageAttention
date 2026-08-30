@@ -207,6 +207,14 @@ load_async_4D(uint32_t dst, void const* const src_tma_map, uint32_t bar, int c0,
                  : "memory");
 }
 
+// TMA descriptor prefetch (cutedsl L432-436): warms the descriptor cache so
+// the first UTMALDG/UTMASTG on each tensor map does not stall on a cold
+// descriptor fetch. Pure prefetch - no data or ordering effect.
+__device__ __forceinline__ void prefetch_tensormap(void const* desc)
+{
+    asm volatile("prefetch.tensormap [%0];" ::"l"(desc) : "memory");
+}
+
 // TMA bulk-tensor store (S2G), u32 smem source. Unlike tma.cuh's
 // store_async_4D this takes the inner coordinate too: the O staging tile is
 // stored as head_dim/64 boxes of 64 columns (the widest inner box a
@@ -1238,6 +1246,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     }
                 };
 
+                // G4: prefetch the load-side descriptors before the first use
+                ws::prefetch_tensormap(&tensorMapQ);
+                ws::prefetch_tensormap(&tensorMapK);
+                ws::prefetch_tensormap(&tensorMapV);
+
                 ws::expect_bytes_bar<SMEM_Q_BYTES>(bars_u32 + kBarQFull * 8);
                 ws::load_async_4D(
                     sQ_u32, &tensorMapQ, bars_u32 + kBarQFull * 8, 0, cta_idx_q * (2 * CTA_Q), head_id, batch_id);
@@ -1286,6 +1299,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             // final wait_group.read keeps sO alive until the engine is done
             // reading it (CTA exit reclaims smem).
             if (tcgen05::elect_one()) {
+                ws::prefetch_tensormap(&tensorMapO);  // G4: cold-fetch off the store path
                 const uint32_t bars_u32 = ws::smem_u32(bars);
                 const uint32_t sO_u32   = ws::smem_u32(smem_) + 2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES;
                 const uint32_t q_base   = blockIdx.x * (2 * CTA_Q);
