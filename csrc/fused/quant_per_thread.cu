@@ -230,7 +230,8 @@ __global__ void QuantPerThreadQInt8Kernel(T* __restrict__ input,
 // over all of them, stored at [tile*4 + warp_id]. Optionally fuses the
 // key - key_mean smoothing subtraction (done in the input dtype, matching the
 // torch sub the Triton path performs beforehand).
-template<uint32_t head_dim, uint32_t WARP_TOKENS, bool sub_mean, typename T>
+// kVarlen: same dense/varlen split as QuantPerThreadQInt8Kernel above.
+template<uint32_t head_dim, uint32_t WARP_TOKENS, bool sub_mean, bool kVarlen, typename T>
 __global__ void SAGE_QUANT_K_BOUNDS(WARP_TOKENS) QuantPerThreadKInt8Kernel(T* __restrict__ input,
                                           T* __restrict__ mean,
                                           int8_t* __restrict__ output,
@@ -280,15 +281,17 @@ __global__ void SAGE_QUANT_K_BOUNDS(WARP_TOKENS) QuantPerThreadKInt8Kernel(T* __
     uint32_t seq_tokens = num_tokens;
     int64_t  seq_base   = 0;
     uint32_t scale_slot = warp_tile_id;
-    if (cu_seqlens != nullptr) {
-        seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
-        const uint32_t ctas_per_blk = scale_blk_tokens / WARP_TOKENS;
-        if (warp_tile_id >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
-            return;
+    if constexpr (kVarlen) {
+        if (cu_seqlens != nullptr) {
+            seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+            const uint32_t ctas_per_blk = scale_blk_tokens / WARP_TOKENS;
+            if (warp_tile_id >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
+                return;
+            }
+            seq_base   = sage::seq_offset(cu_seqlens, batch_id);
+            scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
+                         + warp_tile_id;
         }
-        seq_base   = sage::seq_offset(cu_seqlens, batch_id);
-        scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
-                     + warp_tile_id;
     }
 
     // The warp-tile base is the only offset that can reach the n*h*hd range, so
@@ -490,8 +493,9 @@ void quant_per_thread_int8_k_cuda(torch::Tensor      input,
             DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
                 dim3 grid(num_warp_tiles, layout.num_heads, layout.batch_size);
                 dim3 block(32, 4);
-                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, false, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                auto* kernel = is_varlen ? QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, false, true, c_type> :
+                                           QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, false, false, c_type>;
+                kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  nullptr,
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
@@ -558,8 +562,9 @@ void quant_per_thread_int8_k_fuse_sub_mean_cuda(torch::Tensor      input,
             DISPATCH_WARP_BLOCK_SIZE_K(warp_block_size, WARP_TOKENS, {
                 dim3 grid(num_warp_tiles, layout.num_heads, layout.batch_size);
                 dim3 block(32, 4);
-                QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, true, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                auto* kernel = is_varlen ? QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, true, true, c_type> :
+                                           QuantPerThreadKInt8Kernel<HEAD_DIM, WARP_TOKENS, true, false, c_type>;
+                kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
