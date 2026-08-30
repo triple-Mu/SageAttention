@@ -18,6 +18,7 @@
 #include "../sageattn/launch_helpers.cuh"
 #include "../sageattn/varlen.h"
 #include "../sageattn/varlen_check.h"
+#include "../tma.cuh"
 #include "../utils.cuh"
 
 // Shared tensor-check / layout prelude for the qk_int* attention launchers.
@@ -517,6 +518,88 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     }
 
     return layout;
+}
+
+// The Q/K/V tensor-map triple every TMA launcher (sm90/sm100) builds from the
+// parsed layout. Q and K tile the token axis, V is the transposed
+// [B, D, H, padded_kv] tensor tiled along head_dim.
+struct QKVTensorMaps {
+    CUtensorMap q, k, v;
+};
+
+template<int CTA_Q, int CTA_K, int HEAD_DIM>
+inline QKVTensorMaps make_qkv_tensor_maps(const torch::Tensor& query,
+                                          const torch::Tensor& key,
+                                          const torch::Tensor& value,
+                                          const QKVLayout&     L)
+{
+    QKVTensorMaps maps;
+    maps.q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()),
+                                                   L.batch_size,
+                                                   L.num_qo_heads,
+                                                   L.qo_len,
+                                                   HEAD_DIM,
+                                                   L.stride_batch_q,
+                                                   L.stride_h_q,
+                                                   L.stride_seq_q);
+    maps.k = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()),
+                                                   L.batch_size,
+                                                   L.num_kv_heads,
+                                                   L.kv_len,
+                                                   HEAD_DIM,
+                                                   L.stride_batch_k,
+                                                   L.stride_h_k,
+                                                   L.stride_seq_k);
+    maps.v = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()),
+                                                   L.batch_size,
+                                                   L.num_kv_heads,
+                                                   HEAD_DIM,
+                                                   value.size(3),
+                                                   L.stride_batch_v,
+                                                   L.stride_h_v,
+                                                   L.stride_d_v);
+    return maps;
+}
+
+// The varlen counterpart: rank-4 tensor maps over the rank-3 packed tensors.
+// The batch extent is 1 and the kernel's batch coordinate is always 0, so the
+// sequence offset can ride in the token coordinate and the map itself never
+// sees a cu_seqlens value (which is what makes it safe to capture in a
+// cudagraph). The batch stride is the tensor's own full extent - the driver
+// rejects a stride that is not 16-byte aligned, so 0 is not an option even
+// though nothing reads it.
+template<int CTA_Q, int CTA_K, int HEAD_DIM>
+inline QKVTensorMaps make_qkv_tensor_maps_varlen(const torch::Tensor&   query,
+                                                 const torch::Tensor&   key,
+                                                 const torch::Tensor&   value,
+                                                 const QKVVarlenLayout& L)
+{
+    QKVTensorMaps maps;
+    maps.q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()),
+                                                   1,
+                                                   L.num_qo_heads,
+                                                   L.total_q,
+                                                   HEAD_DIM,
+                                                   L.stride_seq_q * L.total_q,
+                                                   L.stride_h_q,
+                                                   L.stride_seq_q);
+    maps.k = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()),
+                                                   1,
+                                                   L.num_kv_heads,
+                                                   L.total_k,
+                                                   HEAD_DIM,
+                                                   L.stride_seq_k * L.total_k,
+                                                   L.stride_h_k,
+                                                   L.stride_seq_k);
+    maps.v = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()),
+                                                   1,
+                                                   L.num_kv_heads,
+                                                   HEAD_DIM,
+                                                   L.padded_k,
+                                                   L.stride_h_v * L.num_kv_heads,
+                                                   L.stride_h_v,
+                                                   L.stride_d_v);
+    return maps;
 }
 
 // Rebind the parsed layout to the local names the DISPATCH bodies were

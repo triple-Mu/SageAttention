@@ -109,42 +109,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn_inst_buf(torch::T
 
                         CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
-                        // Rank-4 tensor maps over a rank-3 packed tensor: the
-                        // batch extent is 1 and the kernel's batch coordinate
-                        // is always 0, so the sequence offset can ride in the
-                        // token coordinate and the map itself never sees a
-                        // cu_seqlens value (which is what makes it safe to
-                        // capture in a cudagraph). The batch stride is the
-                        // tensor's own full extent - the driver rejects a
-                        // stride that is not 16-byte aligned, so 0 is not an
-                        // option even though nothing reads it.
-                        CUtensorMap tma_map_Q =
-                            create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()),
-                                                                  1,
-                                                                  num_qo_heads,
-                                                                  total_q,
-                                                                  HEAD_DIM,
-                                                                  static_cast<int64_t>(stride_seq_q) * total_q,
-                                                                  stride_h_q,
-                                                                  stride_seq_q);
-                        CUtensorMap tma_map_K =
-                            create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()),
-                                                                  1,
-                                                                  num_kv_heads,
-                                                                  total_k,
-                                                                  HEAD_DIM,
-                                                                  static_cast<int64_t>(stride_seq_k) * total_k,
-                                                                  stride_h_k,
-                                                                  stride_seq_k);
-                        CUtensorMap tma_map_V =
-                            create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()),
-                                                                  1,
-                                                                  num_kv_heads,
-                                                                  HEAD_DIM,
-                                                                  padded_k,
-                                                                  stride_h_v * num_kv_heads,
-                                                                  stride_h_v,
-                                                                  stride_d_v);
+                        QKVTensorMaps tma_maps =
+                            make_qkv_tensor_maps_varlen<CTA_Q, CTA_K, HEAD_DIM>(query, key, value, qkv);
 
                         auto*  kernel     = qk_int8_sv_f8_attn_kernel<CTA_Q,
                                                                  CTA_K,
@@ -164,9 +130,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn_inst_buf(torch::T
                         // shorter ones do not need exit at the top of the kernel
                         dim3 grid(div_ceil(max_seqlen_q, CTA_Q), num_qo_heads, batch_size);
                         kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
-                            tma_map_Q,
-                            tma_map_K,
-                            tma_map_V,
+                            tma_maps.q,
+                            tma_maps.k,
+                            tma_maps.v,
                             reinterpret_cast<float*>(query_scale.data_ptr()),
                             reinterpret_cast<float*>(key_scale.data_ptr()),
                             reinterpret_cast<float*>(value_scale.data_ptr()),

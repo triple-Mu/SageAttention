@@ -725,33 +725,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
 
                         CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
-                        CUtensorMap tma_map_Q =
-                            create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()),
-                                                                  batch_size,
-                                                                  num_qo_heads,
-                                                                  qo_len,
-                                                                  HEAD_DIM,
-                                                                  stride_batch_q,
-                                                                  stride_h_q,
-                                                                  stride_seq_q);
-                        CUtensorMap tma_map_K =
-                            create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()),
-                                                                  batch_size,
-                                                                  num_kv_heads,
-                                                                  kv_len,
-                                                                  HEAD_DIM,
-                                                                  stride_batch_k,
-                                                                  stride_h_k,
-                                                                  stride_seq_k);
-                        CUtensorMap tma_map_V =
-                            create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()),
-                                                                  batch_size,
-                                                                  num_kv_heads,
-                                                                  HEAD_DIM,
-                                                                  value.size(3),
-                                                                  stride_batch_v,
-                                                                  stride_h_v,
-                                                                  stride_d_v);
+                        QKVTensorMaps tma_maps = make_qkv_tensor_maps<CTA_Q, CTA_K, HEAD_DIM>(query, key, value, qkv);
 
                         auto*  kernel     = qk_int8_sv_f8_attn_kernel_sm100<CTA_Q,
                                                                        CTA_K,
@@ -771,9 +745,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
 
                         dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
                         kernel<<<grid, NUM_THREADS, smem_bytes, stream>>>(
-                            tma_map_Q,
-                            tma_map_K,
-                            tma_map_V,
+                            tma_maps.q,
+                            tma_maps.k,
+                            tma_maps.v,
                             reinterpret_cast<float*>(query_scale.data_ptr()),
                             reinterpret_cast<float*>(key_scale.data_ptr()),
                             reinterpret_cast<float*>(value_scale.data_ptr()),
