@@ -1,6 +1,6 @@
 # sm100 varlen 支持设计(M1/M2 已落地;M3 上机:pytest 全绿、压测挂死,红)
 
-基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2,M3 wave14 实录(含挂死画像与建议)见 §6.3。
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2,M3 wave14 实录(含挂死画像与建议)见 §6.3,wave15 的 race 根因分析、已落地修复与 B200 裁决矩阵见 §6.4。
 
 ## 0. 结论
 
@@ -271,7 +271,130 @@ varlen 路径自身开销;等 race 修复后按 M4 全量重测再定论。
 **M3 判定:红**。建议二选一:(a) plan 侧把 sm100 撤出
 `_VARLEN_BACKENDS`(退回 M2 前的 sm89 packed fallback),dense 侧 G2/G1
 冻结不受影响;(b) 定位修复 race 后整轮重跑 M3(pytest 全绿态可沿用,
-压测/bench 必须重来)。
+压测/bench 必须重来)。→ 走 (b),分析与修复见 §6.4。
+
+### 6.4 race 根因分析与修复(wave15,本机 sm86 + nvcc 13.3 静态分析)
+
+**结论:kernel 逻辑与 barrier 记账无 bug;首选根因候选 C1 = mbarrier init
+后缺 async proxy 发布 fence(与 SS twin 同类的跨 proxy 可见性缺口),修复
+已落地(varlen TU 单条 `fence.proxy.async.shared::cta`,dense SASS 逐字节
+不变);C1 无法在本机拍死,§6.4.4 给出让一个 B200 会话一次裁决 C1/C2/C3
+的实验矩阵。**
+
+#### 6.4.1 排除表
+
+逐候选排除,证据全部可本机复核:
+
+| # | 候选 | 排除依据 |
+|---|---|---|
+| E1 | barrier 记账失衡(少发/多发 expect_tx、commit 或 wait) | §3.2 八处改动没有一处触碰 barrier 指令流:mask(第 7 条)只改 `s` 的值,trip 改动(第 3/4 条)只改 T 并保证 T>=1 才进 pipeline,坐标/索引/epilogue(5/6/8)全是地址算术。barrier_ledger.md 的计数表对 varlen 原样成立(把 T 读作该 CTA 自己的 T(cta)):每 barrier 每 tile 恰好一次 completion 一次 wait,T=1 退化列照走。且任何逻辑性失衡对固定形状是确定性的——wave14 同形状 `CUDA_LAUNCH_BLOCKING` 逐位重放 24 launch 全 clean,矛盾 |
+| E2 | 数值链产生 Inf/NaN 引发挂死 | 全 mask 行走 P=exp2(8.807)≈448 的有限链(§6.2 第 4 条三层防线),denom>=1 恒有限;且数值错挂不了 mbarrier,只会错结果——69/69 pytest 含 bitwise 对拍全绿 |
+| E3 | causal trip / first_masked_tile 符号错 | int32 负数除法逐段验过:kv_bound<=0 ⇒ div_ceil 截断后 num_iterations<=0 ⇒ 零 trip 早退;first_masked_tile 偏小只多跑逐元素谓词(幂等),偏大是数值错(E2 同理被测试排除)。谓词 `iter >= first_masked_tile` 块内 uniform,不产生分歧 |
+| E4 | K 尾 tile / 跨序列 OOB 让 TMA 少记 tx | `cp.async.bulk.tensor` 对越界 box 仍按整 box 字节 complete_tx(OOB 行零填充,CUTLASS 全家依赖此语义);dense 自己的尾 tile(kv_len 非 128 倍数)走同一路径,16k+ 压测绿 |
+| E5 | A2/A5 型 SASS 调度差(varlen TU 编译进禁区) | 本机把**生产实例**(per_warp、fuse_v_scale、no-lse、TS,causal/非 causal × 双 hd)双侧编到 sm_100a SASS 逐地标对照(TRYWAIT/ARRIVE/UTMALDG/UTCIMMA/UTCQMMA/UTCBAR/LDTM/STTM/LDG/BAR/FENCE 序列):骨架相似度 0.974-1.000,仅三处差异——varlen 序幕多 cu_seqlens LDG 与两个早退;peeled tile 的 k_scale LDG 从 wait(S_done) 前挪到后(**更保守**的方向,A2 是往前挪才挂);主循环 S 排空的 4 条 LDTM 发射间距 4 连发(dense)→ 2+1+1(varlen,**更少** outstanding,A5 是更多才挂)。无禁区形态 |
+| E6 | TMEM 泄漏 / alloc-dealloc 失配 | 两个早退都在 alloc 之前;进了 pipeline 的 CTA 无一条路径绕过结尾 dealloc;alloc/dealloc 同一常量 256 列。泄漏还会让同 launch 后续 CTA 确定性卡 alloc,与 ~1/1000 非确定性矛盾 |
+| E7 | 早退本身(块内非 uniform / 位置错) | 两个早退条件全由块 uniform 值构成,且都在 barrier init、TMA、tmem_alloc 之前(§3.2 第 2/4 条);CUTLASS 自家 Blackwell varlen FMHA(examples/77,persistent 调度)对空 tile 同样是"不 alloc 直接 continue/exit"的结构 |
+
+E1-E7 合并的推论:挂死不在 kernel 的逻辑层,在硬件交互层——与 A2/A5 两桩
+未定位前科同一空间(同一 kernel、同一形态:golden 绿 + 定点压测 ~1/400-1/2000
+挂死;A5 停在第 1808/386 次 vs 本案 iter 1785/45,频率画像几乎重合)。
+
+#### 6.4.2 候选根因(带论证)
+
+**C1(首选,已修):mbarrier init 与 async proxy 之间缺发布 fence。**
+`mbarrier.init` 是 generic proxy 写;而五个 barrier 里三个由 TMA 的
+complete_tx、两个由 `tcgen05.commit` 的 arrive-on-retire 完成——全是
+**async proxy** 对同一 smem 对象的访问。mbarrier 操作(arrive/expect_tx/
+complete_tx/try_wait)彼此按 mbarrier 协议强序,但 **init 不是 mbarrier
+操作**,是普通写:发布到 async proxy 需要显式
+`fence.proxy.async.shared::cta`——CUDA Programming Guide 的 TMA 示例在
+`init(&bar, ...)` 后紧跟 `cde::fence_proxy_async_shared_cta()`,CUTLASS 的
+pipeline 构造在 init 后统一走 `fence_barrier_init()`。本 kernel(dense 与
+varlen 同)只有 init → `__syncthreads()` → expect+TMA,`__syncthreads()`
+不跨 proxy。SASS 佐证:ptxas 13.3 给 `mbarrier.init` 自动垫了 **init 前**
+的 `FENCE.VIEW.ASYNC.S`(清掉槽位前任在同地址的 async proxy 残留状态),
+**init 后**的发布方向没有任何 fence——工具链自己都认为这个对象跨 proxy
+敏感,而我们缺的恰是文档要求的那半边。
+
+时序窗口:init 的跨 proxy 传播 vs 第一次 complete_tx 的赛跑。窗口平时被
+TMA 取数延迟(冷数据 ~1µs)盖死;varlen 压测是 8 组**固定输入**背靠背
+launch(K/V tile L2 热,complete_tx 可 ~200ns 到达)+ 大量 µs 级生命期
+CTA(block-skip 秒退、causal 1-tile trip)高频复用 SM 槽位——正好把窗口
+压进可命中区。complete_tx 打在 init 未见的陈旧对象上 ⇒ tx 计数丢失 ⇒
+全 CTA 永停在该 barrier 的 phase 0 wait ⇒ util 100% / 低功耗自旋,与
+§6.3 画像逐条吻合。
+
+与观测的对账:非确定性 ~1/50-1/2000 ✓(微架构窗口);同形状重放 clean ✓
+(非形状函数);quant-only 绿 ✓(无 mbarrier);dense classic 6000 绿 ✓
+(变形状 → L2 冷 + 无空 CTA 槽位churn);ws 16k 绿 ✓(init 到首 TMA 之间
+隔着 512 线程序幕,天然余量大);causal 6/6 ✓(trip 减半 → 波次/槽位
+churn 加倍、足迹减半 → L2 更热,是速率富集不是硬门控——这也兼容 bench
+在非 causal 等长行停住的那次);pytest 绿 ✓(launch 数少,p~1/1000 命中
+不了)。**本仓先例**:SS twin 的 sP staging 同为 generic 写喂 async proxy
+读,缺同一条 fence,在 2 CTA 共驻时挂死,加 fence 后 8000×2 绿
+(HARDWARE_CHECKLIST §5f)——同类缺口、同类形态、同款修法。
+
+反对面(诚实记录):dense 同样缺这半边 fence 却 16k+ 绿,说明窗口极窄,
+C1 的"varlen 时序才进窗"论证是速率级的,不是结构性必然;故 C1 必须由
+B200 压测裁决,不能宣布结案。
+
+**C2(候选):µs 级 CTA 槽位 churn 与 TMEM 分配器/CTA teardown 的硬件
+交互。** varlen 是本仓第一个让大量 CTA 不触碰 tcgen05 就退出、且工作 CTA
+生命期跨三个数量级的 tcgen05 workload;若硬件在"槽位回收 ↔ 邻居
+UTCATOMSWS.FIND_AND_SET 重试 / barrier 流量"之间有未写明约束,形态同样是
+永久自旋。反对面:CUTLASS varlen FMHA 结构上允许不 alloc 就退(见 E7,
+虽然它是 persistent、churn 率低);且 causal 富集同样只能用速率解释。
+若坐实,修法是"消灭裸退":`num_iterations = max(...,1)` + 两个早退改为
+跑一轮全 mask 废 tile(§4.2 的 clamp 论证平移),需要两个补丁位——
+q_scale 块索引按本序列块数 clamp(否则 block-skip CTA 的
+`blk_q_base + cta_idx_q` 越界读 Q_scale),dead-row 覆盖条件扩到非 causal
+的 `kv_len == 0`;代价是 ragged 批的空 CTA 从 µs 退出变成整轮废功,bench
+必须重跑。**本轮不落这个补丁**(未证根因先不吃 perf 税)。
+
+**C3(候选,已被 E5 削弱但未死):A2/A5 族未写明管线约束的 varlen 变体。**
+地标级对照排除了粗粒度调度差,但 dual-issue 槽位、scoreboard 分配、代码
+布局这类地标看不见的位形仍可能踩线。无本机手段,只能上机 A/B。
+
+#### 6.4.3 已落地修复与本机 gate 实录
+
+修复(本 commit):`qk_int_sv_f8_sm100_impl.cuh` 的 barrier init 块内、
+`#ifdef SAGE_VARLEN` 下加一条 `tcgen05::fence_async_shared()`(thread 0,
+init 五连之后、`__syncthreads()` 之前,与 Programming Guide 示例同位)。
+一条指令覆盖全部五个 barrier(fence 语义按线程的全部先前 generic smem 写
+生效)。SASS 里落为 `MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S`,与 SS twin
+既有 fence 的降级完全一致。dense TU 不动:dense SASS 处于 G1/G2 冻结,
+且其 16k 压测记录本身就是"dense 时序不进窗"的证据;若 B200 判 C1 成立,
+dense/ws/sm90 三处同型潜伏缺口(均为 init 无发布 fence)另立 gate 周期
+补齐。
+
+| gate | 结果 |
+|---|---|
+| varlen probe 4 实例 × sm_100a | 0 spill / 0 stack,reg 255/254/255/255(与 M2 记录同档,未变) |
+| varlen probe 4 实例 × sm_110a | 同上 |
+| `test_ptxas_gate` | 6/6 过 |
+| dense probe TU sm_100a | 改动前后 `cuobjdump -sass` 与 `-res-usage` 逐字节相同 |
+| dense probe TU sm_110a | 同上(改动整体在 `#ifdef SAGE_VARLEN` 内,dense 预处理文本不变,字节相同是构造性保证,仍实测确认) |
+| fence 落点 SASS 复核 | 四个 varlen 实例的 `SYNCS.EXCH.64 ×5` 与 `BAR.SYNC` 之间均出现 `MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S` |
+
+#### 6.4.4 B200 一次裁决矩阵(w14_isolate.py 口径)
+
+口径沿 §6.3:`w14_isolate.py --component fwd`,8 组预量化输入背靠背
+launch,每 launch 后 synchronize,`w14_21_isolate.sh` 停滞检测;单发概率
+~1/50-1/2000,每臂两轮 6000 次内必中(全绿臂跑满 2×6000 + 一轮 seed 扫)。
+
+| 臂 | 构建/形状 | 判读 |
+|---|---|---|
+| A0 | fence 修复版,原 §6.3 复现姿势(含 seed0/seed2 定点) | 全绿 ⇒ C1 成立,进 M3 重跑(压测 + bench + `pytest test/ -q`);仍挂 ⇒ C1 不充分,进 A1-A3 |
+| A1(裁 C2) | fence 版,causal,全序列等长 4096 × b8h16(**零** block-skip / 零 trip CTA,offset 非零) | 挂 ⇒ C2 出局(无裸退也挂),嫌疑回 C1 残余/C3;绿而 A2 挂 ⇒ C2 坐实 |
+| A2(裁 C2) | fence 版,causal,极偏斜 ragged([7936,128,128,128] 类,max block-skip 占比) | 与 A1 对照读 |
+| A3(裁 C3) | A0/A1/A2 都挂时:对 E5 仅存的两处调度差做源级 A/B(peeled tile 的 k_scale 读回挪到 wait 前 / `num_tiles_s` 循环 `#pragma unroll 1` 改 LDTM 间距),每臂 2×6000 | 哪臂转绿哪处即禁区,回填 A2/A5 那张约束表 |
+| 随挂死附带 | 任何一次挂死时 `cuda-gdb -p` 抓 resident warp 的 PC(wave14 attach 失败的话换 `--ex "set cuda break_on_launch none"` 或 flush coredump 姿势),对照 gensass 产物定位自旋点 | PC 落 `SYNCS.PHASECHK...TRYWAIT`(tile 0 相位)⇒ C1 直接坐实;落 `UTCATOMSWS`/`NANOSLEEP` 重试环 ⇒ C2 直接坐实;落稳态 TRYWAIT(iter>0 相位寄存器非 0)⇒ C1 出局、C3 上位。一次成功抓取即可替代整张矩阵 |
+
+判决后动作:C1 成立 → dense/ws/sm90 的同型 init fence 各起一个带 SASS
+gate 的 follow-up;C2 成立 → 落 §6.4.2 的"消灭裸退"补丁(带 q_scale
+clamp 与 kv_len==0 覆盖)重过 M3;C3 成立 → 按 A3 命中的位形改源并把
+约束写进 HARDWARE_CHECKLIST 的 A2/A5 节。矩阵全绿超过 4×6000 而 A0 曾挂
+⇒ 回到 §6.3 的建议 (a),plan 侧撤 sm100 等根因。
 
 ## 7. 风险(设计问题 4)
 
