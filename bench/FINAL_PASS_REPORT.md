@@ -35,14 +35,12 @@ C1 迭代史:r1 两遍读 0.883 → r2 单遍驻留 0.947 → r3 2×x64 宽 ld +
 | P6 PDL | kernel 间 gap 全形状 ≤1.59%,PDL 可及部分 0.25µs/边;nsys 短调用注入伪 gap 的测量教训在案 | bench/P6_PDL_PRESCREEN.md |
 | sm90 process_tile 收拢 | dense 持平、varlen kernel 锁基频 +1.47%(6/6)→ revert;教训:功耗 cap 下亚 1% 信号必须锁基频仲裁 | hyper01 `/workspace/sm90-7a64fc0/REPORT.md` |
 | P2 per-block 家族拆分 | sm90 实测 plain +21%/sub_mean +3.4%(ptxas 分支域重构杀 LDG 并行)→ dense 回退 kVarlen=true 实例;静态 SASS 条数跨 toolkit 不可移植 | `/workspace/p2-sm90/`(SASS+A/B) |
-| P8 sm80 fold | sm_86 +0.9% 不迁移:L20 0.9995、A100 0.9988;三平台合议「可回收 hunk 换简单性」建议在案 | bench/P8_SM80_FIX_{L20,A100}.md |
+| P8 sm80 fold | sm_86 +0.9% 不迁移:L20 0.9995、A100 0.9988;**已回收**(用户拍板,revert e85834d) | bench/P8_SM80_FIX_{L20,A100}.md |
 | C1 x128 宽 ld | ptxas C7602(单指令 dst 超 512 线程 kernel 的 128 入口 reg,函数级检查),x64 是结构上限 | C1_DESIGN.md §6.3 |
 
 ## 4. 挂账(明确悬置)
 
-- P9 `fp32+fp16` 退役:等 4090 跑 `bench/microbench/mma_rate.cu`(org 内无卡,消费级 Ada 2× 速率变数);
-- 4090 的 P4 门限复核(72MB L2 < L20 的 96MB,拐点可能早于 12288);
+- ~~P9 / 4090 系列~~(2026-08-30 关闭:部署面只有服务器级 GPU,消费级 Ada 的变数不再相关;fp32+fp16 是否保留 sm89 默认见深挖挂账);
 
-- sm80 fold hunk 回收(三平台合议建议,17 行换简单性);
 - C1 下一 lever:ld 与首消费点间填独立工作(需重开 bit-exact 论证);sm100 varlen(等 C1 定型);
 - 清理终审(2026-08-30 用户拍板):computelab 7 个历史构建树已删(~1.7G);hyper01 `SageAttention-rowsum`(独有试验 diff)与 pro-5k `/workspace/SageAttention`(v2g 未 push 工作)保留。证据类目录(kbd_*/profiles/golden_fixq/cdsl_src)保留。
