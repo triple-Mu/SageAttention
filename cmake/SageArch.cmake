@@ -84,17 +84,30 @@ if(SAGE_ARCHS_SM89)
                     "toolkit; upgrade to CUDA 12.8+ for the full sm89 kernel set.")
   endif()
 endif()
-if("9.0" IN_LIST SAGE_REQUESTED_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.3)
-  message(FATAL_ERROR "CUDA 12.3 or higher is required for compute capability 9.0.")
+# sm90 pulls tma.cuh, whose mbarrier/TMA helpers call cuda::ptx::mbarrier_init
+# and cuda::ptx::cp_async_bulk_tensor. Those land in CCCL 2.4 = CUDA 12.5;
+# CUDA 12.4 has <cuda/ptx> but not those two names. Measured, not inferred.
+if(SAGE_ARCHS_SM90 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.5)
+  message(FATAL_ERROR "CUDA 12.5 or higher is required for compute capability 9.0 "
+                      "(cuda::ptx::mbarrier_init / cp_async_bulk_tensor are CCCL 2.4).")
 endif()
-if("11.0" IN_LIST SAGE_REQUESTED_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
-  message(FATAL_ERROR "CUDA 13.0 or higher is required to build the tcgen05 (sm110) kernels.")
+# sm100/sm110 pull tcgen05.cuh. Its tcgen05.* wrappers exist from CUDA 12.8,
+# but elect_one() calls cuda::ptx::elect_sync, which is CCCL 3.1 = CUDA 13.1.
+# nvcc 12.8-13.0 can emit sm_100a SASS, so --list-gpu-code below does NOT catch
+# this - the gate has to be explicit.
+if(SAGE_ARCHS_SM100 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+  message(FATAL_ERROR "CUDA 13.1 or higher is required to build the tcgen05 kernels for "
+                      "compute capabilities ${SAGE_ARCHS_SM100} "
+                      "(cuda::ptx::elect_sync is CCCL 3.1).")
 endif()
 
 # nvcc --list-gpu-code probe: does this toolkit emit SASS for every requested cc?
 execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
                 OUTPUT_VARIABLE _sage_gpu_codes OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(REPLACE "\n" ";" _sage_gpu_codes "${_sage_gpu_codes}")
+# Toolkit version that first emits each code. These are hints on the
+# "nvcc cannot emit sm_XX" error only; the real tcgen05 floor for sm_100/sm_110
+# is the CUDA 13.1 gate above, which is stricter.
 set(_hint_sm_100 "12.8")
 set(_hint_sm_120 "12.8")
 set(_hint_sm_103 "12.9")

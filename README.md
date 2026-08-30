@@ -70,12 +70,8 @@ Paper: https://arxiv.org/abs/2505.11594
 ### Base environment
 + `python>=3.9`, `torch>=2.6.0` (the wheel is `cp39-abi3`: one build covers every Python >= 3.9, but stays tied to the torch major.minor it was built against)
 + `cmake>=3.26` and `ninja` in the build environment (`pip install "cmake>=3.31" ninja`; pulled in automatically under build isolation)
-- `CUDA`:
-  + `>=13.0` for sm110 (tcgen05)
-  + `>=12.8` for Blackwell or SageAttention2++
-  + `>=12.4` for fp8 support on Ada
-  + `>=12.3` for fp8 support on Hopper
-  + `>=12.0` for Ampere
+- `CUDA`: `>=12.0`, with a higher floor per target architecture — see the
+  [CUDA version support matrix](#cuda-version-support-matrix) below
 + `flash-attn` for benchmarking
 
 ### Install Package
@@ -96,6 +92,43 @@ Useful knobs: `MAX_JOBS` (cmake build parallelism), `NVCC_THREADS` (per-TU nvcc
 parallelism; note `MAX_JOBS x NVCC_THREADS` is the real process count),
 `SAGEATTN_PTXAS_VERBOSE=1`, `SAGEATTN_LINEINFO=1`, `DEBUG=1`,
 `SAGEATTN_CMAKE_ARGS` (extra cmake args).
+
+#### CUDA version support matrix
+
+Each architecture group has its own minimum toolkit, set by the newest CUDA /
+CCCL API its kernels reach for. `cmake/SageArch.cmake` enforces these at
+configure time, so an unsupported combination fails before compiling anything.
+
+**Compile-verified** = every translation unit of that group was compiled by that
+exact toolkit in an `nvidia/cuda:<ver>-devel` container. It does *not* mean the
+kernels were executed on that hardware — only sm_86 is available on the machine
+that produced this table, so everything else is compile-level evidence only.
+
+| GPU family | `TORCH_CUDA_ARCH_LIST` | Min CUDA | What sets the floor | Compile-verified on |
+|---|---|---|---|---|
+| Ampere (A100, A800, RTX 30xx) | `8.0`, `8.6` | **12.0** | baseline | 12.0, 12.4, 12.5, 12.6, 12.8, 13.1, 13.3 |
+| Ada (L20, L40, RTX 40xx) — fp8 | `8.9` | **12.4** | `mma.m16n8k32.f32.e4m3` | 12.4, 12.5, 12.6, 12.8, 13.1, 13.3 |
+| Hopper (H100, H800) — fp8 | `9.0` | **12.5** | `cuda::ptx::mbarrier_init`, `cuda::ptx::cp_async_bulk_tensor` (CCCL 2.4) | 12.5, 12.6, 12.8, 13.1, 13.3 |
+| Blackwell consumer (RTX 50xx, RTX PRO) | `12.0`, `12.1` | **12.8** | first toolkit that emits `sm_120` | 12.8, 13.1, 13.3 |
+| Blackwell datacenter (B200) — tcgen05 | `10.0` | **13.1** | `cuda::ptx::elect_sync` (CCCL 3.1) | 13.1, 13.3 |
+| sm110 — tcgen05 | `11.0` | **13.1** | `cuda::ptx::elect_sync` (CCCL 3.1) | 13.1 (`tcgen05.cuh` compiled for `sm_110a`; no full-extension build) |
+
+Caveats:
+
+- On CUDA `<12.8` the fp16-accumulator fp8 kernels
+  (`qk_int8_sv_f8_accum_f16_*`) build as runtime traps, because
+  `mma.m16n8k32.f16.e4m3` needs 12.8. CMake prints a warning; the
+  fp32-accumulator fp8 kernels are unaffected and remain the default on Ada.
+- The tcgen05 wrappers themselves exist from CUDA 12.8, but `elect_one()` needs
+  `cuda::ptx::elect_sync`, which CCCL only shipped in 3.1 / CUDA 13.1. nvcc
+  12.8-13.0 *can* emit `sm_100a` SASS, so this floor is not discoverable from
+  `nvcc --list-gpu-code` — the CMake gate is explicit about it.
+- The table lists SageAttention's own floors. Your torch build imposes a second,
+  independent one: `c10/core/AutogradState.h` uses C++20 default bit-field
+  initializers, which older nvcc rejects under `-std=c++17` and newer nvcc only
+  warns about. Measured with a bare `#include <torch/extension.h>`: torch
+  2.6-2.9 compile under nvcc 12.0, but torch 2.13 needs nvcc `>=12.4`. On CUDA
+  12.0-12.2, pin a torch `<=2.9`. The effective floor is the higher of the two.
 
 An installed `ccache` is picked up automatically and roughly halves a rebuild
 of this tree; a cache hit replays the object file, so a bit-exact comparison

@@ -21,12 +21,25 @@
 #pragma once
 #include <cuda_runtime.h>
 
+// <cuda/std/numbers> is CCCL 3.0, i.e. CUDA 13.0+. It is the only thing in the
+// whole tree that would have pushed the minimum toolkit from 12.0 to 13.0, so
+// the pre-13.0 path spells the constant out instead. The literal is the same
+// float: static_assert(cuda::std::numbers::log2e_v<float> == 1.4426950408889634f)
+// holds on 13.x, and on 13.x this header still takes the <cuda/std/numbers>
+// branch, so the SASS gate compares like for like.
+#if __has_include(<cuda/std/numbers>)
 #include <cuda/std/numbers>
+#define SAGE_HAS_CUDA_STD_NUMBERS 1
+#endif
 
 namespace math {
 
 // log2(e); the softmax runs in base 2 (see attn_utils.cuh)
+#ifdef SAGE_HAS_CUDA_STD_NUMBERS
 constexpr float log2e = cuda::std::numbers::log2e_v<float>;
+#else
+constexpr float log2e = 1.4426950408889634f;
+#endif
 
 /*!
  * \brief Wrapper of PTX ex2.approx instruction, which computes 2^x
