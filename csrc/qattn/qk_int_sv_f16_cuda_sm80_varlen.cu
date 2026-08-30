@@ -26,7 +26,7 @@
 // configurations sageattn_varlen never asks for.
 
 #define SAGE_VARLEN 1
-#define SAGEATTN_SM80_NS sm80_varlen
+#define SAGEATTN_ARCH_NS sm80_varlen
 
 #include "qk_int_sv_f16_sm80_impl.cuh"
 

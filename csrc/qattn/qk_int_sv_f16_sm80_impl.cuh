@@ -48,14 +48,14 @@
 // linked into a single _C extension, so same-named launchers/templates from
 // different arches must not share symbols (ODR). The varlen translation unit
 // compiles a *different* body under the same template name and needs its own
-// namespace for the same reason (the sm89 family solves it identically, with
-// SAGEATTN_ARCH_NS).
-#ifndef SAGEATTN_SM80_NS
-#define SAGEATTN_SM80_NS sm80
+// namespace for the same reason (every arch family names it through the same
+// SAGEATTN_ARCH_NS macro).
+#ifndef SAGEATTN_ARCH_NS
+#define SAGEATTN_ARCH_NS sm80
 #endif
 
 namespace sage {
-namespace SAGEATTN_SM80_NS {
+namespace SAGEATTN_ARCH_NS {
 
 #define PACK_SIZE_QK 16  // as if it is int8
 #define PACK_SIZE_V 8    // fp16
@@ -966,5 +966,5 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     // }
 }
 
-}  // namespace SAGEATTN_SM80_NS
+}  // namespace SAGEATTN_ARCH_NS
 }  // namespace sage

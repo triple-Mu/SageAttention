@@ -47,12 +47,12 @@
 // All sm90 kernels and launchers live in sage::sm90 (single-so ODR rule). The
 // varlen translation unit compiles a *different* body under the same template
 // name and needs its own namespace for the same reason.
-#ifndef SAGEATTN_SM90_NS
-#define SAGEATTN_SM90_NS sm90
+#ifndef SAGEATTN_ARCH_NS
+#define SAGEATTN_ARCH_NS sm90
 #endif
 
 namespace sage {
-namespace SAGEATTN_SM90_NS {
+namespace SAGEATTN_ARCH_NS {
 
 template<uint32_t         CTA_Q,
          uint32_t         CTA_K,
@@ -745,5 +745,5 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     }
 }
 
-}  // namespace sm90
+}  // namespace SAGEATTN_ARCH_NS
 }  // namespace sage

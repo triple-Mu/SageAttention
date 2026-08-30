@@ -24,7 +24,7 @@
 // scale, fp32+fp32 accumulation. The unfused one exists for dense callers only.
 
 #define SAGE_VARLEN 1
-#define SAGEATTN_SM90_NS sm90_varlen
+#define SAGEATTN_ARCH_NS sm90_varlen
 
 #include "qk_int_sv_f8_sm90_impl.cuh"
 
