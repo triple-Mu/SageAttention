@@ -87,6 +87,8 @@ enum class QuantGranularity {
 
 #else  // !SAGE_SM100_DEVICE_ONLY
 
+#include <cstdlib>
+#include <cstring>
 #include <torch/types.h>
 
 #include "../dispatch_utils.h"
@@ -622,6 +624,39 @@ constexpr bool kPVFromSmem = true;  // SS cross-check build (hardware-day oracle
 constexpr bool kPVFromSmem = false;  // default: TS (P fed from TMEM)
 #endif
 
+// C1 warp-specialized kernel (qk_int_sv_f8_cuda_sm100_ws.cu), fuse_v_scale
+// variant only. Ships dark until hardware-validated: opt in per process with
+// SAGEATTN_SM100_WS (read once, same contract as SAGEATTN_SM100_TCGEN05 in
+// plan.cpp). Note the switch bypasses the PV_FROM_SMEM twin: the ws kernel is
+// TS-only, so run the SS oracle with the switch unset.
+torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
+                                                           torch::Tensor key,
+                                                           torch::Tensor value,
+                                                           torch::Tensor output,
+                                                           torch::Tensor query_scale,
+                                                           torch::Tensor key_scale,
+                                                           torch::Tensor value_scale,
+                                                           int           tensor_layout,
+                                                           int           is_causal,
+                                                           int           qk_quant_gran,
+                                                           float         sm_scale,
+                                                           int           return_lse);
+
+namespace {
+
+bool sm100_ws_enabled()
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("SAGEATTN_SM100_WS");
+        return v != nullptr
+               && (std::strcmp(v, "1") == 0 || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0
+                   || std::strcmp(v, "YES") == 0 || std::strcmp(v, "yes") == 0);
+    }();
+    return enabled;
+}
+
+}  // namespace
+
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                         torch::Tensor key,
                                                         torch::Tensor value,
@@ -635,6 +670,21 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                         float         sm_scale,
                                                         int           return_lse)
 {
+    if (sm100_ws_enabled()) {
+        return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(query,
+                                                            key,
+                                                            value,
+                                                            output,
+                                                            query_scale,
+                                                            key_scale,
+                                                            value_scale,
+                                                            tensor_layout,
+                                                            is_causal,
+                                                            qk_quant_gran,
+                                                            sm_scale,
+                                                            return_lse);
+    }
+
     const c10::cuda::CUDAGuard device_guard(query.device());
     cudaStream_t               stream = at::cuda::getCurrentCUDAStream();
 

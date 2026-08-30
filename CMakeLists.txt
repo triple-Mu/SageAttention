@@ -137,7 +137,9 @@ set(SAGE_SRC_SM90 csrc/qattn/qk_int_sv_f8_cuda_sm90.cu)
 if(SAGE_BUILD_VARLEN)
   list(APPEND SAGE_SRC_SM90 csrc/qattn/qk_int_sv_f8_cuda_sm90_varlen.cu)
 endif()
-set(SAGE_SRC_SM100 csrc/qattn/qk_int_sv_f8_cuda_sm100.cu)
+set(SAGE_SRC_SM100
+  csrc/qattn/qk_int_sv_f8_cuda_sm100.cu
+  csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu)
 # The sm89 template TUs are compiled twice (OBJECT libraries below): once as
 # sage::sm89 with the full fallback arch set, once as sage::sm120 with the
 # sm_12x-only set (minus the fp32+fp32 inst_buf variant sm120 never uses).
