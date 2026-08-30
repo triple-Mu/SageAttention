@@ -42,13 +42,48 @@ set(SAGE_ARCHS_SM90  "")   # cc == 9.0                accel (90a only, never PTX
 set(SAGE_ARCHS_SM100 "")   # cc in {10.0, 11.0}       accel (never PTX)
 set(SAGE_ARCHS_SM120 "")   # major == 12              plain
 
+# DRAFT (Track D prescreen, do not flip on without sign-off): drop gencode
+# entries whose SASS resolve() (plan.cpp:206-266) never reaches when the
+# covering group is built from the same arch list:
+#   - sm89 group drops major==12 (any requested 12.x also builds the sm120
+#     group, which resolve() prefers unconditionally);
+#   - sm80 group drops 8.9 when a lower 8.x cubin is requested (same-major
+#     binary compatibility serves it) and drops major >= 10 (any requested
+#     cc >= 10 joins the sm89 group, so the kSm80F16 fallback is unreachable);
+#   - 9.0 always stays in the sm80 group: sm_90a SASS only runs on 9.0
+#     exactly, and resolve() sends every 9.x-minor device to kSm80F16.
+# OFF because backend_compiled() checks the family flag, not per-arch SASS:
+# plan(backend=...) and the raw qattn_sm80_*/qattn_sm89_* ops can still pick a
+# family on a device whose SASS was pruned, turning a working launch into
+# cudaErrorNoKernelImageForDevice. Pruned entries also lose their +PTX copy.
+option(SAGE_PRUNE_GENCODE "Prune per-group gencode entries covered by another group" OFF)
+
+set(_sage_has_sub89_8x FALSE)
+foreach(cc IN LISTS SAGE_REQUESTED_ARCHS)
+  if(cc MATCHES "^8\\." AND NOT cc STREQUAL "8.9")
+    set(_sage_has_sub89_8x TRUE)
+  endif()
+endforeach()
+
 foreach(cc IN LISTS SAGE_REQUESTED_ARCHS)
   string(REPLACE "." ";" _parts "${cc}")
   list(GET _parts 0 _major)
   list(GET _parts 1 _minor)
-  list(APPEND SAGE_ARCHS_SM80 "${cc}")
+  set(_sm80_skip FALSE)
+  set(_sm89_skip FALSE)
+  if(SAGE_PRUNE_GENCODE)
+    if((cc STREQUAL "8.9" AND _sage_has_sub89_8x) OR _major GREATER_EQUAL 10)
+      set(_sm80_skip TRUE)
+    endif()
+    if(_major EQUAL 12)
+      set(_sm89_skip TRUE)
+    endif()
+  endif()
+  if(NOT _sm80_skip)
+    list(APPEND SAGE_ARCHS_SM80 "${cc}")
+  endif()
   list(APPEND SAGE_ARCHS_FUSED "${cc}")
-  if(cc STREQUAL "8.9" OR _major GREATER_EQUAL 10)
+  if((cc STREQUAL "8.9" OR _major GREATER_EQUAL 10) AND NOT _sm89_skip)
     list(APPEND SAGE_ARCHS_SM89 "${cc}")
   endif()
   if(cc STREQUAL "9.0")
