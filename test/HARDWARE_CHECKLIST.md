@@ -817,6 +817,181 @@ operand**,写完都要过一条 `fence.proxy.async.shared::cta`;TMA 填的 buffe
 不需要(TMA 本身就在 async proxy 里,靠 mbarrier 完成)。本仓目前只有 SS twin
 的 `sP` 属于前者。
 
+### cutedsl 反向移植 Phase 1(2026-08-30,B200 `umbriel-b200-017`)
+
+这一节引用的脚本(`cdsl_build.sh` / `cdsl_verify.sh` / `cdsl_bench.py` /
+`cdsl_ab.sh` / `cdsl_report.py` / `cdsl_stress.py` / `cdsl_triage_a2.py` /
+`cdsl_ncu.sh`)不在本仓,放在集群工作目录
+`/home/scratch.sonlin_wwfo/workspace/nvidia/SageAttention_refactor/scripts/`,
+原始 json / 日志在同目录的 `logs/` 下。
+
+四项按序上机,每项独立 commit + 双路 golden + 同卡双向 A/B。基线是
+feat/varlen tip `117d63c`,即上面那轮右尺寸化之后的树。
+
+| 项 | 结论 | 数据 |
+|---|---|---|
+| A1 P 叠进 S 区 | **合入** | 全表几何均值 **1.513×**,d128 段 1.577×(1.283-1.687×) |
+| A2 k_scale 寄存器预载 | **回退** | golden attn 段挂死,TS/SS 各吃满 1800 s timeout |
+| A3 v_scale 预载 smem | **合入** | fuse_v_scale kernel 上几何均值 **1.0124×**(17 快 / 0 慢) |
+| A5 TMEM 读批量发射 | **回退** | 间歇挂死,同一形状两次分别在第 1808、386 次发射停住 |
+
+合入的两项(A1 + A3)是分支上最终留下的代码;A2、A5 只在实验里存在过,没有
+留在历史里。
+
+bench 口径:低层 `qattn_sm100_*_attn` op 直接对测(不含量化前后处理),形状
+d128 × seq{1k,4k,16k,32k,128k} × batch{1,4} × causal 两态 = 20 点,外加 d64
+两点作不回退对照;3 轮 A→B / B→A 交替、每形状取中位数、每点测前测后各查一次
+`nvidia-smi --query-compute-apps`(22 点全部独占)。A1/A5 用不带 v_scale 的
+launcher,A3 必须用 `fuse_v_scale` 的那个——不带 v_scale 的实例里 `sV_scale`
+根本不会被写也不会被读,第一轮拿它测 A3 量出 1.0004×,是测错了对象。
+cudnn 分母是同一份形状网格上的 `SDPBackend.CUDNN_ATTENTION`。
+
+#### A1:P 叠进 S 区(commit `21bce17`)
+
+`TMEM_COL_P` 从 128 改到 32,即 P 复用 S 的 [32,64) 列,`TMEM_COL_O` 128,
+列计划 `128 + head_dim`:d128 从 288 降到 256、d64 从 224 降到 192,两个
+head_dim 都进位到 256,于是 **d128 也能两个 CTA 同时持有 TMEM**。别名安全性
+写在源码 `TMEM_COL_P` 上方,三条:TMEM lane == thread(线程只碰自己那条 lane,
+无跨线程依赖)、tile 内 S 整行先 `tmem_ld` + `wait::ld` 读进寄存器再写 P、
+跨 tile 的下一发 QK MMA 在所有线程过了 `wait(barrier_O_done)` 之后才发出。
+`bench/sm100_review/barrier_ledger.md` 的跨 tile 冒险表补了对应两行。
+
+SASS 自检(probe TU,sm_100a):`UTCATOMSWS.FIND_AND_SET.ALIGN` 前那条 `UMOV`
+立即数,两个 hd128 实例 `0x10 → 0x8`(512 → 256 列),hd64 保持 `0x8`;
+寄存器 255/255/254/254 不变,零 spill;整个 TU 指令数 13496 条不变——A1 的
+收益全部来自 occupancy,不是指令面积。
+
+| 验收 | 结果 |
+|---|---|
+| TS `--check`(发布路径) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| SS twin `--check`(2 CTA 并发是 SS 竞争的现形条件) | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| A/B 全表几何均值 | **1.5126×**(20 点快 / 0 点慢 / 2 点持平) |
+| d128 段 | geo **1.577×**,单点 1.283-1.687×(seq 越长收益越大) |
+| d64 段(自检对照,列数本就是 256) | geo 0.998×,如预期不变 |
+| 对 cudnn(d128 全段几何均值) | **0.471× → 0.743×**,最好的点 0.866× |
+
+ncu(d128 seq4096 causal=0,ncu 2026.2.1):
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| Duration | 1.91 ms | 1.21 ms |
+| Compute (SM) Throughput | 28.17% | 44.21% |
+| Memory Throughput | 11.50% | 19.02% |
+| Eligible Warps / scheduler | 0.30 | 0.58 |
+| No Eligible | 71.35% | 55.04% |
+| Registers / thread | 255 | 255 |
+| Achieved Occupancy | 12.24% | 12.33% |
+
+**occupancy 几乎不动是对的**:改前第二个 CTA 也已经驻留(Achieved Active
+Warps/SM 7.83),只是堵在 `tcgen05.alloc` 里空转,warp 计数上算活着;改后它
+真的在干活,所以变的是 Compute Throughput 和 eligible warp,不是 occupancy。
+d64 两条 ncu 曲线改前改后完全重合(1.02 ms / 50.4%),与 bench 的 0.998× 一致。
+
+#### A2:k_scale 寄存器预载 —— 挂死,已回退
+
+改法是零 smem 的寄存器双缓冲:prologue 预载 tile 0 的标量,每个 tile 在顶部
+发出 tile i+1 的 load。ptxas 侧看不出问题(零 spill,一个实例 254 → 255 寄存器,
+LDG 条数不变,纯调度改动)。上机后 **golden 的 attn 段挂死**:
+
+| 构建 | attn 段(1980 case) |
+|---|---|
+| A1 基线 TS | 20 s 跑完,`ok=1980 diff=0` |
+| A2 TS | 1800 s timeout,日志零输出 |
+| A2 SS | 1800 s timeout,日志零输出 |
+
+quant / e2e / equiv 三段在 A2 下都是 `diff=0` 正常返回,只有 attn 段整段挂。
+
+收窄到的**确定性复现**:`scripts/cdsl_stress.py`(单形状反复发射,发射前打印
+序号,发射后 `synchronize()`),d128 / b4 h32 / per_warp,seq 扫描:
+
+| seq | causal=0 | causal=1 |
+|---|---|---|
+| 2048 | 20 次干净 | 20 次干净 |
+| 4096 | **挂在第 2 次** | 20 次干净 |
+| 8192 | **挂在第 1 次** | **挂在第 0 次** |
+| 16384 | **挂在第 0 次** | **挂在第 0 次** |
+| 32768 | **挂在第 0 次** | **挂在第 0 次**(600 s timeout) |
+
+同一形状同一脚本,A1 构建在 seq 32768 causal 连跑 8000 次干净。小形状也不复现:
+`scripts/cdsl_triage_a2.py` 的 192 个 case(hd × gran × kv≤1024 × causal × lse ×
+v_scale)在 A2 下全过。**这条线上的门限在 seq ≈ 4096**。
+
+注意这还不是全部触发条件:golden attn 段最大的形状只有 qo=kv=2048 / b2 h8,
+比上表里干净的那个点还小,却照样挂——说明除了 seq,至少还有一条触发路径没被
+这个扫描覆盖(attn 段额外变的维度是 layout NHD、bfloat16 输出、GQA hq≠hk、
+per_thread gran)。
+
+越界读已逐条排除(causal 下 `num_iterations ≤ num_ctas_k`,预取下标
+`(iter+1)*offset+cls` 恒在 `num_ctas_k*offset` 内;`T=1` 时走 peeled 分支不
+预取),barrier 记账也一行没动。根因**仍未定位**。
+**在根因清楚之前不要重开这一项**;重开时直接用上面那条复现命令。
+
+#### A3:v_scale 预载 smem(commit `9567bf4`)
+
+per-channel v_scale 原来在 epilogue 里逐通道 `__ldg`:CTA 的每一行都要读同一份
+head_dim 个 float,等于最后一发 PV MMA 之后再发 head_dim 条广播 LDG,后面已经
+没有活能盖住这段延迟。改成 prologue 里一次性搬进 smem(d128 是 512 B,由
+TMEM alloc 后面那条 `__syncthreads()` 发布),epilogue 读 LDS。
+
+静态 smem 仍是 1024 B——这个向量正好落进 barrier 本来就有的对齐填充里,所以
+动态 smem 预算和每 SM 的 CTA 数一点没动。probe TU 四个实例指令数
+13496 → 13360(`LDG.E.CONSTANT` 216 → 26,新增 48 条 `LDS.128`),零 spill。
+
+| 验收 | 结果 |
+|---|---|
+| TS `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| SS twin `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| A/B(fuse_v_scale kernel)全表几何均值 | **1.0124×**(17 点快 / 0 点慢 / 5 点持平) |
+| d128 段 | geo 1.0131×,单点 0.999-1.032× |
+| d64 段 | geo 1.0057× |
+
+短 seq 收益最大(d128 s1024 causal 到 +3.1%),长 seq +0.2-1.2%,与
+「epilogue 在总时间里的占比随 seq 变小」一致。**方向一致性 17/0** 比 1.24%
+的均值本身更硬。
+
+#### A5:TMEM 读批量发射 —— 间歇挂死,已回退
+
+改法是 O 修正与 epilogue 两处把 `num_tiles_o` 条 `tcgen05.ld` 一次发完再等一条
+`wait::ld`(`wait::ld` 覆盖本线程此前所有 `tcgen05.ld`)。静态指标全是好的:
+零 spill,指令数再降 16 条(正好是省掉的 wait),golden 双路 2280 `diff=0`。
+
+但**定点压测挂死**。压测口径:d128 causal b4 s32768 单形状反复发射,每次
+`torch.cuda.synchronize()`,发射前先打印序号,`timeout` 判死:
+
+| 构建 | 结果 |
+|---|---|
+| baseline(A1 之前) | 2000 次干净 |
+| A1 TS | 2000 次 + 8000 次,都干净 |
+| A1 SS twin | 8000 次干净 |
+| A1+A3 TS | 8000 次干净 |
+| **A1+A3+A5 TS** | **两次独立挂死,分别停在第 1808、386 次** |
+
+同一形状在 A/B bench 里也停过一次(5 分钟无进展)。golden 的 2280 个 case 全过
+说明这不是数值问题、也不是小形状能碰到的;根因**没有定位**,`wait::ld` 的语义
+(等本线程此前全部 `tcgen05.ld`)按 PTX ISA 读是够的,所以嫌疑指向 4 条
+`tcgen05.ld` 同时在飞时的某个未写明的约束。**重开这一项之前先复现挂死并定位。**
+
+两次挂死(A2、A5)有个共同点值得记:**golden 全绿不足以放行 sm100 的改动**,
+这个 kernel 的挂死只在长 seq、大 batch、连续发射下现形,必须补一轮定点压测
+(`scripts/cdsl_stress.py`,8000 次量级)。
+
+#### 合入后的最终状态(A1 + A3)
+
+最终构建 = A1 + A3(A2、A5 都不在分支上)。
+
+| 门禁 | 结果 |
+|---|---|
+| golden TS `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| golden SS twin `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` |
+| 压测 seq 扫描(d128 b4 h32,seq 2048/4096/8192/16384/32768 × causal 两态,每点 20 次) | 10/10 全干净 |
+| 压测长跑(d128 causal b4 s32768) | 8000 次干净 |
+| 本机 sm_86 golden | `ok=1493 diff=0`(+48 varlen equiv extra,预期) |
+| 本机 `pytest test/ -q` | 552 passed / 154 skipped / 0 failed |
+| 全 arch SASS 对比(8.6;8.9;9.0;10.0;12.0,20 个 object / 2068 个 kernel / 5,548,880 条指令) | 只有 `qk_int_sv_f8_cuda_sm100.cu.o` 变了,其余逐字节相同 |
+
+d128 对 cudnn 从 **0.471× 提到 0.743×**(全段几何均值),最好的点 0.866×;
+Phase 1 的计划预期是 ~0.78×,实测落在这个量级上,差的那点是 A2 / A5 没进来。
+
 ## 6. 性能决策点
 
 | 项 | 机器 | 命令/指标 | 决策 |

@@ -74,6 +74,8 @@ is the single arrival, performed by hardware when all previously issued
 | TMA K(i+1) overwrites sK while QK(i) reads it | step 4 runs after `wait(barrier_S_done)` (QK retired) |
 | TMA V(i+1) overwrites sV while PV(i) reads it | step 10 runs after `wait(barrier_O_done)` (PV retired) |
 | correction (tile i+1) reads O before PV(i) finished | `wait(barrier_O_done)` at step 9 of tile i |
+| P store overwrites S cols [32,64) while softmax still needs them | same thread, same TMEM lane: every S `tcgen05.ld` + `wait::ld` is program-ordered before the P `tcgen05.st`, and no thread reads another thread's S |
+| next QK MMA overwrites the columns P lives in while PV(i) still reads P | `wait(barrier_O_done)` at step 9 of tile i precedes the elected thread's next `mma_i8_ss` |
 | PV(i) reads P before all 128 threads stored it | step 5 `wait::st` (own thread) + step 6 fence/`__syncthreads()`/fence handoff |
 | PV(i) reads O before correction sts landed | same step 6 handoff (correction st is a prior tcgen05.st of the producer threads) |
 | epilogue reads O before PV(T-1) done | `wait(barrier_O_done)` in the peeled tile |
