@@ -15,8 +15,9 @@
  */
 
 #pragma once
-// torch/types.h 提供 torch::Tensor / torch::kInt8 / torch::IntArrayRef / TORCH_CHECK,
-// 且不引入 pybind11(torch/extension.h 会,与 Py_LIMITED_API 冲突)。
+// torch/types.h provides torch::Tensor / torch::kInt8 / torch::IntArrayRef /
+// TORCH_CHECK without pulling in pybind11 (torch/extension.h would, which
+// conflicts with Py_LIMITED_API).
 #include <torch/types.h>
 
 #include <climits>
