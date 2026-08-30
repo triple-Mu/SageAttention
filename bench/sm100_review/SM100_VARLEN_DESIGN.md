@@ -1,6 +1,6 @@
-# sm100 varlen 支持设计(M1/M2 已落地,M3 待上机)
+# sm100 varlen 支持设计(M1/M2 已落地;M3 上机:pytest 全绿、压测挂死,红)
 
-基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2。
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2,M3 wave14 实录(含挂死画像与建议)见 §6.3。
 
 ## 0. 结论
 
@@ -219,6 +219,59 @@ Phase A 合计约 4 个会话(±1,取决于 M3 一次过与否)。
    sm89 backend);口径按 BENCH_PROTOCOL;ncu 过滤
    `-k regex:qk_int8_sv_f8_attn_kernel_sm100`。
 7. **文档**:HARDWARE_CHECKLIST §1 的 M3 项打勾并填数字;HANDOFF 更新。
+
+### 6.3 M3 上机实录(wave14,B200,tree a88057d;pytest 全绿,压测红)
+
+口径:同 C1_DESIGN §10.4(umb-b200-262,JID 4028527,10.0a + PRUNE=OFF);
+日志集群 `SageAttention_refactor/logs-w14/`。
+
+| §6.2 项 | 结果 |
+|---|---|
+| pytest 三文件(TCGEN05=1,WS 不设) | **test_varlen_sm100 69/69 全过 0 skip**;test_varlen 89 passed / 97 skipped(skip 全是 pin 其他 backend);test_varlen_utils 49/49;合计 207 passed / 97 skipped / 12.4s |
+| 等长 bitwise(`test_fwd_varlen_equals_dense`) | 全组合(双 gran × 双 hd × causal × 4 形状组)`torch.equal` 过 |
+| dead-row 三层防线 | `bottom_right_causal[1000x1]` 四组过(防线一 d_rcp=0);`empty_kv_sequence` 两态过(防线二零 trip);ragged 逐段 `torch.equal` 过(防线三 mask+slab) |
+| 长 packed / cudagraph | `long_packed_tensor`(129536 token,64K 段)causal 两态过;cudagraph 换分段 replay 过 |
+| 全量回归 `pytest test/ -q` | **436 passed / 395 skipped,0 fail**(38s) |
+| bench_varlen(等长 + .25-1x) | **红:挂死**(复跑一次在第 3 行 nc b8h16 n4096 等长处停;首跑 0 行——首跑距被杀的压测 wedged context 仅 5s,可能是连带) |
+| ragged 压测(2000 次定点 driver,验收会话新增;不在 §6.2 清单) | **红:非确定性挂死**(详见下) |
+
+**挂死画像(全部:GPU util 100% / ~247-248 W 低功耗自旋 = kernel 级
+barrier 等待;driver/GPU 健康——同卡夹在中间的 dense ws_stress 16000+
+launch 全绿)**:
+
+| 复现试验 | 结果 |
+|---|---|
+| 压测 driver seed0 首跑 | iter=17 挂死(causal 等长 [7247,2865] b2 hd128) |
+| `CUDA_LAUNCH_BLOCKING=1` 阶梯(同 seed 逐位重放 18 迭代 + 6 个 solo 变体:同形状 / smooth_k=0 / per_thread / 非 causal / b1 / 128 对齐) | **全部 clean → launch-blocking 掩蔽,是 race 不是形状 bug** |
+| async 复跑 seed0 / seed1 / bench_varlen | **3/3 挂死**,位置各异(iter=225 causal b5 maxq4037;iter=53 causal b3 maxq7963;causal b8h16 n4096 等长)→ 非确定性,等长/ragged、空 KV 有无都中过,频率 ~每几十到几千次 varlen launch 一次 |
+| 组件隔离:fwd_varlen-only(8 组预量化输入,纯 fwd 背靠背循环) | **挂死 ×2**(seed0 iter=1785、seed2 iter=45)→ 不需要 quant/segment_mean 在场 |
+| 组件隔离:quant-only(segment_mean + quant_qk + quant_v 循环,不发 fwd) | 2000 次全绿 |
+| dense 对照(同 pack 循环姿势,`SAGEATTN_SM100_WS=0` classic kernel,变形状 6000 次) | **全绿**(加上会话内 ws_stress 16000+ 次)→ 共享 impl body 的 dense 编译型不涉 |
+| cuda-gdb attach(非 debug 进程) | 拿不到 resident kernel 名 |
+
+**圈定**:race 在 **sm100 varlen fwd kernel(`SAGE_VARLEN` 分支 + varlen
+launcher TU)自身**,quant 侧与 dense 编译型排除;triggering 条件是
+async 背靠背 launch(每次 launch 后都有 `synchronize`,即单 launch 在飞,
+串行化到 launch 级即消失)。**六次挂死全部落在 causal=1 迭代**(各 driver
+两态交替,6/6 causal 的随机概率 1/64)→ runtime mask / 符号 trip /
+差异化 trip 数是首要嫌疑面;其余差异只有 §3.2 八处(SeqlenInfo 读、K/V
+坐标、block 表 scale 索引、零 trip 早退)加 launcher 的 rank-4 batch=1
+tensor map。挂死形态是 util 100% / ~247 W 的 mbarrier 自旋。复现工具:集群
+`SageAttention_refactor/scripts-w14/w14_isolate.py --component fwd`
+(挂死概率单发 ~1/50-1/2000,跑 2 轮 6000 次内必中;stall 检测包装
+`w14_21_isolate.sh`)。
+
+**bench_varlen 部分数据**(挂死前 12 行,非 causal 全 10 行 + causal 2 行,
+`logs-w14/repro/bench_vl.log`;dense 侧 d128 是 auto=WS 路):等长
+0.71-0.86×(d128 0.71-0.80、d64 0.83-0.86),ragged .25-1x 0.99-1.37×——
+显著低于 sm90/sm120 的记录(等长 0.93-1.01、.25-1x 1.35-1.68),d128 差距
+一部分是 dense 参照换成了 WS kernel(+13-16%),d64 的 ~15% 等长差距是
+varlen 路径自身开销;等 race 修复后按 M4 全量重测再定论。
+
+**M3 判定:红**。建议二选一:(a) plan 侧把 sm100 撤出
+`_VARLEN_BACKENDS`(退回 M2 前的 sm89 packed fallback),dense 侧 G2/G1
+冻结不受影响;(b) 定位修复 race 后整轮重跑 M3(pytest 全绿态可沿用,
+压测/bench 必须重来)。
 
 ## 7. 风险(设计问题 4)
 
