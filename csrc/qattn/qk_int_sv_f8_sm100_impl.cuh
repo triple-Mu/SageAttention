@@ -435,6 +435,26 @@ __global__ void __launch_bounds__(NUM_THREADS)
         tcgen05::init_barrier(&barrier_V, 1);
         tcgen05::init_barrier(&barrier_S_done, 1);
         tcgen05::init_barrier(&barrier_O_done, 1);
+#ifdef SAGE_VARLEN
+        // Publish the five initialized barriers to the async proxy before any
+        // of them is completed through it (the TMA trio's complete_tx and the
+        // two tcgen05.commit arrive-on-retire are all async-proxy accesses).
+        // mbarrier.init is a generic-proxy write, and neither __syncthreads()
+        // nor the mbarrier operations themselves order the two proxies - the
+        // same staleness the SS twin's sP staging hit (the fence in
+        // process_tile below, HARDWARE_CHECKLIST section 5f), and the fence
+        // the CUDA programming guide's own TMA example issues right after
+        // init(&bar, ...). Root-cause candidate C1 of the wave14 varlen
+        // stress hang (SM100_VARLEN_DESIGN section 6.4): the varlen grids are
+        // the first tcgen05 workload here that recycles CTA slots within
+        // microseconds (block-skip exits, one-tile causal trips) against
+        // L2-hot inputs, which is what shrinks the init-to-complete_tx window
+        // to the point of racing the cross-proxy propagation. Varlen-only for
+        // now: the dense TU's SASS is frozen byte-identical and its stress
+        // record is clean, so it keeps the latent pattern until the B200
+        // verdict on this fence is in.
+        tcgen05::fence_async_shared();
+#endif
     }
 
     __syncthreads();
