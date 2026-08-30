@@ -84,6 +84,7 @@ def _fwd_fake(
     sm_scale=1.0,
     return_lse=False,
     out_dtype=torch.float16,
+    backend=None,
 ):
     out = torch.empty(query.shape, dtype=out_dtype, device=query.device)
     if not return_lse:

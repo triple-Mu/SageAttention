@@ -16,7 +16,9 @@
 
 // torch.ops.sageattention.fwd — the single attention entry point. Picks the
 // kernel from the device's compute capability and the request via resolve()
-// (plan.cpp, the one source of truth), validates the combination loudly
+// (plan.cpp, the one source of truth; `backend` overrides the cc-based
+// selection, e.g. to run the sm89 fatbin on Blackwell), validates the
+// combination loudly
 // (the old per-arch pipeline silently returned uninitialized memory for
 // unsupported pv_accum_dtype), and dispatches onto the per-arch launchers.
 //
@@ -69,7 +71,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
                                                            bool                             is_causal,
                                                            double                           sm_scale,
                                                            bool                             return_lse,
-                                                           at::ScalarType                   out_dtype)
+                                                           at::ScalarType                   out_dtype,
+                                                           std::optional<c10::string_view>  backend)
 {
     const c10::cuda::CUDAGuard device_guard(query.device());
 
@@ -79,11 +82,16 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
     const PVAccum      pv     = parse_pv_accum(pv_accum_dtype);
     const VLayout      vl     = parse_v_layout(v_layout);
 
+    std::optional<Backend> req_backend;
+    if (backend) {
+        req_backend = parse_backend(*backend);
+    }
+
     TORCH_CHECK(query.dim() == 4, "query must be 4-D");
     const int head_dim = static_cast<int>(query.size(3));
     const CC  cc       = device_cc(query.device().index());
     Plan      plan     = resolve(
-        cc, head_dim, std::nullopt, gran, pv, value_mean.has_value() ? std::optional<bool>(true) : std::nullopt);
+        cc, head_dim, req_backend, gran, pv, value_mean.has_value() ? std::optional<bool>(true) : std::nullopt);
     TORCH_CHECK(plan.error.empty(), "sageattention.fwd: ", plan.error);
     // fwd receives already-quantized inputs, so the caller must have fetched the
     // same plan; re-check the request against the resolved plan (a mismatch
@@ -368,7 +376,8 @@ TORCH_LIBRARY_FRAGMENT(sageattention, m)
           "str tensor_layout=\"HND\", str qk_quant_gran=\"per_thread\", "
           "str pv_accum_dtype=\"fp32\", str v_layout=\"mma_k16\", "
           "bool is_causal=False, float sm_scale=1.0, bool return_lse=False, "
-          "ScalarType out_dtype=float16) -> (Tensor out, Tensor? lse)");
+          "ScalarType out_dtype=float16, str? backend=None) "
+          "-> (Tensor out, Tensor? lse)");
 }
 
 TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
