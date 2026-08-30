@@ -19,8 +19,8 @@ from typing import Literal, Optional, Set, Tuple, Union, overload
 
 import torch
 
+from ._layout import _seq_nh_dims
 from ._plan import get_plan
-from .ops import _seq_nh_dims
 
 # The v2.x truncated log2(e) literal, kept on purpose: the kernel-side constant
 # (csrc/math.cuh) is a separate full-precision value, so aligning this one to

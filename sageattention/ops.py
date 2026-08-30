@@ -19,14 +19,9 @@ FakeTensor kernels for the torch.ops.sageattention attention ops (needed for
 torch.compile). The mutating quantization ops return () and need no fake.
 """
 
-from typing import Tuple
-
 import torch
 
-
-def _seq_nh_dims(tensor_layout: str) -> Tuple[int, int]:
-    """(seq_dim, num_heads_dim) for a 4D q/k/v tensor in `tensor_layout`."""
-    return (1, 2) if tensor_layout == "NHD" else (2, 1)
+from ._layout import _seq_nh_dims
 
 
 def _fwd_fake(
