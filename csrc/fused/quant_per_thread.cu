@@ -57,6 +57,18 @@ __device__ __forceinline__ int8_t quantize_round_half_away(float x, float scale)
     return static_cast<int8_t>(q);
 }
 
+// Packed 2-lane counterpart of T, for the sub_mean subtraction below.
+template<typename T>
+struct pair_of;
+template<>
+struct pair_of<half> {
+    using type = __half2;
+};
+template<>
+struct pair_of<__nv_bfloat16> {
+    using type = __nv_bfloat162;
+};
+
 // One warp handles one scale group; lane `l` covers columns [l*pack_size, (l+1)*pack_size).
 template<uint32_t head_dim>
 struct PerThreadVec {
@@ -293,10 +305,28 @@ __global__ void SAGE_QUANT_K_BOUNDS(WARP_TOKENS) QuantPerThreadKInt8Kernel(T* __
         pack_t x_val;
         x_val.load_ro(input_ptr_base + local * stride_seq_input);
         if constexpr (sub_mean) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+            // sm8x ptxas splats a per-element subtraction into one register per
+            // element before caching, doubling the cached rows' footprint: the
+            // warp_k=64 hd128 instances land at 110-118 registers (4 CTAs/SM)
+            // instead of the packed form's 72-80 (7 CTAs/SM). Per-lane HSUB2 is
+            // bit-identical to the scalar subtract. sm90/sm100 codegen sits
+            // under the 32-register pin and sm120 already keeps fp16 packed
+            // (re-packing there flips its bf16 form 80 -> 96), so they keep
+            // the per-element form.
+            using pair_t   = typename pair_of<T>::type;
+            auto*       xp = reinterpret_cast<pair_t*>(&x_val);
+            const auto* mp = reinterpret_cast<const pair_t*>(&mean_val);
+#pragma unroll
+            for (uint32_t j = 0; j < pack_size / 2; j++) {
+                xp[j] = __hsub2(xp[j], mp[j]);
+            }
+#else
 #pragma unroll
             for (uint32_t j = 0; j < pack_size; j++) {
                 x_val[j] = x_val[j] - mean_val[j];
             }
+#endif
         }
         return x_val;
     };
