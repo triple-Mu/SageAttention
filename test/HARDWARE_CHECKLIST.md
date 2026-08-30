@@ -96,10 +96,22 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       kernel 这是第一次真在硬件上执行。API 级 41 个用例(等长 `torch.equal`、
       ragged 分段 SDPA、bottom-right causal、空 KV 段、GQA + head_dim pad、
       cudagraph 换分段 replay、compile 无 graph break)全过。
-- [x] sm100(B200,2026-08-29):**设计内不支持**,只验报错可读。tcgen05 kernel
-      的 K/V 走每个 batch entry 一份 tensor map,packed 布局要另写一份,所以
-      `resolve()` 直接拒绝而不是静默降级。实机确认抛
-      `ValueError: varlen is not supported by the sm100 backend`。
+- [x] sm100(B200,2026-08-29,已过时):当时**设计内不支持**,只验了报错可读
+      (`ValueError: varlen is not supported by the sm100 backend`)。
+- [ ] sm100 varlen Phase A M3(wave12/sm100-varlen-m2 起):packed kernel 已
+      落地(经典 128 线程 kernel 的 `#ifdef SAGE_VARLEN` 分支 + 独立 TU
+      `sm100_varlen` 命名空间;WS kernel 无 varlen 路,`SAGEATTN_SM100_WS`
+      只影响 dense),`resolve()` 不再拒绝。B200 待跑:
+      `pytest test/test_varlen_sm100.py test/test_varlen.py -q`。gate 组同
+      sm90 文件(等长 batch 对 dense classic kernel `torch.equal`、ragged
+      非 causal 逐段对 dense、CAUSAL_RAGGED 五组 bottom-right(含 dead row
+      O==0 / lse==-inf)、空 KV 段、cudagraph、opcheck),外加
+      (blk_q=128, warp_q=32, blk_k=128, warp_k=128) 四元组 quant 对拍;
+      几何 CTA_Q=CTA_K=128、`v_layout="linear"`、`pad_multiple=128`、
+      pv 只有 `"fp32"`。注意:该文件 import 时把 `SAGEATTN_SM100_WS`
+      setdefault 成 "0"(dense 参照必须走同 kernel 体);显式设 WS=1/auto
+      跑它会整文件 skip。上机清单见
+      bench/sm100_review/SM100_VARLEN_DESIGN.md §6 M3。
 - [x] sm89 / sm120 的 kernel 级 packed 用例已补:`test_varlen_sm89.py` /
       `test_varlen_sm120.py`,套用 `test_varlen_sm90.py` 的 gate 组(等长
       batch 对共享 body 的 dense kernel `torch.equal`、ragged 非 causal 逐段
@@ -113,9 +125,9 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       cc 12.0 两处均确认 collection 干净、只 skip)。
 
 口径提醒:varlen 每个 arch 只实例化它自己的默认 `pv_accum_dtype`(sm80
-`"fp32"`、sm89 `"fp32+fp16"`、sm90 `"fp32+fp32"`、sm120 `"fp32"`,见
-plan.cpp)。别的组合会明确报错,不会静默降级,所以对拍和 bench 脚本里不要
-顺手换 pv。
+`"fp32"`、sm89 `"fp32+fp16"`、sm90 `"fp32+fp32"`、sm100 `"fp32"`、sm120
+`"fp32"`,见 plan.cpp)。别的组合会明确报错,不会静默降级,所以对拍和 bench
+脚本里不要顺手换 pv。
 
 ## 2. A4-1 合并的性能复核(sm89/sm120)
 
@@ -670,7 +682,7 @@ new 的 SS twin 和 TS 各自对这一份跑 `--check`。三者全等,同时说�
 | equiv 段(SS 与 TS 各一轮) | 105/105 |
 | SDPA 精度(cos_sim > 0.99、rel_l1 < 0.06) | SS 62/62、TS 62/62 |
 | pytest 全量 | 307 passed / 441 skipped,0 failed |
-| varlen 设计内拒绝 | `ValueError: varlen is not supported by the sm100 backend` |
+| varlen 设计内拒绝 | `ValueError: varlen is not supported by the sm100 backend`(当日行为;wave12 起拒绝已删,sm100 有 packed kernel,见 §1) |
 | `test_large_seq_batch_isolation`(batch stride > 2^32) | PASSED(183 GB 够) |
 | e2e bench(40 配置,3 轮交替中位数) | 0.995-1.128×,中位 1.051×,**零劣化** |
 

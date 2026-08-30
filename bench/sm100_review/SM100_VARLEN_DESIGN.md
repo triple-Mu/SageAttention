@@ -1,6 +1,6 @@
-# sm100 varlen 支持设计(M1 已落地,M2 起未实现)
+# sm100 varlen 支持设计(M1/M2 已落地,M3 待上机)
 
-基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾。
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2。
 
 ## 0. 结论
 
@@ -162,6 +162,63 @@ Phase A 落地后 varlen 入口 plan 恒走旧 kernel,`SAGEATTN_SM100_WS` 只影
 | Phase B(悬置) | WS varlen(§4)| 上述全部 + `ws_stress.py` SWEEP + 8000×2 定点 + ptxas 预算复核 + bench 证明命中段存在 | B200 | 2-3 |
 
 Phase A 合计约 4 个会话(±1,取决于 M3 一次过与否)。
+
+### 6.1 M2 落地记录(分支 wave12/sm100-varlen-m2,2026-08-31)
+
+- kernel:§3.2 八处全部进 `qk_int_sv_f8_sm100_impl.cuh` 的 `#ifdef SAGE_VARLEN`
+  分支,dense 分支原文本保留;`../sageattn/seqlen_info.cuh` 的 include 也套在
+  `SAGE_VARLEN` 里(与 sm90 不同):无条件 include 时每个 kernel 自身的指令流
+  与 ptxas 资源都不变,但 torch/cub 的 `EmptyKernel` 样板在 ELF 里的落点会移,
+  违反本仓「整 dump 逐字节」的 gate 口径。与 sm90 的两处口径差:mask 触发条件
+  是 `iter >= first_masked_tile`(runtime、块内 uniform,dense 的
+  `if constexpr (is_last)` 只在 dense 分支保留);dead row 用 `d_rcp = 0` +
+  `row_max = -INFINITY` 覆盖(thread=row,无 fragment 展开)。零 trip 退出的
+  零填充是每 thread 一行 head_dim/2 个 uint32 store。
+- host:launcher TU `qk_int_sv_f8_cuda_sm100_varlen.cu`(`sm100_varlen`
+  命名空间,rank-4 batch=1 tensor map 走 `make_qkv_tensor_maps_varlen<128,128,HD>`,
+  padded_k 钉 `blk_total*128`,不接 `SAGEATTN_SM100_WS`)+
+  `attn_cuda_sm100_varlen.h` + CMake(`SAGE_BUILD_VARLEN` 下追加进
+  `SAGE_SRC_SM100`,自动继承 sm_100a+sm_110a gencode)+
+  fwd_varlen_cuda.cu 加 `kSm100F8` case(pv 钉 `"fp32"`)+ plan.cpp 删拒绝块 +
+  varlen.py/conftest.py 的 backend 集合加 "sm100"。
+- 测试:`test/test_varlen_sm100.py`(sm90 gate 组 + 四元组 quant 对拍;import
+  时 `SAGEATTN_SM100_WS` setdefault "0",显式 WS=1/auto 则整文件 skip);
+  test_varlen_utils.py 拒绝断言反转为 dense/varlen plan 等同;
+  ptxas gate 新增 `qk_int_sv_f8_cuda_sm100_varlen_probe.cu`(4 实例)。
+- 本机 gate 实录:dense TU 与 ws TU 的 `cuobjdump -sass/-res-usage`
+  在 sm_100a+sm_110a 双 gencode 下改动前后逐字节全同(同路径 build dir
+  全新重配,单 TU 对比);varlen TU 全量 CMake(`10.0;11.0` 与
+  `8.6;10.0;11.0` 两种 arch 列表)编译链接绿;varlen probe 4 实例 ×
+  sm_100a/sm_110a 全部 0 spill / 0 stack、254-255 reg(与 dense 同档),
+  `test_ptxas_gate` 6/6;本机(sm_86)pytest 全套 542 passed / 347 skipped,
+  test_varlen_sm100.py 69 例 collection 干净、全按 resolved backend skip。
+
+### 6.2 M3 上机清单(B200,下一会话)
+
+1. **构建**:ComputeLab b200x4(`--sqsh pytorch_26.07-py3`),全 arch 或至少
+   `10.0;11.0`;并发乘积 ≤16;bdist 前清 `build/lib*`(memory 两条构建教训)。
+2. **pytest**:`SAGEATTN_SM100_TCGEN05=1 pytest test/test_varlen_sm100.py
+   test/test_varlen.py -q`(TCGEN05=1 是 resolve 到 sm100 的标准姿势,不设则
+   两个文件按 resolved backend 全 skip)。不要显式设 `SAGEATTN_SM100_WS`
+   (test_varlen_sm100.py 自己 setdefault "0";设了 1/auto 会整文件 skip)。
+   test_varlen.py 的 API 组这次在 sm100 上 resolve 到 packed kernel,是
+   `_VARLEN_BACKENDS` 加 "sm100" 后的首跑。
+3. **等长 bitwise**:上面文件里的 test_fwd_varlen_equals_dense 即是 gate
+   (dense classic kernel 同 kernel 体 `torch.equal`,无需新 golden dir);
+   若 fail,先确认 dense 参照没被路由到 ws kernel(见 §6.1 的 env 说明)。
+4. **dead-row 三层防线落地确认**(P=exp2(8.807)≈448 陷阱):
+   CAUSAL_RAGGED 的 `([1000],[1])` 用例断言 dead row O==0 且 lse==-inf
+   (防线一:epilogue `d_rcp=0`);空 KV 用例断言零 trip 提前退出路径
+   (防线二);K 尾 tile 跨序列由 mask `kv_idx>=kv_len` 清除、V 走 slab
+   (防线三)由 ragged 逐段对拍覆盖。
+5. **压测**:`test_fwd_varlen_long_packed_tensor`(129536 token,64K 段)+
+   cudagraph 换分段 replay(都在文件里);再顺跑一轮 `pytest test/ -q`
+   看全套无回归。
+6. **bench**:`bench/bench_varlen.py`(packed vs padded dense,equal/ragged
+   .25/.1 三 profile × 5 shape × causal)+ 同机 fallback 对照(TCGEN05 off →
+   sm89 backend);口径按 BENCH_PROTOCOL;ncu 过滤
+   `-k regex:qk_int8_sv_f8_attn_kernel_sm100`。
+7. **文档**:HARDWARE_CHECKLIST §1 的 M3 项打勾并填数字;HANDOFF 更新。
 
 ## 7. 风险(设计问题 4)
 
