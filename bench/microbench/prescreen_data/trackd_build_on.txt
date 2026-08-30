@@ -1,0 +1,87 @@
+# Track D gencode-prune benefit measurement: SAGE_PRUNE_GENCODE=ON
+# host: local dev box (RTX 3080 Ti Laptop, build is CPU-only), CUDA 13.3.73 nvcc,
+# cmake 4.4.2 + ninja 1.13.0 (pip), torch 2.13.0+cu132 headers, gcc host compiler.
+# configure: cmake -G Ninja -DSAGE_CUDA_ARCHS="8.6;8.9;9.0;10.0;12.0" -DSAGE_NVCC_THREADS=4 -DSAGE_CCACHE=OFF
+#            -DSAGE_PRUNE_GENCODE=ON
+# build:     /usr/bin/time -v ninja _C -j4   (4 jobs x nvcc --threads 4)
+# NOTE: the box ran unrelated load during both builds; wall clock is noisy,
+# user+sys CPU seconds are per-process-tree and robust to it.
+
+== /usr/bin/time -v (build) ==
+User time (seconds): 3905.85
+System time (seconds): 202.67
+Percent of CPU this job got: 553%
+Elapsed (wall clock) time (h:mm:ss or m:ss): 12:22.19
+Maximum resident set size (kbytes): 2026516
+Exit status: 0
+
+== artifact ==
+_C.abi3.so bytes: 73573376
+embedded cubins: 40
+
+== per-arch cubin histogram ==
+      8 sm_100
+      2 sm_100a
+      7 sm_120
+      3 sm_75
+      5 sm_86
+      8 sm_89
+      5 sm_90
+      2 sm_90a
+
+== .ninja_log per-output wall time, top 12 ==
+entries=25 serial_cpu_seconds=2745.0
+    328.6s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu.o
+    175.2s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu.o
+    174.6s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu.o
+    172.1s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf.cu.o
+    166.8s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu.o
+    151.5s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f16_cuda_sm80_varlen.cu.o
+    141.8s  CMakeFiles/sage_sm89_varlen_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf.cu.o
+    126.0s  CMakeFiles/_C.dir/csrc/fused/fused.cu.o
+    122.9s  CMakeFiles/sage_sm120_varlen_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn.cu.o
+    121.9s  CMakeFiles/sage_sm120_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu.o
+    120.1s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu.o
+    118.7s  CMakeFiles/sage_sm120_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu.o
+
+== cuobjdump --list-elf ==
+ELF file    1: _C.abi3.1.sm_89.cubin
+ELF file    2: _C.abi3.2.sm_100.cubin
+ELF file    3: _C.abi3.3.sm_89.cubin
+ELF file    4: _C.abi3.4.sm_100.cubin
+ELF file    5: _C.abi3.5.sm_89.cubin
+ELF file    6: _C.abi3.6.sm_100.cubin
+ELF file    7: _C.abi3.7.sm_89.cubin
+ELF file    8: _C.abi3.8.sm_100.cubin
+ELF file    9: _C.abi3.9.sm_89.cubin
+ELF file   10: _C.abi3.10.sm_100.cubin
+ELF file   11: _C.abi3.11.sm_120.cubin
+ELF file   12: _C.abi3.12.sm_120.cubin
+ELF file   13: _C.abi3.13.sm_120.cubin
+ELF file   14: _C.abi3.14.sm_120.cubin
+ELF file   15: _C.abi3.15.sm_75.cubin
+ELF file   16: _C.abi3.16.sm_75.cubin
+ELF file   17: _C.abi3.17.sm_75.cubin
+ELF file   18: _C.abi3.18.sm_86.cubin
+ELF file   19: _C.abi3.19.sm_89.cubin
+ELF file   20: _C.abi3.20.sm_90.cubin
+ELF file   21: _C.abi3.21.sm_100.cubin
+ELF file   22: _C.abi3.22.sm_120.cubin
+ELF file   23: _C.abi3.23.sm_86.cubin
+ELF file   24: _C.abi3.24.sm_89.cubin
+ELF file   25: _C.abi3.25.sm_90.cubin
+ELF file   26: _C.abi3.26.sm_100.cubin
+ELF file   27: _C.abi3.27.sm_120.cubin
+ELF file   28: _C.abi3.28.sm_86.cubin
+ELF file   29: _C.abi3.29.sm_89.cubin
+ELF file   30: _C.abi3.30.sm_90.cubin
+ELF file   31: _C.abi3.31.sm_100.cubin
+ELF file   32: _C.abi3.32.sm_120.cubin
+ELF file   33: _C.abi3.33.sm_86.cubin
+ELF file   34: _C.abi3.34.sm_90.cubin
+ELF file   35: _C.abi3.35.sm_86.cubin
+ELF file   36: _C.abi3.36.sm_90.cubin
+ELF file   37: _C.abi3.37.sm_90a.cubin
+ELF file   38: _C.abi3.38.sm_90a.cubin
+ELF file   39: _C.abi3.39.sm_100a.cubin
+ELF file   40: _C.abi3.40.sm_100a.cubin

@@ -136,3 +136,59 @@ sm100 四个生产实例(同一 `sass_area_results.txt`),口径:相邻、同 opc
 - 面积:`bash build_area_probes.sh`(需 torch 头文件)→ `python sass_area.py --pairs <cubin...>`
 - 数值:`python e1_fp16_exp2_sim.py`
 - .so 审计:`python so_param_audit.py <path>/_C.abi3.so`
+
+---
+
+## 四、Track D 收口(wave7):裁剪收益实测、fwd 报错改进、转正建议
+
+| 项 | 结论 |
+|---|---|
+| 全 arch fresh build,CPU 秒(user+sys) | 6432.5 s → 4108.5 s,**省 36.1%** |
+| 同上,墙钟(-j4,机上有无关负载,噪声大) | 959.7 s → 742.2 s,省 22.7% |
+| `_C.abi3.so` 体积 | 113.2 MiB → 70.2 MiB,省 38.0% |
+| 嵌入 cubin 数 | 51 → 40,裁 11 个,清单与静态预测逐条一致 |
+| SASS gate | 存活 40 对全部无真实 SASS 差异(23 对逐字节同,17 对只差纯命名 token,见下) |
+| 显式 backend 撞裁剪档 | 已修:fwd 层 `backend_serves()` 前置检查(commit 581ded8),launch 崩溃变干净 TORCH_CHECK |
+| 建议 | **GO**:两项判据(build >15%、体积 >15%)双双大幅超线;敞口一条,见 4.4 |
+
+### 4.1 实测条件与数字
+
+同机串行两次 fresh build,配置只差 `-DSAGE_PRUNE_GENCODE`:源码 = a264fc0 + 报错改进 commit(581ded8);CUDA 13.3.73,cmake 4.4.2 + ninja 1.13.0,torch 2.13.0+cu132 头文件;`SAGE_CUDA_ARCHS="8.6;8.9;9.0;10.0;12.0"`(无 +PTX),`-DSAGE_CCACHE=OFF`,`ninja _C -j4` × `--threads=4`(并发积 16)。机器同时有无关负载,墙钟受污染,**CPU 秒(`/usr/bin/time -v` 的 user+sys,只计本构建进程树)是干净口径**。原始数据:`prescreen_data/trackd_build_off.txt` / `trackd_build_on.txt`。
+
+| 指标 | OFF | ON | 变化 |
+|---|---|---|---|
+| CPU 秒(user+sys) | 6432.5 | 4108.5 | −36.1% |
+| 墙钟 | 959.7 s | 742.2 s | −22.7% |
+| `.ninja_log` 逐 task 墙钟合计 | 3308.7 s | 2745.0 s | −17.0% |
+| `_C.abi3.so` | 118,693,600 B | 73,573,376 B | −38.0% |
+| kernel TU 的 arch-compile 次数 | 48 | 37 | −11 |
+| 最重 TU(sm80 dense,5→2 arch) | 493.1 s | 328.6 s | −33.4% |
+| sm89 组单 TU(3→2 arch,×5 TU) | 203.9–217.3 s | 166.8–175.2 s | 约 −18% |
+
+CPU 省幅(36%)大于 arch-compile 计数省幅(23%):被裁的 sm_120/sm_100 ptxas pass 单价高于平均。
+
+### 4.2 SASS gate:裁剪只删整个 cubin,不改存活 cubin
+
+`cuobjdump -xelf all` 抽出两侧全部 cubin,按(源 TU,arch,产品 kernel 符号集)配对(工具:`prune_cubin_gate.py`,输出:`prescreen_data/trackd_cubin_gate.txt`):
+
+- 被裁 11 个,与 resolve 决策表推导逐条一致:sm80 组 2 TU × {sm_89, sm_100, sm_120},sm89 组 5 TU × {sm_120};ON 侧无新增 cubin。
+- 存活 40 对:23 对 sha256 逐字节同;17 对字节不同但 `nvdisasm` 文本在刮掉两类**纯命名 token** 后零差异——(a)nvcc 给 local symbol 加的 `_INTERNAL_<hash>_<TU>_cu_<hash>` 前缀,其 hash 覆盖 gencode 列表与预处理输入;(b)CUB/CCCL 按编译 arch 集合铸造的 inline namespace `_V_<ver>_SM_<列表>`(防 ODR 机制)。改 gencode 列表必然改这两串名字,指令流一字未动。
+- 交叉验证:17 对恰好 = gencode 集合变化的 7 个 kernel TU 的存活 arch + 3 个 binding TU 的 sm_75 cubin(后者因 include 生成头、宏值随 OFF/ON 变而换 module hash);23 对逐字节同的恰好 = gencode 未变的 fused/sm90/sm100/sm120 组全部 cubin。
+
+kernel TU(csrc/qattn、csrc/fused)一律不 include 生成头,报错改进 commit 对产品 SASS 无影响面(全仓 grep 过)。
+
+### 4.3 fwd 报错改进(prescreen 遗留项,已落地 581ded8)
+
+原状:显式 `backend` 覆盖(fwd op 的逃生门)指向已编家族但该设备 SASS 被裁时,`backend_compiled()` 家族级检查放行,launch 时 `cudaErrorNoKernelImageForDevice`。
+
+改动:CMake 把每家族实际编译的 gencode 列表(cubin + PTX 子集)写进 `sageattn_build_config.h`;`plan.cpp` 新增 `backend_serves(backend, cc)` 按 CUDA loader 规则判定(plain cubin 同 major 低 minor 向上兼容、PTX 数值向前 JIT、`sm_XXa` 只认自身);`fwd`/`fwd_varlen` 在 resolve 之后、launch 之前 TORCH_CHECK,报错带 built-archs 列表与 rebuild 提示。plan op 保持家族级答案:它是纯 host 决策表,测试与 import-time prime 用合成 cc 查询,不能依赖本构建的 SASS 配置。
+
+sm86 实机验证(OFF 与 ON 构建各一轮):显式 `backend="sm90"`/`"sm120"` → 新报错;`backend="sm80"` 正常放行;pytest 全绿(OFF 轮 test_plan+test_varlen_utils+test_style 111 例 + test_api 25 例;ON 轮 test_plan+test_varlen_utils+test_api 94 例)。报错文本与 test/ 现有 pytest match 无碰撞。
+
+### 4.4 转正建议:GO(默认 ON),敞口一条
+
+判据是「build 收益 >15% 或体积收益 >15%」,实测 build −36.1%(CPU 口径;墙钟 −22.7%)且体积 −38.0%,**双双超线,建议转正**。裁掉的 cubin 全部是 resolve() 默认路径永远不选的死重;唯一行为变化落在显式 backend 逃生门,且已由 4.3 的检查兜住。
+
+敞口:prune ON 时 major==12 无条件出 sm89 组,`SAGE_CUDA_ARCHS` 怎么写都加不回 sm89 家族的 sm_12x cubin——cc12 设备上显式请求 sm89 家族(sm89↔sm120 同设备对拍的唯一途径)只能用 `-DSAGE_PRUNE_GENCODE=OFF` 重建恢复(给 8.x/10.x 条目加 +PTX 也能跑但走 JIT,不适合对拍)。同理 sm80 组被裁的 8.9/10.x/12.x:8.9 设备由 8.6 cubin 二进制兼容顶上,cc≥10 设备显式 `backend="sm80"`(fp16 PV)无兜底。撞上时报错干净且带 cure。
+
+本节只出数字与建议,不动默认值;转正 = 翻 `SAGE_PRUNE_GENCODE` 默认 + 文档写明敞口,由维护者拍板另行落地。

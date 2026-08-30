@@ -1,0 +1,97 @@
+# Track D gencode-prune benefit measurement: SAGE_PRUNE_GENCODE=OFF
+# host: local dev box (RTX 3080 Ti Laptop, build is CPU-only), CUDA 13.3.73 nvcc,
+# cmake 4.4.2 + ninja 1.13.0 (pip), torch 2.13.0+cu132 headers, gcc host compiler.
+# configure: cmake -G Ninja -DSAGE_CUDA_ARCHS="8.6;8.9;9.0;10.0;12.0" -DSAGE_NVCC_THREADS=4 -DSAGE_CCACHE=OFF
+# build:     /usr/bin/time -v ninja _C -j4   (4 jobs x nvcc --threads 4)
+# NOTE: the box ran unrelated load during both builds; wall clock is noisy,
+# user+sys CPU seconds are per-process-tree and robust to it.
+
+== /usr/bin/time -v (build) ==
+User time (seconds): 6177.23
+System time (seconds): 255.29
+Percent of CPU this job got: 670%
+Elapsed (wall clock) time (h:mm:ss or m:ss): 15:59.68
+Maximum resident set size (kbytes): 2038120
+Exit status: 0
+
+== artifact ==
+_C.abi3.so bytes: 118693600
+embedded cubins: 51
+
+== per-arch cubin histogram ==
+     10 sm_100
+      2 sm_100a
+     14 sm_120
+      3 sm_75
+      5 sm_86
+     10 sm_89
+      5 sm_90
+      2 sm_90a
+
+== .ninja_log per-output wall time, top 12 ==
+entries=25 serial_cpu_seconds=3308.7
+    493.1s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu.o
+    237.4s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f16_cuda_sm80_varlen.cu.o
+    217.3s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu.o
+    211.3s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf.cu.o
+    209.1s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu.o
+    203.9s  CMakeFiles/sage_sm89_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu.o
+    172.1s  CMakeFiles/sage_sm89_varlen_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf.cu.o
+    164.7s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu.o
+    150.3s  CMakeFiles/sage_sm120_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu.o
+    148.5s  CMakeFiles/sage_sm120_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu.o
+    147.9s  CMakeFiles/sage_sm120_objs.dir/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu.o
+    139.9s  CMakeFiles/_C.dir/csrc/qattn/qk_int_sv_f8_cuda_sm100.cu.o
+
+== cuobjdump --list-elf ==
+ELF file    1: _C.abi3.1.sm_89.cubin
+ELF file    2: _C.abi3.2.sm_100.cubin
+ELF file    3: _C.abi3.3.sm_120.cubin
+ELF file    4: _C.abi3.4.sm_89.cubin
+ELF file    5: _C.abi3.5.sm_100.cubin
+ELF file    6: _C.abi3.6.sm_120.cubin
+ELF file    7: _C.abi3.7.sm_89.cubin
+ELF file    8: _C.abi3.8.sm_100.cubin
+ELF file    9: _C.abi3.9.sm_120.cubin
+ELF file   10: _C.abi3.10.sm_89.cubin
+ELF file   11: _C.abi3.11.sm_100.cubin
+ELF file   12: _C.abi3.12.sm_120.cubin
+ELF file   13: _C.abi3.13.sm_89.cubin
+ELF file   14: _C.abi3.14.sm_100.cubin
+ELF file   15: _C.abi3.15.sm_120.cubin
+ELF file   16: _C.abi3.16.sm_120.cubin
+ELF file   17: _C.abi3.17.sm_120.cubin
+ELF file   18: _C.abi3.18.sm_120.cubin
+ELF file   19: _C.abi3.19.sm_120.cubin
+ELF file   20: _C.abi3.20.sm_75.cubin
+ELF file   21: _C.abi3.21.sm_75.cubin
+ELF file   22: _C.abi3.22.sm_75.cubin
+ELF file   23: _C.abi3.23.sm_86.cubin
+ELF file   24: _C.abi3.24.sm_89.cubin
+ELF file   25: _C.abi3.25.sm_90.cubin
+ELF file   26: _C.abi3.26.sm_100.cubin
+ELF file   27: _C.abi3.27.sm_120.cubin
+ELF file   28: _C.abi3.28.sm_86.cubin
+ELF file   29: _C.abi3.29.sm_89.cubin
+ELF file   30: _C.abi3.30.sm_90.cubin
+ELF file   31: _C.abi3.31.sm_100.cubin
+ELF file   32: _C.abi3.32.sm_120.cubin
+ELF file   33: _C.abi3.33.sm_86.cubin
+ELF file   34: _C.abi3.34.sm_89.cubin
+ELF file   35: _C.abi3.35.sm_90.cubin
+ELF file   36: _C.abi3.36.sm_100.cubin
+ELF file   37: _C.abi3.37.sm_120.cubin
+ELF file   38: _C.abi3.38.sm_86.cubin
+ELF file   39: _C.abi3.39.sm_89.cubin
+ELF file   40: _C.abi3.40.sm_90.cubin
+ELF file   41: _C.abi3.41.sm_100.cubin
+ELF file   42: _C.abi3.42.sm_120.cubin
+ELF file   43: _C.abi3.43.sm_86.cubin
+ELF file   44: _C.abi3.44.sm_89.cubin
+ELF file   45: _C.abi3.45.sm_90.cubin
+ELF file   46: _C.abi3.46.sm_100.cubin
+ELF file   47: _C.abi3.47.sm_120.cubin
+ELF file   48: _C.abi3.48.sm_90a.cubin
+ELF file   49: _C.abi3.49.sm_90a.cubin
+ELF file   50: _C.abi3.50.sm_100a.cubin
+ELF file   51: _C.abi3.51.sm_100a.cubin

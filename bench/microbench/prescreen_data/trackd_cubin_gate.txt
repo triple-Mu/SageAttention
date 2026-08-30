@@ -1,0 +1,43 @@
+# Track D SASS gate: SAGE_PRUNE_GENCODE=ON vs OFF, cubins extracted with
+# cuobjdump -xelf all, paired by (source TU, sm arch, product kernel symbol set),
+# compared as sha256 first and as nvdisasm text after scrubbing the two
+# name-only build-identity tokens (see bench/microbench/prune_cubin_gate.py):
+#   1. nvcc's _INTERNAL_<modid>_<len>_<tu>_cu_<hash> local-symbol prefix
+#      (hash covers the preprocessed input and the gencode list);
+#   2. CUB/CCCL's arch-list inline namespace _V_<ver>_SM_<list> (minted per
+#      compiled arch set precisely so mixed-arch TUs cannot ODR-collide).
+# Verdict line 'pairs with REAL SASS diff: 0' is the gate.
+
+pairs byte-identical:             23
+pairs identical after hash-scrub: 17
+    sm_75    fwd_cuda
+    sm_75    fwd_varlen_cuda
+    sm_86    qk_int_sv_f16_cuda_sm80
+    sm_90    qk_int_sv_f16_cuda_sm80
+    sm_86    qk_int_sv_f16_cuda_sm80_varlen
+    sm_90    qk_int_sv_f16_cuda_sm80_varlen
+    sm_75    quant_cuda
+    sm_100   sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
+    sm_89    sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
+    sm_100   sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf
+    sm_89    sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf
+    sm_100   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn
+    sm_89    sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn
+    sm_100   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+    sm_89    sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+    sm_100   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn
+    sm_89    sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn
+pairs with REAL SASS diff:        0
+pruned (in OFF only):             11
+    sm_100   qk_int_sv_f16_cuda_sm80
+    sm_120   qk_int_sv_f16_cuda_sm80
+    sm_89    qk_int_sv_f16_cuda_sm80
+    sm_100   qk_int_sv_f16_cuda_sm80_varlen
+    sm_120   qk_int_sv_f16_cuda_sm80_varlen
+    sm_89    qk_int_sv_f16_cuda_sm80_varlen
+    sm_120   sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
+    sm_120   sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_varlen_attn_inst_buf
+    sm_120   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn
+    sm_120   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+    sm_120   sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn
+ON-only (must be none):           none
