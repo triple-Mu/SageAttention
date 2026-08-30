@@ -100,11 +100,17 @@ sm90 已在 H200(GPU 5)验完,fp8 V^T 量化这一级也随之有了硬件证据
       的 K/V 走每个 batch entry 一份 tensor map,packed 布局要另写一份,所以
       `resolve()` 直接拒绝而不是静默降级。实机确认抛
       `ValueError: varlen is not supported by the sm100 backend`。
-- [ ] sm89 / sm120 都缺 kernel 级 packed 用例。`test_varlen.py` 里 `fwd_varlen`
-      那一组写死 `pv_accum_dtype="fp32"` + `v_layout="seq"`,所以 pin 在 sm80;
-      sm90 另有 `test_varlen_sm90.py`。这两个 arch 目前只有 API 级覆盖,补
-      `test_varlen_sm89.py` / `test_varlen_sm120.py` 才能直接测它们的 tile
-      几何与 fp8 V^T 布局。
+- [x] sm89 / sm120 的 kernel 级 packed 用例已补:`test_varlen_sm89.py` /
+      `test_varlen_sm120.py`,套用 `test_varlen_sm90.py` 的 gate 组(等长
+      batch 对共享 body 的 dense kernel `torch.equal`、ragged 非 causal 逐段
+      对 dense、bottom-right causal 精度、空 KV 段、opcheck),几何
+      CTA_Q 128 / CTA_K 64、`pad_multiple=64`,pv 各用自己的默认(sm89
+      `"fp32+fp16"` 配 V `scale_max=2.25`,sm120 `"fp32"` 配 448)。
+      sm120 已上机(pro-5k RTX PRO 6000,2026-08-30):
+      `pytest test/test_varlen_sm89.py test/test_varlen_sm120.py -q`
+      62 passed / 62 skipped,skip 的 62 个全是 sm89 文件在 cc 12.0 上按
+      resolved backend 让路。sm89 侧 62 个用例待 L20 复验轮顺跑(sm_86 与
+      cc 12.0 两处均确认 collection 干净、只 skip)。
 
 口径提醒:varlen 每个 arch 只实例化它自己的默认 `pv_accum_dtype`(sm80
 `"fp32"`、sm89 `"fp32+fp16"`、sm90 `"fp32+fp32"`、sm120 `"fp32"`,见
