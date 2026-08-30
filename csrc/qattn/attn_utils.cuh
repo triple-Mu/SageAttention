@@ -38,7 +38,6 @@ enum class MaskMode {
 enum class DataType {
     kHalf,
     kInt8,
-    kInt4,
     kE4M3,
 };
 
@@ -211,7 +210,7 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
                                                uint32_t&                           offset_Q,
                                                uint32_t&                           offset_K)
 {
-    static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4);
+    static_assert(DTypeQK == DataType::kInt8);
 
     uint32_t RQ[num_tiles_q][4];
     uint32_t RK[4];
@@ -291,7 +290,7 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
                                                uint32_t                            RQ[][4],
                                                uint32_t                            offset_K)
 {
-    static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4);
+    static_assert(DTypeQK == DataType::kInt8);
     static_assert(num_tiles_qk_inner == 1);
 
     uint32_t RK[4];

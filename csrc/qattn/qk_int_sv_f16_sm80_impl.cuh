@@ -134,9 +134,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                           float          sm_scale)
 {
     // compile time check
-    static_assert(
-        DTypeQK == DataType::kInt8,
-        "DTypeQK must be int8 (the kInt4 compute path was never implemented: compute_int_qk has no int4 mma branch and would silently produce garbage)");
+    static_assert(DTypeQK == DataType::kInt8, "DTypeQK must be int8");
     static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp
                       || Q_GRAN == QuantGranularity::kPerThread,
                   "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
@@ -160,11 +158,10 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
     constexpr uint32_t num_warps   = num_warps_q * num_warps_k;
     constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
     constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
-    constexpr uint32_t num_tiles_qk_inner =
-        (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
+    constexpr uint32_t num_tiles_qk_inner = head_dim / MMA_QK_K;
     constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
 
-    constexpr uint32_t QK_SMEM_STRIDE = (DTypeQK == DataType::kInt8) ? (head_dim) : (head_dim / 2);
+    constexpr uint32_t QK_SMEM_STRIDE = head_dim;
     constexpr uint32_t O_SMEM_STRIDE  = head_dim;
     constexpr uint32_t V_SMEM_STRIDE  = head_dim;
 
