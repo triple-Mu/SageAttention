@@ -992,6 +992,179 @@ TMEM alloc 后面那条 `__syncthreads()` 发布),epilogue 读 LDS。
 d128 对 cudnn 从 **0.471× 提到 0.743×**(全段几何均值),最好的点 0.866×;
 Phase 1 的计划预期是 ~0.78×,实测落在这个量级上,差的那点是 A2 / A5 没进来。
 
+### cutedsl 反向移植 Phase 3:两个结构候选都判负(2026-08-30,B200 `umb-b200-250`)
+
+Phase 1 之后剩下的两个结构改动互相冲突,只能各做一版跟 A1 基线三方 A/B。
+基线是 feat/varlen tip `6ae9fe6`(A1 + A3),两个候选各自独立分支,不叠加。
+脚本 `p3_stage.sh` / `p3_ab3.sh` / `p3_report.py` / `p3_stress_scan.sh` /
+`p3_phaseA.sh` / `p3_phaseB.sh` / `p3_phaseC.sh` / `p3_ncu.sh` /
+`p3_ncu_retry.sh` / `ncu_table.py` / `stalls.py` 与 Phase 1 的脚本同目录
+(集群 `SageAttention_refactor/scripts/`),日志在同目录 `logs/`。
+
+| 候选 | 改动 | 结论 |
+|---|---|---|
+| **B1** KV 统一 ring | K/V 共用 `KV_STAGES=4` 个 smem slot(load 2i = K tile i,2i+1 = V tile i,slot = idx % 4);TMA 在 slot 空出时发,提前量从 1 发 MMA 变成 2 个 KV tile。smem/CTA 48 → 80 KB | **回退**,全表几何均值 1.0004,方向不一致 |
+| **C2** S 双缓冲 ping-pong | TMEM 改 S0[0,128) + S1[128,256) + O[256,256+d),P 各叠进对应 S 区;QK(0) 剥进 prologue,tile i 先发 QK(i+1) 再做自己的 softmax;K 双缓冲配套 | **回退**,全表几何均值 0.6508,22 点全慢 |
+
+#### 三方 A/B(同卡、3 轮轮换顺序、每形状取中位数,22 个形状全部独占)
+
+`p3base-ts` = A1 基线。比值是 base / 候选,>1 表示候选更快。基线自己对 cudnn
+的 d128 全段几何均值这一轮是 **0.760**(范围 0.539-0.887);Phase 1 记的 0.743
+是另一台 B200 上另一轮的数,同一份代码,不要当成变化。
+
+| 分段 | B1 vs 基线 | C2 vs 基线 |
+|---|---|---|
+| **全表几何均值** | **1.0004**(低于 0.5% 阈值) | **0.6508**(有信号) |
+| 方向一致性(>0.5% 计) | 10 快 / 12 慢 | 0 快 / 22 慢 |
+| d128 non-causal | 1.0140(0.977-1.062) | 0.6582 |
+| d128 causal | 0.9878(0.985-0.995) | 0.6474 |
+| d64 non-causal(对照) | 0.9973 | 0.6308 |
+| hd128 s1024 / s4096 | 0.9962 / 1.0138 | 0.7465 / 0.6753 |
+| hd128 s16384 / s32768 / s131072 | 0.9995 / 0.9973 / 0.9968 | 0.6234 / 0.6166 / 0.6119 |
+| d128 对 cudnn(全段几何均值) | 0.761 | 0.496 |
+
+**B1 不是「没效果」,是收益和代价互相抵消**:non-causal 全段 +1.4%(最好的点
+d128 / batch 1 / s4096,+6.2%),causal 全段 −1.2%,两边都过 0.5% 阈值但符号相反,
+所以按 BENCH_PROTOCOL 的方向一致性检验判负。四个形状的 ncu 给出的是同一张脸:
+
+| 每形状 base → B1 | s4096 c0 | s4096 c1 | s16384 c0 |
+|---|---|---|---|
+| L1 命中率 | 88.40 → 92.14% | 88.46 → 91.19% | 88.75 → 93.01% |
+| `long_scoreboard` | 0.97 → 0.89 | 1.11 → 0.96 | 0.83 → 0.80 |
+| `wait` | 1.00 → 0.92 | 1.00 → 0.94 | 0.99 → 0.91 |
+| **`short_scoreboard`** | 0.43 → **0.51** | 0.48 → **0.63** | 0.36 → **0.39** |
+| eligible warps / scheduler | 0.60 → 0.60 | 0.55 → 0.55 | 0.65 → 0.65 |
+| SM Throughput | 44.82 → 46.11% | 39.84 → 40.60% | 49.46 → 51.01% |
+
+预取那一半确实奏效:L1 命中率涨 2.5-4.3 个点,`long_scoreboard` 和 `wait` 都降。
+但**省下来的延迟没人接盘**——eligible warp 三个形状全部一动不动,只有 0.55-0.65,
+腾出来的空档没有别的 warp 可以填。代价那一半是 `short_scoreboard` 上涨:ring
+把 barrier 和 smem 基址都变成了动态下标(`barrier_kv[st]`、`sKV + st*TILE`),
+这些访问走 MIO。涨幅最大的正是 causal s4096(+0.15),也正是 bench 上亏得最多的
+那一段;non-causal 长序列涨得最少(+0.03),也正是赢的那一段。**这条归因是相关
+关系,没有做消融**(比如把 `KV_STAGES` 固定成 2 让下标退回常量),重开时先补。
+
+**C2 是教科书式的 occupancy 交换**:TMEM 从 256 列涨到 384 列 → 进位到 512
+→ 每个 SM 只剩一个 CTA 真正在干活。ncu 上 Duration 1.19 → 1.83 ms(比值
+0.650,跟 bench 的 0.6508 对得上),Compute (SM) Throughput 44.78% → 30.09%。
+拿掉的正是 A1 花 1.51× 换来的东西,而 QK/softmax 重叠换回来的远不够。
+cutedsl 单 tile 变体在 `core_sm100.py:1310` 列的翻案条件里,「S 双缓冲」这一条
+到此关闭;剩下那条(2 CTA/SM + `setmaxnreg`)要求先有完整 warp specialization。
+
+#### 门禁(两个候选都过,判负是纯性能结论)
+
+| 门禁 | B1 | C2 |
+|---|---|---|
+| golden TS `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` | 同左 |
+| golden SS twin `--check` | `ok=2280 diff=0 env_mismatch=0 missing=0` | 同左 |
+| 压测 seq 扫描(d128 b4 h32,seq 2048/4096/8192/16384/32768/65536/131072 × causal 两态,每点 10 次) | 14/14 全干净 | 14/14 全干净 |
+| 定点压测(d128 b4 h32 s32768,causal 两态各 8000 次) | 两态都干净 | 未跑(性能已判负) |
+| 全 arch object 对比(8.6;8.9;9.0;10.0;12.0,23 个 object) | 只有 `qk_int_sv_f8_cuda_sm100.cu.o` 变 | 同左 |
+
+四段 golden 的分段数是 quant 240 / attn 1980 / e2e 60 / equiv 0,equiv 段另有
+105 个 case 不在 golden 里(`extra=105`),三份构建完全一致,是 golden 目录的
+覆盖范围问题,不是改动引入的。
+
+全 arch 对比这次没用 SASS 反汇编,直接比 23 个编译产物的 md5:**先用同一份源码
+重建一次,23 个 md5 全部复现**,确认 nvcc 在这台机器上是确定性的,再拿这个
+基准去比两个候选。两个候选都只有 sm100 那一个 object 变。构建树固定在同一个
+路径下原地换 `.cu` 重建——换目录会让 `TORCH_CHECK` 里的 `__FILE__` 变化,
+制造出假的差异。
+
+#### ncu(d128 b4 h32 s4096 non-causal,ncu 2026.2.1,单次发射)
+
+| 指标 | 基线(A1) | B1 | C2 |
+|---|---|---|---|
+| Duration | 1.191 ms | 1.200 ms | 1.834 ms |
+| SM Throughput | 44.82% | 46.11% | 30.09% |
+| Memory Throughput | 19.55% | 19.43% | 12.01% |
+| Warps active / scheduler | 1.97 | 1.97 | 1.96 |
+| **Eligible warps / scheduler** | **0.60** | **0.60** | 0.32 |
+| L1 命中率 | 88.40% | 92.14% | 88.76% |
+| L2 命中率 | 83.64% | 84.47% | 79.49% |
+| DRAM 字节 | 303.6 MB | 302.8 MB | 304.9 MB |
+| Registers / thread | 255 | 168 | 254 |
+| Dynamic smem / block | 48 KB | 80 KB | 64 KB |
+| occupancy 上限(寄存器 / smem) | 2 / — | 3 / 2 | 2 / 2 |
+
+`--set full` 那一轮另外给出:基线 No Eligible 54.31%、Achieved Active Warps/SM
+7.87;C2 No Eligible 69.38%、Achieved Active Warps/SM 7.83。C2 的 warp 计数
+仍是两个 CTA 的量,但第二个 CTA 堵在 `tcgen05.alloc` 里空转——跟 Phase 1 记的
+512 列旧版同一个现象,warp 计数上活着、实际不干活。**基线那一栏的
+`Block Limit Shared Mem` 报 0,不可信**:动态 smem opt-in 超过 ncu 默认假设的
+48 KB carveout 之后这一栏就失真,判 CTA 数要看 `Achieved Active Warps / SM`。
+
+**B1 在 ncu 下有一个形状挂死,这本身是一条结论**。指定 metric 的少 pass 采集
+在四个形状上跑了一遍:
+
+| 形状(d128 b4 h32) | 基线 | B1 |
+|---|---|---|
+| s4096 non-causal | 正常 | 正常 |
+| s4096 causal | 正常 | 正常 |
+| s16384 non-causal | 正常 | 正常 |
+| **s16384 causal** | 正常 | **只写出一行 `Connected to process`,吃满 600 s timeout(两次复现)** |
+
+`--set full` 在 B1 上也两次跑满十几分钟后报 `==ERROR== An error occurred while
+trying to profile`。同一条命令在基线和 C2 上每个形状都正常,所以嫌疑在 kernel
+不在工具。正常发射下 B1 是干净的(golden 2280 双路、seq 扫描 14/14 含这个形状、
+8000 次定点两态),但 A2/A5 的前科正是「常规路径全绿、换个发射节奏就挂」,
+ncu 恰好就是换发射节奏。**这条没定位之前不要重开 B1**;复现命令是
+`p3_ncu_retry.sh b1-ts 1 16384`。
+
+#### warp stall 分解(每条已发射指令的 warp cycle,同一批采集)
+
+| stall 原因 | 基线(A1) | B1 | C2 | 基线 causal | C2 causal |
+|---|---|---|---|---|---|
+| selected(发射本身) | 1.000 | 1.00 | 1.000 | 1.00 | 1.00 |
+| wait(定长延迟依赖) | 0.996 | 0.92 | 1.034 | 0.99 | 1.02 |
+| long_scoreboard | 0.969 | 0.89 | 0.529 | 0.88 | 0.46 |
+| short_scoreboard | 0.429 | 0.51 | 0.402 | 0.37 | 0.38 |
+| not_selected | 0.306 | 0.27 | 0.049 | 0.31 | 0.05 |
+| **barrier** | **0.142** | 0.13 | 2.549 | 0.13 | 2.55 |
+| no_instruction | 0.138 | 0.13 | 0.141 | 0.13 | 0.15 |
+| branch_resolving | 0.124 | — | 0.279 | — | — |
+| sleeping | 0.000 | 0.00 | 0.310 | 0.00 | 0.31 |
+| membar | 0.000 | — | 0.000 | — | — |
+| 合计(`--set full` 全项) | 4.304 | — | 6.392 | — | — |
+
+后两列是 causal 的对照(d128 b4 h32 s16384):基线 8.643 ms / SM 47.72% /
+eligible 0.64,C2 13.938 ms / SM 31.14% / eligible 0.33,比值 0.620,跟 bench
+的 causal s16384 段 0.621 对得上。causal 与 non-causal 的 stall 形状几乎一样,
+说明 C2 的亏损跟 mask 无关,就是那一个 CTA。
+
+读这张表要注意一件事:这个 kernel 的 MMA 交接走的是 `mbarrier.try_wait.parity`
+自旋,**不计进 `barrier`**;`barrier` 只统计每个 tile 那一次 `__syncthreads()`。
+所以「基线的 barrier 只占 3.3%」的正确读法是「CTA 内的线程同步本身很便宜」,
+不能直接读成「等 MMA 不花时间」。
+
+#### Phase 4 / C1(完整 warp specialization)还值不值得做:值得,但立项理由要换
+
+Phase 3 这两条负结果把 C1 的论证方式改了。原来的说法是「barrier 开销大,
+warp specialization 去掉它」;实测下来基线的 `__syncthreads()` 只占 3.3%,
+**这个理由不成立**。真正的天花板是另一件事:
+
+- 每个 SM 只有 **1.97 个 active warp per scheduler**(2 CTA × 4 warp = 8 warp,
+  4 个 scheduler),其中只有 **0.60 个 eligible**,54% 的 scheduler cycle
+  无指令可发;
+- 最大的两块 stall 是 `wait`(0.996,定长延迟依赖,softmax 的 FFMA/exp2 链)
+  和 `long_scoreboard`(0.969,TMEM/global 读),两块加起来占 46%,**都是靠
+  「有别的 warp 可以发」来盖的延迟,不是靠调结构能消掉的**;
+- B1 证明了这一点的反面:它确实把 `long_scoreboard` 压到 0.89、`wait` 压到
+  0.92、L1 命中率提到 92%,但 eligible warp 一点没动(0.60 → 0.60),
+  端到端因此只有 +1.4%(还只在 non-causal 段),净收益归零;
+- C2 证明了另一面:在 128 线程的地基上腾挪 TMEM,拿走 occupancy 的代价
+  (0.65×)远大于结构重叠拿回来的。
+
+所以 C1 的立项理由应该是**把 warp 数从每 scheduler 2 个抬到 8 个**——
+cutedsl 用 16 warp 全特化跑到 62-67% SOL,对照基线的 44.8%,这才是那 2.31×
+的来源。**代价是 128 线程地基假设全改**(thread == S/O 行 == TMEM lane 的
+一一对应没了,softmax / correction / epilogue 全部要重写),属于重写级,
+不是增量优化。建议:**单独立项,别挂在 Phase 3 后面继续做增量**;立项前先
+在小 kernel 上验 `setmaxnreg` 在 sm100a 上编得过(sm90 有编译阻塞前科)。
+
+同时关掉两条:B1 这类「加深 KV 预取」和 C2 这类「TMEM 内腾挪」在 128 线程
+地基上都已实测判负,不要再试第三种排列。
+
 ## 6. 性能决策点
 
 | 项 | 机器 | 命令/指标 | 决策 |
@@ -999,6 +1172,7 @@ Phase 1 的计划预期是 ~0.78×,实测落在这个量级上,差的那点是 A
 | C-8 QMMA.SF go/no-go | sm120 | `bash bench/microbench/run_microbench.sh`,看 QMMA.SF(fp32 accum)相对 f8f8f32 的比率;同时记录 f8f8f16:f8f8f32 | full-rate → 立项 sm120 v2(block-scaled mma);f8f8f16 与 f8f8f32 同速 → 退役 fp32+fp16 路径。**已采数,见下表** |
 | H1/H4 sm90 wgmma 异步化 | H100/H200 | `ncu` 采 `sm__pipe_tensor_op_cycles_active / sm__cycles_active` 与 `smsp__warp_issue_stalled_barrier` | **按实验证据关闭,见下节**。重叠四件套已在 `cutedsl-sage-sm90` 上全部实测判负;提高 occupancy 的替代方向也判负 |
 | sm90 行和交给 tensor core | H200 | `bench/sm90_rowsum/bench_rowsum.py` 双向 A/B | **判负,见下节**。d64 慢 7.3~7.8%、d128 慢 17%,三个变体零个点变快 |
+| sm100 结构改动(128 线程地基上) | B200 | `p3_ab3.sh` 三方 A/B + `p3_report.py` | **判负,见 5f 的 Phase 3**。KV 统一 ring 几何均值 1.0004 且方向不一致,S 双缓冲 ping-pong 0.6508。要再往上走只剩完整 warp specialization(C1),单独立项 |
 
 C-8 实测(RTX PRO 6000 Blackwell,110 SM,nvcc 13.3,2026-08-29):
 
