@@ -30,6 +30,7 @@
 #include <torch/types.h>
 
 #include "../fused/fused.h"
+#include "arch.h"
 #include "config.h"
 #include "sageattn_build_config.h"
 #include "varlen.h"
@@ -41,19 +42,31 @@ namespace {
 // The fused kernel has no V^T to hold its first read in, so it reads V twice,
 // and its gather moves 32-byte pieces of a token row rather than whole lines.
 // That pays for itself only while the second pass still finds the first pass's
-// bytes in L2, which its own 2048-token round is the natural unit of. Measured
-// on sm_120 (V preparation alone, per-shape medians, b8 h16 d128): -41% at 512
-// tokens, -54% at 2048, -9% at 4096, then +10% at 5120 and +45% at 8192. Two
-// rounds is where it turns over.
-constexpr int64_t kFusedVQuantMaxTokens = 4096;
+// bytes in L2, so the turnover point is a cache property and per-arch:
+//  - sm_120 (V preparation alone, per-shape medians, b8 h16 d128): -41% at
+//    512 tokens, -54% at 2048, -9% at 4096, then +10% at 5120 and +45% at
+//    8192. Two of the kernel's 2048-token rounds is where it turns over.
+//  - sm_89 (L20, 96 MB L2; bench/P4_VFUSE_L20.md): fused wins at every
+//    b*h in {32,64,128,256} through 12288 padded tokens (0.80-0.85 of the
+//    two-kernel path even at 12288) and turns over at 16384 (1.04-1.10);
+//    12288 is the last grid point every arm still wins.
+//  - other arches: not swept yet, they inherit the sm_120 value.
+inline int64_t fused_v_quant_max_tokens(c10::DeviceIndex device)
+{
+    const CC cc = device_cc(device);
+    if (cc == CC{8, 9}) {
+        return 12288;
+    }
+    return 4096;
+}
 
 // Whether the two quant_v_fp8 composites below run the transpose and the fp8
 // quantization as one kernel instead of two. Both produce the same bits (the
 // fused kernel keeps the two-pass reduction order and permute), so every term
 // here is about timing or about what the kernel can address.
-inline bool use_fused_v_quant(int64_t head_dim, int64_t padded_tokens)
+inline bool use_fused_v_quant(int64_t head_dim, int64_t padded_tokens, c10::DeviceIndex device)
 {
-    return SAGEATTN_FUSED_V_QUANT != 0 && padded_tokens <= kFusedVQuantMaxTokens
+    return SAGEATTN_FUSED_V_QUANT != 0 && padded_tokens <= fused_v_quant_max_tokens(device)
            && transpose_quant_v_fp8_supported(head_dim);
 }
 
@@ -327,7 +340,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_cuda(c
     const int  layout_int = static_cast<int>(layout);
     const bool permute    = vl == VLayout::kMmaK16;
 
-    if (use_fused_v_quant(head_dim, padded_kv_len)) {
+    if (use_fused_v_quant(head_dim, padded_kv_len, value.get_device())) {
         transpose_quant_v_fp8_cuda(
             value, v_fp8, value_mean, v_scale, static_cast<float>(scale_max), layout_int, permute);
     }
@@ -416,7 +429,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> quant_v_fp8_varlen
 
     // The gate takes max_seqlen: every sequence runs the same kernel, so the
     // longest one decides which is cheaper for the batch.
-    if (use_fused_v_quant(head_dim, at::round_up<int64_t>(max_k, pad_multiple))) {
+    if (use_fused_v_quant(head_dim, at::round_up<int64_t>(max_k, pad_multiple), value.get_device())) {
         transpose_quant_v_fp8_cuda(
             value, v_fp8, value_mean, v_scale, static_cast<float>(scale_max), layout_int, permute, varlen);
     }
