@@ -56,7 +56,7 @@ set(SAGE_ARCHS_SM120 "")   # major == 12              plain
 # plan(backend=...) and the raw qattn_sm80_*/qattn_sm89_* ops can still pick a
 # family on a device whose SASS was pruned, turning a working launch into
 # cudaErrorNoKernelImageForDevice. Pruned entries also lose their +PTX copy.
-option(SAGE_PRUNE_GENCODE "Prune per-group gencode entries covered by another group" OFF)
+option(SAGE_PRUNE_GENCODE "Prune per-group gencode entries covered by another group" ON)
 
 set(_sage_has_sub89_8x FALSE)
 foreach(cc IN LISTS SAGE_REQUESTED_ARCHS)

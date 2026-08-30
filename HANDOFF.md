@@ -1,13 +1,13 @@
 # SageAttention 交接文档(2026-08-30,收尾会话后)
 
-新会话读本文件即可接续。分支 `feat/varlen`(未 push),线性历史 = 两轮重构 + varlen + 全部优化/修复 + 本轮收尾(整理净 −1191 行、C1 WS kernel、P2/P4 落袋);工作树应干净。本轮完整账目(收益表、判负、挂账)在 `bench/FINAL_PASS_REPORT.md`,先读它。
+新会话读本文件即可接续。分支 `feat/varlen`(已 push origin),线性历史 = 两轮重构 + varlen + 全部优化/修复 + 本轮收尾(整理净 −1191 行、C1 WS kernel、P2/P4 落袋);工作树应干净。本轮完整账目(收益表、判负、挂账)在 `bench/FINAL_PASS_REPORT.md`,先读它。
 
 ## 1. 机器与环境
 
 | 机器 | 连接 | GPU | 环境 | 工作目录(清理后) |
 |---|---|---|---|---|
 | 本机 | — | RTX 3080Ti Laptop(sm_86) | `/home/ubuntu/miniconda3/envs/torch/bin/python`(torch 2.13.0+cu132,nvcc 13.3;**别用 .venv**);cmake/ninja 用同 env 的 | 本仓库,editable install 就绪;**本机 golden:`~/sage-golden-local/{full,full2}`**(1493/1541) |
-| hyper01(H200×8, sm_90) | `ssh hyper01 "docker exec sglang-diffusion-triplemu bash -c '<cmd>'"` | **卡有他人任务,现场挑空卡**;功耗 cap,亚 1% 信号必须 ncu 锁基频仲裁 | `source /workspace/.sglang/bin/activate` | `/workspace/{sage-w3,sage-w4}`(a264fc0 / 终验树);golden `/workspace/sage-golden-sm90`;证据 `/workspace/{sm90-7a64fc0,p2-sm90,sage-evidence-archive}`;待裁决 `SageAttention-rowsum` |
+| hyper01(H200×8, sm_90) | `ssh hyper01 "docker exec sglang-diffusion-triplemu bash -c '<cmd>'"` | **卡有他人任务,现场挑空卡**;功耗 cap,亚 1% 信号必须 ncu 锁基频仲裁 | `source /workspace/.sglang/bin/activate` | `/workspace/{sage-w3,sage-w4}`(a264fc0 / 终验树);golden `/workspace/sage-golden-sm90`;证据 `/workspace/{sm90-7a64fc0,p2-sm90,sage-evidence-archive}`;`SageAttention-rowsum`(判负试验 diff,用户拍板保留) |
 | pro-5k(PRO 6000×8, sm_120) | `ssh pro-5k "docker exec sglang-diffusion-triplemu-inference bash -c '<cmd>'"` | 常空,GPU 0 | `source /workspace/sgl-env/bin/activate` | `/workspace/SageAttention-refactor/{baseline,golden-sm120,archive/}`;**注意 `/workspace/SageAttention` 有 4 个未 push commit(v2g 工作),别动** |
 | ComputeLab(L20/B200/A100) | `ssh computelab-sc`,csh 登陆节点,**非交互命令必 bash -c 包裹,多步写脚本 scp 执行** | Slurm+Pyxis | `clab.py -p {b200x4,l20x1,a100x1} --sqsh .../pytorch_26.07-py3.sqsh alloc`;**--sqsh 第一条命令就要带(默认 cu130 镜像编不了 sm_100a);多任务显式 --job-id;完毕必 cancel** | 容器把 `/home/scratch.sonlin_wwfo/workspace/nvidia` 挂为 `/workspace`;树 `SageAttention_refactor/{baseline,sage-w4,golden-sm100,sm89/,scripts/,logs*}` |
 
@@ -29,7 +29,7 @@
 - **`SAGEATTN_SM100_WS` 三态**:未设=auto(d128 且 qo_len≥16384 非 causal / ≥32768 causal 自动走 WS kernel)、`1`=强制 WS、`0`=强制旧(跑旧路 golden/SS oracle 必须显式 0)。
 - V 融合门限 per-arch:sm89=12288、sm100/110=24576、其余 4096(quant_cuda.cu `fused_v_quant_max_tokens`);两路 bit 等价,换路不动 golden。
 - quant kernel:per_warp/per_thread 家族 dense/varlen 双实例;per-block 家族 dense 仍走 kVarlen=true 实例(H200 判据,见 FINAL_PASS_REPORT §3)。
-- `SAGE_PRUNE_GENCODE`(默认 OFF):GO 建议在案(build CPU −36%/体积 −38%),转正待用户拍板。
+- `SAGE_PRUNE_GENCODE`(**默认 ON**,2026-08-30 用户拍板):build CPU −36%/体积 −38%;cc12 机上显式请求 sm89 家族对拍需 -DSAGE_PRUNE_GENCODE=OFF 重建。
 
 ## 4. 已完成 / 判负 / 挂账
 
@@ -39,4 +39,4 @@
 
 - memory 目录(`~/.claude/projects/-home-ubuntu-workspace-github-llm-SageAttention/memory/`)有全部教训索引;协作纪律:多会话 worktree 隔离、改动一成形就 commit、共享 kernel 文件先协调、**给 subagent 的 worktree 初始 HEAD 可能指错,第一步 reset --hard 到指定 SHA**。
 - `sageattention3_blackwell` 不入 wheel;`native_quant_op.py`、`.idea/`、`refs/`、`sageattention-patches*` 不入库(git add -A 会误收,用显式路径)。
-- feat/varlen 未 push;push/PR 待用户确认。
+- feat/varlen 已 push 到 origin(2026-08-30);PR 待用户确认。

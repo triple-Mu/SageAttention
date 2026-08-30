@@ -22,7 +22,7 @@ C1 迭代史:r1 两遍读 0.883 → r2 单遍驻留 0.947 → r3 2×x64 宽 ld +
 |---|---|---|
 | 代码整理(批 1-4) | **净 −1191 行**(45 文件,+1700/−2891):过渡 op 退役 −753、死代码 −582、base launcher −295、launcher/宏/fused 收拢 −402、kernel body 去重 −106、Python 整理与命名 +附带;2005 个 kernel 与基线 SASS 逐字节全同 | scratchpad `sassd_gateB/gateC`、`build_w4` 对比 |
 | fwd 加 `backend=` 覆写 | 对拍跨家族覆盖保住,五机 golden 零重 dump(RETIRED markers 兼容层) | tools/compare_reference.py |
-| Track D gencode 裁剪(`SAGE_PRUNE_GENCODE`,默认 OFF 待拍板) | build CPU **−36.1%**、so 体积 **−38.0%**(118.7→73.6MB)、cubin 51→40 与决策表逐条一致;GO 建议在案,敞口=cc12 上 sm89 家族对拍需 OFF 重建 | bench/microbench/PRESCREEN_REPORT.md §4、`prescreen_data/trackd_*` |
+| Track D gencode 裁剪(`SAGE_PRUNE_GENCODE`,**已转正默认 ON**) | build CPU **−36.1%**、so 体积 **−38.0%**(118.7→73.6MB)、cubin 51→40 与决策表逐条一致;已转正;敞口=cc12 上 sm89 家族对拍需 OFF 重建 | bench/microbench/PRESCREEN_REPORT.md §4、`prescreen_data/trackd_*` |
 | resolve 显式 backend 干净报错 | 撞未编 SASS 由 no-kernel-image 变 TORCH_CHECK 带 cure | csrc/sageattn/plan.cpp `backend_serves` |
 | 测试补全 | test_varlen_sm89/sm120 各 62 kernel 级 packed 用例(sm120@pro-5k、sm89@L20 全过);sm89 fp8 accuracy 数值采齐(最差 cos 0.999296) | test/、HARDWARE_CHECKLIST §1b |
 | varlen 零开销审计 | attention 侧本就是独立实例零开销(SASS/param 布局审计固化);quant 侧残余税裁决维持,超阈值的实例已由 P2 拆分 | PRESCREEN_REPORT.md Track D 节 |
@@ -42,7 +42,7 @@ C1 迭代史:r1 两遍读 0.883 → r2 单遍驻留 0.947 → r3 2×x64 宽 ld +
 
 - P9 `fp32+fp16` 退役:等 4090 跑 `bench/microbench/mma_rate.cu`(org 内无卡,消费级 Ada 2× 速率变数);
 - 4090 的 P4 门限复核(72MB L2 < L20 的 96MB,拐点可能早于 12288);
-- `SAGE_PRUNE_GENCODE` 转正:GO 建议在案,默认值未动等拍板;
+
 - sm80 fold hunk 回收(三平台合议建议,17 行换简单性);
 - C1 下一 lever:ld 与首消费点间填独立工作(需重开 bit-exact 论证);sm100 varlen(等 C1 定型);
-- 三处清理待裁决:hyper01 `SageAttention-rowsum`(179M 独有试验 blob)、pro-5k `/workspace/SageAttention`(4 个未 push commit + v2g 分支)、computelab 14 个历史目录(~2.0G,证据类建议保留、构建树类可删)。
+- 清理终审(2026-08-30 用户拍板):computelab 7 个历史构建树已删(~1.7G);hyper01 `SageAttention-rowsum`(独有试验 diff)与 pro-5k `/workspace/SageAttention`(v2g 未 push 工作)保留。证据类目录(kbd_*/profiles/golden_fixq/cdsl_src)保留。
