@@ -1,0 +1,44 @@
+
+== attn pair <...3_2EfLb0E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0E>
+  dense : 3760 instrs, 24 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/4B 9:+0x44/4B 10:+0x48/4B 11:+0x50/8B 12:+0x58/4B 13:+0x60/8B 14:+0x68/8B 15:+0x70/4B 16:+0x78/8B 17:+0x80/8B 18:+0x88/4B 19:+0x90/8B 20:+0x98/8B 21:+0xa0/4B 22:+0xa8/8B 23:+0xb0/4B
+  varlen: 3880 instrs, 27 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/8B 9:+0x48/8B 10:+0x50/4B 11:+0x54/4B 12:+0x58/4B 13:+0x5c/4B 14:+0x60/8B 15:+0x68/4B 16:+0x70/8B 17:+0x78/8B 18:+0x80/4B 19:+0x88/8B 20:+0x90/8B 21:+0x98/4B 22:+0xa0/8B 23:+0xa8/8B 24:+0xb0/4B 25:+0xb8/8B 26:+0xc0/4B
+  param bytes dense=160 varlen=180 (delta 20; expected +20 = 2x8B cu_seqlens ptrs + 3x4B strides - 2x4B qo/kv_len)
+  dense LDG census: {'LDG.E.CONSTANT': 4, 'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDGDEPBAR': 7}
+  varlen LDG census: {'LDG.E.CONSTANT': 8, 'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDGDEPBAR': 7}
+
+== attn pair <...3_2EfLb0E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb1ELb0E>
+  dense : 3792 instrs, 24 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/4B 9:+0x44/4B 10:+0x48/4B 11:+0x50/8B 12:+0x58/4B 13:+0x60/8B 14:+0x68/8B 15:+0x70/4B 16:+0x78/8B 17:+0x80/8B 18:+0x88/4B 19:+0x90/8B 20:+0x98/8B 21:+0xa0/4B 22:+0xa8/8B 23:+0xb0/4B
+  varlen: 3912 instrs, 27 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/8B 9:+0x48/8B 10:+0x50/4B 11:+0x54/4B 12:+0x58/4B 13:+0x5c/4B 14:+0x60/8B 15:+0x68/4B 16:+0x70/8B 17:+0x78/8B 18:+0x80/4B 19:+0x88/8B 20:+0x90/8B 21:+0x98/4B 22:+0xa0/8B 23:+0xa8/8B 24:+0xb0/4B 25:+0xb8/8B 26:+0xc0/4B
+  param bytes dense=160 varlen=180 (delta 20; expected +20 = 2x8B cu_seqlens ptrs + 3x4B strides - 2x4B qo/kv_len)
+  dense LDG census: {'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDG.E.CONSTANT': 4, 'LDGDEPBAR': 7}
+  varlen LDG census: {'LDG.E.CONSTANT': 8, 'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDGDEPBAR': 7}
+
+== attn pair <...3_2EfLb0E13__nv_bfloat16L11ComputeUnit0EL8MaskMode1ELb0ELb0E>
+  dense : 4008 instrs, 24 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/4B 9:+0x44/4B 10:+0x48/4B 11:+0x50/8B 12:+0x58/4B 13:+0x60/8B 14:+0x68/8B 15:+0x70/4B 16:+0x78/8B 17:+0x80/8B 18:+0x88/4B 19:+0x90/8B 20:+0x98/8B 21:+0xa0/4B 22:+0xa8/8B 23:+0xb0/4B
+  varlen: 4480 instrs, 27 params: 0:+0x0/8B 1:+0x8/8B 2:+0x10/8B 3:+0x18/8B 4:+0x20/8B 5:+0x28/8B 6:+0x30/8B 7:+0x38/8B 8:+0x40/8B 9:+0x48/8B 10:+0x50/4B 11:+0x54/4B 12:+0x58/4B 13:+0x5c/4B 14:+0x60/8B 15:+0x68/4B 16:+0x70/8B 17:+0x78/8B 18:+0x80/4B 19:+0x88/8B 20:+0x90/8B 21:+0x98/4B 22:+0xa0/8B 23:+0xa8/8B 24:+0xb0/4B 25:+0xb8/8B 26:+0xc0/4B
+  param bytes dense=160 varlen=180 (delta 20; expected +20 = 2x8B cu_seqlens ptrs + 3x4B strides - 2x4B qo/kv_len)
+  dense LDG census: {'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDG.E.CONSTANT': 4, 'LDGDEPBAR': 7}
+  varlen LDG census: {'LDG.E.CONSTANT': 8, 'LDGSTS.E.BYPASS.LTC128B.128': 44, 'LDGDEPBAR': 7}
+
+== quant/fused cu_seqlens sentinel blocks (P2 static baseline)
+ QuantPerThreadQInt8Kernel:
+    total  256  varlen-only block  57 instrs (22.3%)  [param@+0x60, skip 0xc0->0x460; dense path pays 2 ISETP + 1 BRA]
+    total  392  varlen-only block  59 instrs (15.1%)  [param@+0x60, skip 0xc0->0x480; dense path pays 2 ISETP + 1 BRA]
+ QuantPerThreadKInt8Kernel:
+    total  776  varlen-only block  57 instrs (7.3%)  [param@+0x78, skip 0xa0->0x440; dense path pays 2 ISETP + 1 BRA]
+    total  816  varlen-only block  59 instrs (7.2%)  [param@+0x78, skip 0xa0->0x460; dense path pays 2 ISETP + 1 BRA]
+ QuantInt8Kernel:
+    total  264  varlen-only block  60 instrs (22.7%)  [param@+0x78, skip 0xa0->0x470; dense path pays 2 ISETP + 1 BRA]
+    total  296  varlen-only block  59 instrs (19.9%)  [param@+0x78, skip 0xa0->0x460; dense path pays 2 ISETP + 1 BRA]
+ TransposeQuantFp8Kernel:
+    total 2216  varlen-only block  13 instrs (0.6%)  [param@+0x78, skip 0x70->0x150; dense path pays 2 ISETP + 1 BRA]
+    total 2224  varlen-only block  13 instrs (0.6%)  [param@+0x78, skip 0x70->0x150; dense path pays 2 ISETP + 1 BRA]
+ SubMeanKernel:
+    total   80  no pointer null-test found
+    total   64  no pointer null-test found
+ TransposePadPermuteKernel:
+    total  128  varlen-only block  36 instrs (28.1%)  [param@+0x48, skip 0x70->0x2c0; dense path pays 2 ISETP + 1 BRA]
+    total  136  varlen-only block  36 instrs (26.5%)  [param@+0x48, skip 0x70->0x2c0; dense path pays 2 ISETP + 1 BRA]
+ MeanScaleKernel:
+    total  584  varlen-only block  34 instrs (5.8%)  [param@+0x78, skip 0x90->0x2c0; dense path pays 2 ISETP + 1 BRA]
+    total  712  varlen-only block  34 instrs (4.8%)  [param@+0x78, skip 0x90->0x2c0; dense path pays 2 ISETP + 1 BRA]
