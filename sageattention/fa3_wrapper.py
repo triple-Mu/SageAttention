@@ -1,4 +1,26 @@
-from typing import Any, Optional
+"""
+Copyright (c) 2024 by SageAttention team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+FlashAttention-3 baselines for the benchmarks and examples, wrapped in the
+sageattn calling convention (the examples install them as
+F.scaled_dot_product_attention).
+"""
+
+from typing import Optional
 
 import torch
 
@@ -18,8 +40,15 @@ def fa3(
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
-    **kwargs: Any,
+    *,
+    # SDPA drop-in compatibility (the examples pass attn_mask/dropout_p);
+    # accepted and ignored, exactly as the old **kwargs swallowed them
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
 ):
+    del attn_mask, dropout_p, scale, enable_gqa
     dtype = q.dtype
     assert FA3_ENABLED, "FA3 not available"
     assert q.is_cuda, "Input tensors must be on cuda."
@@ -50,8 +79,14 @@ def fa3_fp8(
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
-    **kwargs: Any,
+    *,
+    # SDPA drop-in compatibility; accepted and ignored, as in fa3 above
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
 ):
+    del attn_mask, dropout_p, scale, enable_gqa
     dtype = q.dtype
     assert FA3_ENABLED, "FA3 not available"
     assert q.is_cuda, "Input tensors must be on cuda."
