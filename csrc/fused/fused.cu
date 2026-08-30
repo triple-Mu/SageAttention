@@ -52,11 +52,16 @@
 #define SAGE_QUANT_MEAN_REMAT 0
 #endif
 
+// kVarlen splits the dense and packed-layout instances: the dense one folds
+// seq_base/scale_slot and drops the cu_seqlens sentinel (see the
+// QuantPerThreadQInt8Kernel comment in quant_per_thread.cu); the varlen one
+// keeps the runtime null test so its instruction stream stays the pre-split one.
 template<uint32_t head_dim,
          uint32_t CTA_TOKENS,
          uint32_t num_pack_per_thread = 1,
          bool     has_sm_scale        = false,
          bool     sub_mean            = false,
+         bool     kVarlen             = false,
          typename T>
 __global__ void SAGE_QUANT_BOUNDS(CTA_TOKENS*(head_dim / 8) / num_pack_per_thread) QuantInt8Kernel(T* __restrict__ input,
                                 T* __restrict__ mean,
@@ -107,15 +112,17 @@ __global__ void SAGE_QUANT_BOUNDS(CTA_TOKENS*(head_dim / 8) / num_pack_per_threa
     uint32_t seq_tokens = num_tokens;
     int64_t  seq_base   = 0;
     uint32_t scale_slot = token_cta_idx;
-    if (cu_seqlens != nullptr) {
-        seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
-        const uint32_t ctas_per_blk = scale_blk_tokens / CTA_TOKENS;
-        if (token_cta_idx >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
-            return;
+    if constexpr (kVarlen) {
+        if (cu_seqlens != nullptr) {
+            seq_tokens                  = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+            const uint32_t ctas_per_blk = scale_blk_tokens / CTA_TOKENS;
+            if (token_cta_idx >= ((seq_tokens + scale_blk_tokens - 1) / scale_blk_tokens) * ctas_per_blk) {
+                return;
+            }
+            seq_base   = sage::seq_offset(cu_seqlens, batch_id);
+            scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
+                         + token_cta_idx;
         }
-        seq_base   = sage::seq_offset(cu_seqlens, batch_id);
-        scale_slot = static_cast<uint32_t>(sage::blk_offset(cu_seqlens, batch_id, scale_blk_tokens)) * ctas_per_blk
-                     + token_cta_idx;
     }
 
     uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
@@ -302,7 +309,9 @@ __global__ void SubMeanKernel(T* __restrict__ input,
     }
 }
 
-template<uint32_t head_dim, uint32_t CTA_TOKENS, bool pad_zero = false, bool permute = true, typename T>
+// kVarlen: same dense/varlen instance split as QuantInt8Kernel above.
+template<uint32_t head_dim, uint32_t CTA_TOKENS, bool pad_zero = false, bool permute = true, bool kVarlen = false,
+         typename T>
 __global__ void TransposePadPermuteKernel(T* __restrict__ input,
                                           T* __restrict__ output,
                                           const uint32_t num_tokens,
@@ -339,13 +348,15 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
     uint32_t seq_tokens = num_tokens;
     int64_t  seq_base   = 0;
     int64_t  pad_base   = 0;
-    if (cu_seqlens != nullptr) {
-        seq_tokens = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
-        if (token_cta_idx * CTA_TOKENS >= seq_tokens) {
-            return;
+    if constexpr (kVarlen) {
+        if (cu_seqlens != nullptr) {
+            seq_tokens = static_cast<uint32_t>(sage::seq_len(cu_seqlens, batch_id));
+            if (token_cta_idx * CTA_TOKENS >= seq_tokens) {
+                return;
+            }
+            seq_base = sage::seq_offset(cu_seqlens, batch_id);
+            pad_base = sage::pad_offset(cu_seqlens, batch_id, pad_tokens);
         }
-        seq_base = sage::seq_offset(cu_seqlens, batch_id);
-        pad_base = sage::pad_offset(cu_seqlens, batch_id, pad_tokens);
     }
 
     uint32_t thread_base_token = token_cta_idx * CTA_TOKENS + thread_id / num_threads_per_token;
@@ -412,6 +423,10 @@ __global__ void TransposePadPermuteKernel(T* __restrict__ input,
         *(float4*)(&smem_store_tile[thread_id / num_threads_per_cta][thread_id % num_threads_per_cta * pack_size]);
 }
 
+// No kVarlen split here: the varlen prologue sits outside the token loops
+// that dominate this kernel (it only launches on the two-pass V path, i.e.
+// padded_tokens > 4096), so a dense instance saves ~6-26 one-off instructions
+// per thread while doubling the largest instance bodies of the fused TU.
 template<uint32_t pad_size, bool sub_mean = false, typename T>
 __global__ void MeanScaleKernel(T* __restrict__ input,
                                 int8_t* __restrict__ output,
@@ -641,6 +656,9 @@ constexpr int kVQuantThreads = 256;
 // row - it covers chunk_size channels rather than one, so a gather is a 32-byte
 // piece of a token row (a whole DRAM sector, no waste) instead of a 128-byte
 // line.
+// No kVarlen split here: the varlen-only block is 13 instructions of a
+// 2216-3272 instruction body (0.6%), all outside the token loops, so a dense
+// instance buys nothing measurable and doubles the biggest bodies of the TU.
 template<uint32_t chunk_size, uint32_t pad_size, bool sub_mean = false, bool permute = true, typename T>
 __global__ void TransposeQuantFp8Kernel(const T* __restrict__ input,
                                         int8_t* __restrict__ output,
@@ -956,8 +974,11 @@ void quant_per_block_int8_cuda(torch::Tensor        input,
     dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);                                   \
     constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;                                   \
     dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);                                                     \
-    QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, c_type>                            \
-        <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),                                      \
+    auto* kernel = is_varlen ? QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, true,   \
+                                               c_type> :                                                               \
+                               QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, false,  \
+                                               c_type>;                                                                \
+    kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),                                    \
                                      nullptr,                                                                          \
                                      output.data_ptr<int8_t>(),                                                        \
                                      reinterpret_cast<float*>(scale.data_ptr()),                                       \
@@ -1046,8 +1067,10 @@ void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor      input,
 
                 dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                auto* kernel =
+                    is_varlen ? QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, true, c_type> :
+                                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, false, c_type>;
+                kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),
                                                  reinterpret_cast<float*>(scale.data_ptr()),
@@ -1118,8 +1141,11 @@ void quant_per_warp_int8_cuda(torch::Tensor      input,
 
                     dim3 block(WARP_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
-                    QuantInt8Kernel<HEAD_DIM, WARP_TOKENS, num_pack_per_thread, false, false, c_type>
-                        <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                    auto* kernel =
+                        is_varlen ?
+                            QuantInt8Kernel<HEAD_DIM, WARP_TOKENS, num_pack_per_thread, false, false, true, c_type> :
+                            QuantInt8Kernel<HEAD_DIM, WARP_TOKENS, num_pack_per_thread, false, false, false, c_type>;
+                    kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                      nullptr,
                                                      output.data_ptr<int8_t>(),
                                                      reinterpret_cast<float*>(scale.data_ptr()),
@@ -1374,9 +1400,11 @@ static void transpose_pad_impl(
 
             dim3 block(CTA_TOKENS * (HEAD_DIM / 8));
 
+            const bool is_varlen = varlen.cu_seqlens != nullptr;
             if (permute) {
-                TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, true, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                auto* kernel = is_varlen ? TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, true, true, c_type> :
+                                           TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, true, false, c_type>;
+                kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(output.data_ptr()),
                                                  num_tokens,
                                                  stride_batch_input,
@@ -1390,8 +1418,9 @@ static void transpose_pad_impl(
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             else {
-                TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, false, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
+                auto* kernel = is_varlen ? TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, false, true, c_type> :
+                                           TransposePadPermuteKernel<HEAD_DIM, CTA_TOKENS, true, false, false, c_type>;
+                kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(output.data_ptr()),
                                                  num_tokens,
                                                  stride_batch_input,
