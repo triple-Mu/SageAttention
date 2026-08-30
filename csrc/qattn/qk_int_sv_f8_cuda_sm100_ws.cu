@@ -78,8 +78,6 @@ enum class MaskMode {
 };
 
 enum class QuantGranularity {
-    kPerTensor = 0,
-    kPerBlock  = 1,
     kPerWarp   = 2,
     kPerThread = 3,
 };
@@ -459,11 +457,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         const uint32_t num_qblocks = div_ceil(qo_len, CTA_Q);
         const uint32_t qblk        = min(2 * cta_idx_q + tile, num_qblocks - 1);
         int64_t        q_scale_idx;
-        if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-            q_scale_idx = static_cast<int64_t>(batch_id) * num_qo_heads * num_qblocks
-                          + static_cast<int64_t>(head_id) * num_qblocks + qblk;
-        }
-        else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
+        if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
             const uint32_t num_warp_tiles_q = num_qblocks * (CTA_Q / 32);
             q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
                           + static_cast<int64_t>(head_id) * num_warp_tiles_q + qblk * (CTA_Q / 32) + lane_row / 32;
@@ -476,7 +470,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         }
 
         const float* K_scale_base_ptr;
-        if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
+        if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
             const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
             K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
                                + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
@@ -487,8 +481,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                                + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
                                + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
         }
-        constexpr uint32_t k_scale_advance_offset =
-            (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+        constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
         const float q_scale = Q_scale[q_scale_idx];
 

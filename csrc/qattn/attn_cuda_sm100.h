@@ -23,6 +23,8 @@
 namespace sage {
 namespace sm100 {
 
+torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
+                                                        torch::Tensor key,
                                                         torch::Tensor value,
                                                         torch::Tensor output,
                                                         torch::Tensor query_scale,
