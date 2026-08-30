@@ -20,7 +20,7 @@ from typing import Literal, Optional, Set, Tuple, Union, overload
 import torch
 
 from ._layout import _seq_nh_dims
-from ._plan import get_plan
+from ._plan import Plan, get_plan
 
 # The v2.x truncated log2(e) literal, kept on purpose: the kernel-side constant
 # (csrc/math.cuh) is a separate full-precision value, so aligning this one to
@@ -28,6 +28,17 @@ from ._plan import get_plan
 _LOG2E_V2 = 1.44269504
 
 _warned_configs: Set[Tuple[Tuple[int, int], str]] = set()
+
+
+def _warn_smooth_v_ignored(p: Plan, cc: Tuple[int, int], message: str) -> None:
+    """Warn once per (cc, pv_accum_dtype) when the plan drops a smooth_v
+    request. stacklevel=3 skips this helper and the entry point, landing on
+    the caller's line exactly as the previously inlined stacklevel=2 did."""
+    if p.smooth_v_ignored and not torch.compiler.is_compiling():
+        key = (cc, p.pv_accum_dtype)
+        if key not in _warned_configs:
+            _warned_configs.add(key)
+            warnings.warn(message, stacklevel=3)
 
 
 def _check_qkv_common(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -203,13 +214,9 @@ def sageattn(
     cc = torch.cuda.get_device_capability(q.device.index)
     p = get_plan(cc, q.size(-1), qk_quant_gran, pv_accum_dtype, smooth_v)
 
-    if p.smooth_v_ignored and not torch.compiler.is_compiling():
-        key = (cc, p.pv_accum_dtype)
-        if key not in _warned_configs:
-            _warned_configs.add(key)
-            warnings.warn(
-                f"pv_accum_dtype is '{p.pv_accum_dtype}', smooth_v will be ignored.", stacklevel=2
-            )
+    _warn_smooth_v_ignored(
+        p, cc, f"pv_accum_dtype is '{p.pv_accum_dtype}', smooth_v will be ignored."
+    )
 
     seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
 

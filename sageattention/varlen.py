@@ -28,13 +28,12 @@ region. The one thing that would break that is a shape derived from tensor
 so Dynamo never has to read ``cu_seqlens`` to size an output.
 """
 
-import warnings
 from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
 from ._plan import get_plan
-from .core import _LOG2E_V2, _check_qkv_common, _pad_qkv_head_dim, _warned_configs
+from .core import _LOG2E_V2, _check_qkv_common, _pad_qkv_head_dim, _warn_smooth_v_ignored
 
 # Backends with a packed-layout attention kernel, mirroring the dispatch table
 # in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
@@ -226,11 +225,7 @@ def sageattn_varlen(
 
     cc = torch.cuda.get_device_capability(q.device.index)
     p = get_plan(cc, q.size(-1), qk_quant_gran, pv_accum_dtype, smooth_v, varlen=True)
-    if p.smooth_v_ignored and not torch.compiler.is_compiling():
-        key = (cc, p.pv_accum_dtype)
-        if key not in _warned_configs:
-            _warned_configs.add(key)
-            warnings.warn("smooth_v has no varlen kernel and will be ignored.", stacklevel=2)
+    _warn_smooth_v_ignored(p, cc, "smooth_v has no varlen kernel and will be ignored.")
     if p.backend not in _VARLEN_BACKENDS:
         raise NotImplementedError(
             f"sageattn_varlen has packed-layout kernels for {sorted(_VARLEN_BACKENDS)}; "
