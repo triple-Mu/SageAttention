@@ -16,55 +16,17 @@ limitations under the License.
 ---
 
 FakeTensor kernels for the torch.ops.sageattention attention ops (needed for
-torch.compile). The mutating quantization ops return () and need no fake; the
-qattn ops return the lse tensor, whose shape depends only on op arguments.
-
-Every qattn op shares the trailing flag signature
-    (..., str tensor_layout, bool is_causal, str qk_quant_gran,
-     float sm_scale, bool return_lse)
-so one fake body serves all of them, reading the flags from the tail.
+torch.compile). The mutating quantization ops return () and need no fake.
 """
 
 from typing import Tuple
 
 import torch
 
-_QATTN_OPS = [
-    "qattn_sm80_qk_int8_sv_f16_accum_f32_attn",
-    "qattn_sm80_qk_int8_sv_f16_accum_f16_attn",
-    "qattn_sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf",
-    "qattn_sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn",
-    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
-    "qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
-    "qattn_sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
-    "qattn_sm90_qk_int8_sv_f8_accum_f32_attn_inst_buf",
-    "qattn_sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
-    "qattn_sm100_qk_int8_sv_f8_accum_f32_attn",
-    "qattn_sm100_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-    "qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-    "qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
-    "qattn_sm120_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
-]
-
 
 def _seq_nh_dims(tensor_layout: str) -> Tuple[int, int]:
     """(seq_dim, num_heads_dim) for a 4D q/k/v tensor in `tensor_layout`."""
     return (1, 2) if tensor_layout == "NHD" else (2, 1)
-
-
-def _qattn_fake(*args):
-    query = args[0]
-    tensor_layout = args[-5]
-    return_lse = args[-1]
-    seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
-    qo_len, num_qo_heads = query.size(seq_dim), query.size(nh_dim)
-    if return_lse:
-        return torch.empty(
-            (query.size(0), num_qo_heads, qo_len), dtype=torch.float32, device=query.device
-        )
-    # matches the C++ side: an empty CPU float placeholder when lse is off
-    return torch.empty((0,))
 
 
 def _fwd_fake(
@@ -263,13 +225,6 @@ def _sub_mean_v_fake(value, *, tensor_layout="HND"):
 
 
 def _register() -> None:
-    for name in _QATTN_OPS:
-        # ops of arch families not compiled into this build have no schema
-        try:
-            getattr(torch.ops.sageattention, name)
-        except AttributeError:
-            continue
-        torch.library.register_fake(f"sageattention::{name}")(_qattn_fake)
     torch.library.register_fake("sageattention::fwd")(_fwd_fake)
     torch.library.register_fake("sageattention::fwd_varlen")(_fwd_varlen_fake)
     torch.library.register_fake("sageattention::quant_qk")(_quant_qk_fake)

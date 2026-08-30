@@ -19,14 +19,10 @@
 // Layers:
 //   - 8 low-level quantization ops (mutating, -> (), no fake needed): the
 //     former pybind11 _fused surface, overloads merged via optional args.
-//   - per-arch attention ops qattn_smXX_* (mutating output, return lse):
-//     1:1 with the historical per-arch pybind functions; string/bool flags
-//     replace the magic-int API. Guarded by SAGEATTN_BUILD_SMXX.
 //   - host query ops: plan (dispatch decision table) and compiled_archs.
 //
-// This TU is host-only: it sees the launcher declarations (namespaced per
-// arch in the attn_cuda_*.h headers) and the fused.h declarations; kernels
-// live in their own TUs.
+// This TU is host-only: it sees the fused.h declarations; kernels live in
+// their own TUs. The attention ops (fwd / fwd_varlen) register in theirs.
 
 #include <optional>
 #include <string>
@@ -41,22 +37,6 @@
 #include "sageattn_build_config.h"
 #include "varlen_check.h"
 
-#if SAGEATTN_BUILD_SM80
-#include "../qattn/attn_cuda_sm80.h"
-#endif
-#if SAGEATTN_BUILD_SM89
-#include "../qattn/attn_cuda_sm89.h"
-#endif
-#if SAGEATTN_BUILD_SM90
-#include "../qattn/attn_cuda_sm90.h"
-#endif
-#if SAGEATTN_BUILD_SM100
-#include "../qattn/attn_cuda_sm100.h"
-#endif
-#if SAGEATTN_BUILD_SM120
-#include "../qattn/attn_cuda_sm120.h"
-#endif
-
 namespace sage {
 namespace {
 
@@ -65,13 +45,6 @@ namespace {
 inline int layout_flag(c10::string_view s)
 {
     return static_cast<int>(parse_tensor_layout(s));
-}
-inline int gran_flag(c10::string_view s)
-{
-    QuantGran g = parse_quant_gran(s);
-    TORCH_CHECK(g == QuantGran::kPerWarp || g == QuantGran::kPerThread,
-                "qk_quant_gran must be \"per_warp\" or \"per_thread\" for attention ops");
-    return static_cast<int>(g);
 }
 
 // ---------------------------------------------------------------- fused ops
@@ -211,131 +184,6 @@ void mean_scale_fuse_quant(const at::Tensor& input,
                                layout_flag(tensor_layout));
 }
 
-// ------------------------------------------------- per-arch attention shims
-// The kernel launchers keep their historical int-flag signatures; these shims
-// translate the string/bool op arguments once per call.
-
-using BaseFn   = torch::Tensor (*)(torch::Tensor,
-                                 torch::Tensor,
-                                 torch::Tensor,
-                                 torch::Tensor,
-                                 torch::Tensor,
-                                 torch::Tensor,
-                                 int,
-                                 int,
-                                 int,
-                                 float,
-                                 int);
-using ExtraFn  = torch::Tensor (*)(torch::Tensor,
-                                  torch::Tensor,
-                                  torch::Tensor,
-                                  torch::Tensor,
-                                  torch::Tensor,
-                                  torch::Tensor,
-                                  torch::Tensor,
-                                  int,
-                                  int,
-                                  int,
-                                  float,
-                                  int);
-using Extra2Fn = torch::Tensor (*)(torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   torch::Tensor,
-                                   int,
-                                   int,
-                                   int,
-                                   float,
-                                   int);
-
-template<BaseFn fn>
-at::Tensor qattn_base(const at::Tensor& query,
-                      const at::Tensor& key,
-                      const at::Tensor& value,
-                      at::Tensor&       output,
-                      const at::Tensor& query_scale,
-                      const at::Tensor& key_scale,
-                      c10::string_view  tensor_layout,
-                      bool              is_causal,
-                      c10::string_view  qk_quant_gran,
-                      double            sm_scale,
-                      bool              return_lse)
-{
-    return fn(query,
-              key,
-              value,
-              output,
-              query_scale,
-              key_scale,
-              layout_flag(tensor_layout),
-              is_causal ? 1 : 0,
-              gran_flag(qk_quant_gran),
-              static_cast<float>(sm_scale),
-              return_lse ? 1 : 0);
-}
-
-template<ExtraFn fn>
-at::Tensor qattn_extra(const at::Tensor& query,
-                       const at::Tensor& key,
-                       const at::Tensor& value,
-                       at::Tensor&       output,
-                       const at::Tensor& query_scale,
-                       const at::Tensor& key_scale,
-                       const at::Tensor& extra,
-                       c10::string_view  tensor_layout,
-                       bool              is_causal,
-                       c10::string_view  qk_quant_gran,
-                       double            sm_scale,
-                       bool              return_lse)
-{
-    return fn(query,
-              key,
-              value,
-              output,
-              query_scale,
-              key_scale,
-              extra,
-              layout_flag(tensor_layout),
-              is_causal ? 1 : 0,
-              gran_flag(qk_quant_gran),
-              static_cast<float>(sm_scale),
-              return_lse ? 1 : 0);
-}
-
-template<Extra2Fn fn>
-at::Tensor qattn_extra2(const at::Tensor& query,
-                        const at::Tensor& key,
-                        const at::Tensor& value,
-                        at::Tensor&       output,
-                        const at::Tensor& query_scale,
-                        const at::Tensor& key_scale,
-                        const at::Tensor& value_scale,
-                        const at::Tensor& value_mean,
-                        c10::string_view  tensor_layout,
-                        bool              is_causal,
-                        c10::string_view  qk_quant_gran,
-                        double            sm_scale,
-                        bool              return_lse)
-{
-    return fn(query,
-              key,
-              value,
-              output,
-              query_scale,
-              key_scale,
-              value_scale,
-              value_mean,
-              layout_flag(tensor_layout),
-              is_causal ? 1 : 0,
-              gran_flag(qk_quant_gran),
-              static_cast<float>(sm_scale),
-              return_lse ? 1 : 0);
-}
-
 // ---------------------------------------------------------------- host ops
 
 std::vector<int64_t> compiled_archs()
@@ -457,51 +305,6 @@ TORCH_LIBRARY(sageattention, m)
           "int num_tokens, float scale_max, str tensor_layout) -> ()");
     m.def("mean_scale_fuse_quant(Tensor input, Tensor(a!) output, Tensor(b!) mean, "
           "Tensor(c!) scale, int num_tokens, float scale_max, str tensor_layout) -> ()");
-
-    // per-arch attention ops (transitional 1:1 surface; the unified fwd op
-    // dispatches onto the same launchers)
-#define SAGE_QATTN_BASE_SCHEMA(op)                                                                                     \
-#op "(Tensor query, Tensor key, Tensor value, Tensor(a!) output, "                                                 \
-        "Tensor query_scale, Tensor key_scale, str tensor_layout, "                                                    \
-        "bool is_causal, str qk_quant_gran, float sm_scale, bool return_lse)"                                          \
-        " -> Tensor"
-#define SAGE_QATTN_EXTRA_SCHEMA(op, extra)                                                                             \
-#op "(Tensor query, Tensor key, Tensor value, Tensor(a!) output, "                                                 \
-        "Tensor query_scale, Tensor key_scale, Tensor " extra ", str tensor_layout, "                                  \
-        "bool is_causal, str qk_quant_gran, float sm_scale, bool return_lse)"                                          \
-        " -> Tensor"
-#define SAGE_QATTN_EXTRA2_SCHEMA(op)                                                                                   \
-#op "(Tensor query, Tensor key, Tensor value, Tensor(a!) output, "                                                 \
-        "Tensor query_scale, Tensor key_scale, Tensor value_scale, "                                                   \
-        "Tensor value_mean, str tensor_layout, "                                                                       \
-        "bool is_causal, str qk_quant_gran, float sm_scale, bool return_lse)"                                          \
-        " -> Tensor"
-
-#if SAGEATTN_BUILD_SM80
-    m.def(SAGE_QATTN_BASE_SCHEMA(qattn_sm80_qk_int8_sv_f16_accum_f32_attn));
-    m.def(SAGE_QATTN_BASE_SCHEMA(qattn_sm80_qk_int8_sv_f16_accum_f16_attn));
-    m.def(SAGE_QATTN_BASE_SCHEMA(qattn_sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn, "value_mean"));
-#endif
-#if SAGEATTN_BUILD_SM89
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn, "value_scale"));
-    m.def(SAGE_QATTN_EXTRA2_SCHEMA(qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf, "value_scale"));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf, "value_scale"));
-#endif
-#if SAGEATTN_BUILD_SM90
-    m.def(SAGE_QATTN_BASE_SCHEMA(qattn_sm90_qk_int8_sv_f8_accum_f32_attn_inst_buf));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf, "value_scale"));
-#endif
-#if SAGEATTN_BUILD_SM100
-    m.def(SAGE_QATTN_BASE_SCHEMA(qattn_sm100_qk_int8_sv_f8_accum_f32_attn));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm100_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn, "value_scale"));
-#endif
-#if SAGEATTN_BUILD_SM120
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn, "value_scale"));
-    m.def(SAGE_QATTN_EXTRA2_SCHEMA(qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn));
-    m.def(SAGE_QATTN_EXTRA_SCHEMA(qattn_sm120_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf, "value_scale"));
-#endif
 }
 
 TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
@@ -514,47 +317,6 @@ TORCH_LIBRARY_IMPL(sageattention, CUDA, m)
     m.impl("transpose_pad_v", TORCH_FN(sage::transpose_pad_v));
     m.impl("scale_fuse_quant", TORCH_FN(sage::scale_fuse_quant));
     m.impl("mean_scale_fuse_quant", TORCH_FN(sage::mean_scale_fuse_quant));
-
-#if SAGEATTN_BUILD_SM80
-    m.impl("qattn_sm80_qk_int8_sv_f16_accum_f32_attn",
-           TORCH_FN(sage::qattn_base<sage::sm80::qk_int8_sv_f16_accum_f32_attn>));
-    m.impl("qattn_sm80_qk_int8_sv_f16_accum_f16_attn",
-           TORCH_FN(sage::qattn_base<sage::sm80::qk_int8_sv_f16_accum_f16_attn>));
-    m.impl("qattn_sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf",
-           TORCH_FN(sage::qattn_base<sage::sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf>));
-    m.impl("qattn_sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn",
-           TORCH_FN(sage::qattn_extra<sage::sm80::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn>));
-#endif
-#if SAGEATTN_BUILD_SM89
-    m.impl("qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-           TORCH_FN(sage::qattn_extra<sage::sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn>));
-    m.impl("qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
-           TORCH_FN(sage::qattn_extra2<sage::sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn>));
-    m.impl("qattn_sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
-           TORCH_FN(sage::qattn_extra<sage::sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf>));
-    m.impl("qattn_sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
-           TORCH_FN(sage::qattn_extra<sage::sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf>));
-#endif
-#if SAGEATTN_BUILD_SM90
-    m.impl("qattn_sm90_qk_int8_sv_f8_accum_f32_attn_inst_buf",
-           TORCH_FN(sage::qattn_base<sage::sm90::qk_int8_sv_f8_accum_f32_attn_inst_buf>));
-    m.impl("qattn_sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
-           TORCH_FN(sage::qattn_extra<sage::sm90::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf>));
-#endif
-#if SAGEATTN_BUILD_SM100
-    m.impl("qattn_sm100_qk_int8_sv_f8_accum_f32_attn",
-           TORCH_FN(sage::qattn_base<sage::sm100::qk_int8_sv_f8_accum_f32_attn>));
-    m.impl("qattn_sm100_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-           TORCH_FN(sage::qattn_extra<sage::sm100::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn>));
-#endif
-#if SAGEATTN_BUILD_SM120
-    m.impl("qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
-           TORCH_FN(sage::qattn_extra<sage::sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn>));
-    m.impl("qattn_sm120_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
-           TORCH_FN(sage::qattn_extra2<sage::sm120::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn>));
-    m.impl("qattn_sm120_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
-           TORCH_FN(sage::qattn_extra<sage::sm120::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf>));
-#endif
 }
 
 // plan / compiled_archs need a CompositeExplicitAutograd (catch-all) impl —
