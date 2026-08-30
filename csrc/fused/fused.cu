@@ -1470,13 +1470,17 @@ static VTQuantLayout parse_vt_quant_layout(const torch::Tensor& input,
     return l;
 }
 
-void scale_fuse_quant_cuda(torch::Tensor      input,
-                           torch::Tensor      output,
-                           torch::Tensor      scale,
-                           int                num_tokens,
-                           float              scale_max,
-                           int                tensor_layout,
-                           const QuantVarlen& varlen)
+// Shared body of the two fp8 V quantization launchers below: they differ only
+// in the mean tensor. An undefined mean selects the plain scale path, a
+// defined one the sub_mean kernel (the transpose_quant_v_fp8_cuda convention).
+static void scale_fuse_quant_impl(torch::Tensor      input,
+                                  torch::Tensor      output,
+                                  torch::Tensor      mean,
+                                  torch::Tensor      scale,
+                                  int                num_tokens,
+                                  float              scale_max,
+                                  int                tensor_layout,
+                                  const QuantVarlen& varlen)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -1491,21 +1495,35 @@ void scale_fuse_quant_cuda(torch::Tensor      input,
                     prop->minor);
     }
 
+    const bool sub_mean = mean.defined();
+
     CHECK_CUDA(input);
     CHECK_CUDA(output);
+    if (sub_mean) {
+        CHECK_CUDA(mean);
+    }
     CHECK_CUDA(scale);
 
     // CHECK_DTYPE(output, torch::kInt8);
+    if (sub_mean) {
+        CHECK_DTYPE(mean, torch::kFloat);
+    }
     CHECK_DTYPE(scale, torch::kFloat);
 
     CHECK_CONTIGUOUS(input);
     CHECK_CONTIGUOUS(output);
+    if (sub_mean) {
+        CHECK_CONTIGUOUS(mean);
+    }
     CHECK_CONTIGUOUS(scale);
 
     if (varlen.cu_seqlens == nullptr) {
         CHECK_DIMS(input, 4);
         CHECK_DIMS(output, 4);
     }  // the packed rank is checked by parse_vt_varlen_layout
+    if (sub_mean) {
+        CHECK_DIMS(mean, 3);
+    }
     CHECK_DIMS(scale, 3);
 
     const VTQuantLayout l = parse_vt_quant_layout(input, output, tensor_layout, varlen);
@@ -1522,6 +1540,9 @@ void scale_fuse_quant_cuda(torch::Tensor      input,
     const int64_t stride_d_output     = l.stride_d_output;
     const int64_t stride_h_output     = l.stride_h_output;
 
+    if (sub_mean) {
+        CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
+    }
     CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
 
     constexpr int CTA_THREADS = 256;
@@ -1533,27 +1554,54 @@ void scale_fuse_quant_cuda(torch::Tensor      input,
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        MeanScaleKernel<64, false, c_type><<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
-                                                                       reinterpret_cast<int8_t*>(output.data_ptr()),
-                                                                       nullptr,
-                                                                       reinterpret_cast<float*>(scale.data_ptr()),
-                                                                       scale_max,
-                                                                       num_tokens,
-                                                                       stride_batch_input,
-                                                                       stride_d_input,
-                                                                       stride_h_input,
-                                                                       stride_batch_output,
-                                                                       stride_d_output,
-                                                                       stride_h_output,
-                                                                       0,
-                                                                       0,
-                                                                       scale.stride(0),
-                                                                       scale.stride(1),
-                                                                       varlen.cu_seqlens,
-                                                                       static_cast<uint32_t>(varlen.pad_tokens));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    });
+// The launch the two flavours share; only the sub_mean template argument and
+// the mean pointer/strides differ.
+#define SAGEATTN_LAUNCH_MEAN_SCALE(SUB_MEAN, MEAN_PTR, STRIDE_BATCH_MEAN, STRIDE_H_MEAN)                               \
+    MeanScaleKernel<64, SUB_MEAN, c_type><<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),     \
+                                                                      reinterpret_cast<int8_t*>(output.data_ptr()),    \
+                                                                      MEAN_PTR,                                        \
+                                                                      reinterpret_cast<float*>(scale.data_ptr()),      \
+                                                                      scale_max,                                       \
+                                                                      num_tokens,                                      \
+                                                                      stride_batch_input,                              \
+                                                                      stride_d_input,                                  \
+                                                                      stride_h_input,                                  \
+                                                                      stride_batch_output,                             \
+                                                                      stride_d_output,                                 \
+                                                                      stride_h_output,                                 \
+                                                                      STRIDE_BATCH_MEAN,                               \
+                                                                      STRIDE_H_MEAN,                                   \
+                                                                      scale.stride(0),                                 \
+                                                                      scale.stride(1),                                 \
+                                                                      varlen.cu_seqlens,                               \
+                                                                      static_cast<uint32_t>(varlen.pad_tokens));       \
+    C10_CUDA_KERNEL_LAUNCH_CHECK()
+
+    // Two dispatch bodies rather than one branch inside the dispatch: kernels
+    // land in the cubin in (reverse) first-instantiation order, so this keeps
+    // the pre-merge order - both sub_mean=false instances before the true
+    // ones - and with it byte-identical SASS.
+    if (!sub_mean) {
+        DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(
+            input_dtype, c_type, { SAGEATTN_LAUNCH_MEAN_SCALE(false, nullptr, 0, 0); });
+    }
+    else {
+        DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+            SAGEATTN_LAUNCH_MEAN_SCALE(true, reinterpret_cast<float*>(mean.data_ptr()), mean.stride(0), mean.stride(1));
+        });
+    }
+#undef SAGEATTN_LAUNCH_MEAN_SCALE
+}
+
+void scale_fuse_quant_cuda(torch::Tensor      input,
+                           torch::Tensor      output,
+                           torch::Tensor      scale,
+                           int                num_tokens,
+                           float              scale_max,
+                           int                tensor_layout,
+                           const QuantVarlen& varlen)
+{
+    scale_fuse_quant_impl(input, output, torch::Tensor(), scale, num_tokens, scale_max, tensor_layout, varlen);
 }
 
 void mean_scale_fuse_quant_cuda(torch::Tensor      input,
@@ -1565,87 +1613,7 @@ void mean_scale_fuse_quant_cuda(torch::Tensor      input,
                                 int                tensor_layout,
                                 const QuantVarlen& varlen)
 {
-    const c10::cuda::CUDAGuard device_guard(input.device());
-
-    // The fp8 conversion (cvt.rn.satfinite.e4m3x2) requires sm_89+; on older
-    // parts the kernel guard compiles to a trap that kills the CUDA context.
-    // Fail loudly on the host instead.
-    {
-        const cudaDeviceProp* prop = at::cuda::getDeviceProperties(input.device().index());
-        TORCH_CHECK(prop->major > 8 || (prop->major == 8 && prop->minor >= 9),
-                    "fp8 per-channel V quantization requires compute capability 8.9+, got sm_",
-                    prop->major,
-                    prop->minor);
-    }
-
-    CHECK_CUDA(input);
-    CHECK_CUDA(output);
-    CHECK_CUDA(mean);
-    CHECK_CUDA(scale);
-
-    // CHECK_DTYPE(output, torch::kInt8);
-    CHECK_DTYPE(mean, torch::kFloat);
-    CHECK_DTYPE(scale, torch::kFloat);
-
-    CHECK_CONTIGUOUS(input);
-    CHECK_CONTIGUOUS(output);
-    CHECK_CONTIGUOUS(mean);
-    CHECK_CONTIGUOUS(scale);
-
-    if (varlen.cu_seqlens == nullptr) {
-        CHECK_DIMS(input, 4);
-        CHECK_DIMS(output, 4);
-    }  // the packed rank is checked by parse_vt_varlen_layout
-    CHECK_DIMS(mean, 3);
-    CHECK_DIMS(scale, 3);
-
-    const VTQuantLayout l = parse_vt_quant_layout(input, output, tensor_layout, varlen);
-
-    const int64_t batch_size = l.batch_size;
-    const int64_t num_heads  = l.num_heads;
-    const int64_t head_dim   = l.head_dim;
-
-    const int64_t stride_batch_input = l.stride_batch_input;
-    const int64_t stride_d_input     = l.stride_d_input;
-    const int64_t stride_h_input     = l.stride_h_input;
-
-    const int64_t stride_batch_output = l.stride_batch_output;
-    const int64_t stride_d_output     = l.stride_d_output;
-    const int64_t stride_h_output     = l.stride_h_output;
-
-    CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
-    CHECK_SHAPE(scale, batch_size, num_heads, head_dim);
-
-    constexpr int CTA_THREADS = 256;
-
-    dim3 grid(num_heads, batch_size, head_dim);
-    dim3 block(CTA_THREADS);
-
-    auto input_dtype = input.scalar_type();
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        MeanScaleKernel<64, true, c_type><<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
-                                                                      reinterpret_cast<int8_t*>(output.data_ptr()),
-                                                                      reinterpret_cast<float*>(mean.data_ptr()),
-                                                                      reinterpret_cast<float*>(scale.data_ptr()),
-                                                                      scale_max,
-                                                                      num_tokens,
-                                                                      stride_batch_input,
-                                                                      stride_d_input,
-                                                                      stride_h_input,
-                                                                      stride_batch_output,
-                                                                      stride_d_output,
-                                                                      stride_h_output,
-                                                                      mean.stride(0),
-                                                                      mean.stride(1),
-                                                                      scale.stride(0),
-                                                                      scale.stride(1),
-                                                                      varlen.cu_seqlens,
-                                                                      static_cast<uint32_t>(varlen.pad_tokens));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    });
+    scale_fuse_quant_impl(input, output, mean, scale, num_tokens, scale_max, tensor_layout, varlen);
 }
 
 bool transpose_quant_v_fp8_supported(int64_t head_dim)
