@@ -261,6 +261,59 @@ __device__ __forceinline__ void tmem_st_32x32b_x2(uint32_t tmem_addr, const uint
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Packed f32x2 ALU (PTX ISA 8.6+). Each lane of mul/fma.rn.ftz.f32x2 is an
+// independent IEEE fp32 op with round-to-nearest-even and ftz - exactly what
+// the scalar mul.ftz.f32 / fma.rn.ftz.f32 this TU emits under
+// --use_fast_math compute - so results are bit-identical per element to the
+// scalar sequence they replace. (The explicit .rn also forbids mul->fma
+// contraction, which never fires on these muls anyway: their consumers are
+// max chains and fma multiplicands, not adds; FMUL.FTZ verified in SASS.)
+// ptxas lowering, measured with nvcc 13.3: sm_100a -> one FMUL2.FTZ /
+// FFMA2.FTZ with splat operands folded to a single broadcast register;
+// sm_110a -> split back into two scalar FMUL/FFMA (no packed ALU there),
+// correct either way. max.f32x2 does not exist (ptxas rejects it), so the
+// row-max chain stays scalar.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void f32x2_mul(float& d0, float& d1, float a0, float a1, float b0, float b1)
+{
+#ifdef SAGE_TCGEN05_ENABLED
+    asm("{\n"
+        ".reg .b64 a, b, d;\n"
+        "mov.b64 a, {%2, %3};\n"
+        "mov.b64 b, {%4, %5};\n"
+        "mul.rn.ftz.f32x2 d, a, b;\n"
+        "mov.b64 {%0, %1}, d;\n"
+        "}"
+        : "=f"(d0), "=f"(d1)
+        : "f"(a0), "f"(a1), "f"(b0), "f"(b1));
+#else
+    d0 = a0 * b0;
+    d1 = a1 * b1;
+#endif
+}
+
+__device__ __forceinline__ void
+f32x2_fma(float& d0, float& d1, float a0, float a1, float b0, float b1, float c0, float c1)
+{
+#ifdef SAGE_TCGEN05_ENABLED
+    asm("{\n"
+        ".reg .b64 a, b, c, d;\n"
+        "mov.b64 a, {%2, %3};\n"
+        "mov.b64 b, {%4, %5};\n"
+        "mov.b64 c, {%6, %7};\n"
+        "fma.rn.ftz.f32x2 d, a, b, c;\n"
+        "mov.b64 {%0, %1}, d;\n"
+        "}"
+        : "=f"(d0), "=f"(d1)
+        : "f"(a0), "f"(a1), "f"(b0), "f"(b1), "f"(c0), "f"(c1));
+#else
+    d0 = fmaf(a0, b0, c0);
+    d1 = fmaf(a1, b1, c1);
+#endif
+}
+
 }  // namespace ws
 
 // ---------------------------------------------------------------------------
@@ -550,8 +603,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 dequant_scale[0] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset];
             }
 
-            // dequant + fused mask for S column j (mirrors :420-444)
-            auto s_of = [&](uint32_t raw, uint32_t j) -> float {
+            // dequant + fused mask for the S column pair (j, j+1), j even
+            // (value sequence mirrors :420-444). The two columns of a pair
+            // share one k-scale at both granularities ((j%8)/2 is equal for
+            // j and j+1 when j is even), so the packed multiplier is a splat;
+            // the dequant itself is one mul.rn.ftz.f32x2 whose lanes are
+            // bit-identical to the two scalar muls it replaces (see the
+            // f32x2 helper comment). The causal/OOB mask select stays scalar.
+            auto s_of_pair = [&](uint32_t raw0, uint32_t raw1, uint32_t j, float& s0, float& s1) {
                 float dequant_scale_j;
                 if constexpr (K_GRAN == QuantGranularity::kPerThread) {
                     dequant_scale_j = dequant_scale[(j % 8) / 2];
@@ -559,21 +618,29 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 else {
                     dequant_scale_j = dequant_scale[0];
                 }
-                float s = __int2float_rz(static_cast<int32_t>(raw)) * dequant_scale_j;
+                ws::f32x2_mul(s0,
+                              s1,
+                              __int2float_rz(static_cast<int32_t>(raw0)),
+                              __int2float_rz(static_cast<int32_t>(raw1)),
+                              dequant_scale_j,
+                              dequant_scale_j);
                 if constexpr (is_last) {
+                    auto is_oob = [&](uint32_t kv_idx) {
+                        if constexpr (mask_mode == MaskMode::kCausal) {
+                            return (kv_idx > q_idx) || (kv_idx >= kv_len);
+                        }
+                        else {
+                            return kv_idx >= kv_len;
+                        }
+                    };
                     const uint32_t kv_idx = iter * CTA_K + j;
-                    bool           is_out_of_bounds;
-                    if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (kv_idx > q_idx) || (kv_idx >= kv_len);
+                    if (is_oob(kv_idx)) {
+                        s0 = -5000000.0f;
                     }
-                    else {
-                        is_out_of_bounds = (kv_idx >= kv_len);
-                    }
-                    if (is_out_of_bounds) {
-                        s = -5000000.0f;
+                    if (is_oob(kv_idx + 1)) {
+                        s1 = -5000000.0f;
                     }
                 }
-                return s;
             };
 
             ws::wait_bar(bar_full, s_full_phase);
@@ -593,10 +660,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
                 tcgen05::tmem_ld_wait();
 #pragma unroll
-                for (uint32_t jj = 0; jj < 64; jj++) {
-                    const float s       = s_of(RS_row[c * 64 + jj], c * 64 + jj);
-                    m_local             = max(m_local, s);
-                    RS_row[c * 64 + jj] = __float_as_uint(s);
+                for (uint32_t jj = 0; jj < 64; jj += 2) {
+                    float s0, s1;
+                    s_of_pair(RS_row[c * 64 + jj], RS_row[c * 64 + jj + 1], c * 64 + jj, s0, s1);
+                    m_local                 = max(m_local, s0);  // fold order still ascending j
+                    m_local                 = max(m_local, s1);
+                    RS_row[c * 64 + jj]     = __float_as_uint(s0);
+                    RS_row[c * 64 + jj + 1] = __float_as_uint(s1);
                 }
             }
 
@@ -620,18 +690,39 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
             // ---- p = exp2(fma(s, scale, -row_max)), d_sum, e4m3 pack from
             //      the retained row (p / d_sum / pack value sequences match
-            //      :459-474; the pack is fused per 4 columns so each RS_f32
+            //      :459-474; the pack is fused per 4 columns so each row
             //      quad dies as its RP word is born - liveness only falls
-            //      from here). ----
+            //      from here). The exp2 arguments are computed as two
+            //      fma.rn.ftz.f32x2 per quad, each lane bit-identical to the
+            //      scalar fmaf it replaces (see the f32x2 helper comment);
+            //      MUFU exp2 and the d_sum adds stay scalar - d_sum is a
+            //      serial chain and keeps its ascending-b add order. ----
             const float neg_row_max = -row_max;
             float       d_sum       = 0.0f;
             uint32_t    RP_u32[CTA_K / 4];
 #pragma unroll
             for (uint32_t w = 0; w < CTA_K / 4; w++) {
+                float a[4];
+                ws::f32x2_fma(a[0],
+                              a[1],
+                              __uint_as_float(RS_row[4 * w]),
+                              __uint_as_float(RS_row[4 * w + 1]),
+                              local_sm_scale,
+                              local_sm_scale,
+                              neg_row_max,
+                              neg_row_max);
+                ws::f32x2_fma(a[2],
+                              a[3],
+                              __uint_as_float(RS_row[4 * w + 2]),
+                              __uint_as_float(RS_row[4 * w + 3]),
+                              local_sm_scale,
+                              local_sm_scale,
+                              neg_row_max,
+                              neg_row_max);
                 float p[4];
 #pragma unroll
                 for (uint32_t b = 0; b < 4; b++) {
-                    p[b] = math::ptx_exp2(fmaf(__uint_as_float(RS_row[4 * w + b]), local_sm_scale, neg_row_max));
+                    p[b] = math::ptx_exp2(a[b]);
                     d_sum += p[b];
                 }
                 floatx4_to_e4m3x4(&RP_u32[w], &p[0], &p[2]);
