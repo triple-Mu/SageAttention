@@ -216,11 +216,9 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     // per-head extent from gridDim (the dense form below) or from kv_len would
     // be wrong here twice over - the grid covers max_seqlen, and the blocks of
     // the earlier sequences sit in front of this one's.
-    constexpr uint32_t q_scale_per_cta = (Q_GRAN == QuantGranularity::kPerBlock)  ? 1 :
-                                         (Q_GRAN == QuantGranularity::kPerWarp)   ? (NUM_THREADS / 32) :
+    constexpr uint32_t q_scale_per_cta = (Q_GRAN == QuantGranularity::kPerWarp)   ? (NUM_THREADS / 32) :
                                                                                     (NUM_THREADS / 32) * 8;
-    constexpr uint32_t k_scale_per_cta =
-        (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+    constexpr uint32_t k_scale_per_cta = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
     q_scale_idx = static_cast<int64_t>(head_id) * q_scale_stride_h
                   + static_cast<int64_t>(seq_info.blk_q_base + cta_idx_q) * q_scale_per_cta;
@@ -235,12 +233,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
                        + static_cast<int64_t>(seq_info.blk_k_base) * k_scale_per_cta;
     k_scale_off = (K_GRAN == QuantGranularity::kPerThread) ? (lane_id % 4) : 0;
 #else
-    if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_ctas_q = gridDim.x;
-        q_scale_idx               = static_cast<int64_t>(batch_id) * num_qo_heads * num_ctas_q
-                      + static_cast<int64_t>(head_id) * num_ctas_q + cta_idx_q;
-    }
-    else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
+    if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
         const uint32_t num_warp_tiles_q = gridDim.x * 4;
         q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
                       + static_cast<int64_t>(head_id) * num_warp_tiles_q + cta_idx_q * 4 + warp_idx;
@@ -252,7 +245,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
                       + lane_id / 4;
     }
 
-    if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
+    if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
         const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
         K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
                            + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
@@ -266,8 +259,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     }
 #endif
 
-    constexpr uint32_t k_scale_advance_offset =
-        (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+    constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
     uint32_t Q_idx_lane_base = cta_idx_q * CTA_Q + warp_idx * 16 + lane_id / 4;
 #ifdef SAGE_VARLEN

@@ -73,8 +73,6 @@ enum class MaskMode {
 };
 
 enum class QuantGranularity {
-    kPerTensor = 0,
-    kPerBlock  = 1,
     kPerWarp   = 2,
     kPerThread = 3,
 };
@@ -249,12 +247,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     int64_t      q_scale_idx;
     const float* K_scale_base_ptr;
 
-    if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-        const uint32_t num_ctas_q = gridDim.x;
-        q_scale_idx               = static_cast<int64_t>(batch_id) * num_qo_heads * num_ctas_q
-                      + static_cast<int64_t>(head_id) * num_ctas_q + cta_idx_q;
-    }
-    else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
+    if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
         // per_warp_int8_cuda(BLKQ=128, WARPQ=32): 4 scales per block, one per 32 rows
         const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
         q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * num_warp_tiles_q
@@ -268,7 +261,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                       + (row_id / 32) * 8 + (row_id % 8);
     }
 
-    if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) {
+    if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
         const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
         K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
                            + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
@@ -280,8 +273,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                            + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
     }
 
-    constexpr uint32_t k_scale_advance_offset =
-        (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+    constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
     // --- flash-attention state (thread-local; this thread's row) ---
     float row_max = -5000000.0f;

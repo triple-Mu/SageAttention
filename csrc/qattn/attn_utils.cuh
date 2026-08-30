@@ -42,8 +42,6 @@ enum class DataType {
 };
 
 enum class QuantGranularity {
-    kPerTensor = 0,
-    kPerBlock  = 1,
     kPerWarp   = 2,
     kPerThread = 3,
 };
