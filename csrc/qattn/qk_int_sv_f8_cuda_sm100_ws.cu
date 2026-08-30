@@ -45,13 +45,15 @@
 // (line references at each block). Copies are annotated instead of extracted
 // into a shared header so the existing kernel's TU keeps byte-identical
 // device text (SASS gate). Softmax reads each S row once - two x64
-// tcgen05.ld per KV block, the widest form ptxas accepts under the
-// 128-register entry target - and keeps the whole dequanted row in
-// registers (the 128-thread kernel's value sequence, :407-449). History: a
-// two-pass variant (re-reading TMEM for the exp2 pass) doubled the
-// tcgen05.ld traffic and lost 11% end to end; the round-2 single-pass
-// version chained four x32 loads and still stalled on long_scoreboard -
-// the analyses and the register accounts are in
+// tcgen05.ld per KV block (the widest form ptxas accepts under the
+// 128-register entry target) issued back to back under one collective
+// wait::ld - and keeps the whole dequanted row in registers (the
+// 128-thread kernel's value sequence, :407-449). History: a two-pass
+// variant (re-reading TMEM for the exp2 pass) doubled the tcgen05.ld
+// traffic and lost 11% end to end; the round-2 single-pass version
+// chained four x32 loads and still stalled on long_scoreboard; round 3
+// widened to two x64 with per-ld waits, still two serial exposed round
+// trips - the analyses and the register accounts are in
 // bench/sm100_review/C1_DESIGN.md.
 //
 // Pipeline/barrier design and the deadlock-freedom + TMEM alias-hazard
@@ -227,15 +229,15 @@ __device__ __forceinline__ void tmem_ld_32x32b_x2(uint32_t r[2], uint32_t tmem_a
 }
 
 // 64-column tcgen05.ld: the softmax S-row drain (tcgen05.cuh stops at x32).
-// One LDTM.x64 moves half the 128-col row, so each KV block exposes two
-// TMEM-load latencies instead of four chained x32 round trips, still with
-// exactly one outstanding tcgen05.ld (stays clear of the batch-issue
-// pattern that hung in the A5 experiment). x64 is the widest feasible
-// form here: the x128 variant is a single instruction whose destination
-// block alone (128 regs + the address operand) exceeds the 128-register
-// entry target that __launch_bounds__(512, 1) pins, and ptxas rejects it
-// with C7602 "Insufficient registers" regardless of the setmaxnreg region
-// budget (measured, nvcc 13.3).
+// One LDTM.x64 moves half the 128-col row; the softmax step issues the two
+// of them back to back under one collective wait::ld (2 outstanding, r4 -
+// the schedule ptxas already picked for r3's peeled instance and the r3
+// stress runs covered; the A5 hang was 4+ outstanding). x64 is the widest
+// feasible form here: the x128 variant is a single instruction whose
+// destination block alone (128 regs + the address operand) exceeds the
+// 128-register entry target that __launch_bounds__(512, 1) pins, and ptxas
+// rejects it with C7602 "Insufficient registers" regardless of the
+// setmaxnreg region budget (measured, nvcc 13.3).
 __device__ __forceinline__ void tmem_ld_32x32b_x64(uint32_t r[64], uint32_t tmem_addr)
 {
 #ifdef SAGE_TCGEN05_ENABLED
@@ -575,16 +577,25 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
         // -------------------------------------------------------------------
         // Per-KV-block softmax step. One pass over the S row: two x64
-        // tcgen05.ld + wait round trips drain the whole row (two exposed
-        // TMEM-load latencies per KV block; round 2 chained four x32 loads
-        // and long_scoreboard stayed the top stall - see C1_DESIGN.md round
-        // 3, which also records why x128 is rejected by ptxas). Still
-        // exactly one outstanding tcgen05.ld, NOT the batch-issue/
-        // collective-wait pattern that hung in the A5 experiment. Each raw
-        // word is dequanted+masked in place and folded into m_local; the
-        // whole row then stays in registers, so nothing touches TMEM
-        // between the vec store (aliases S cols [0,2)) and the P store.
-        // The per-element dequant/max/exp2/d_sum/pack value sequences are
+        // tcgen05.ld issued back to back, then ONE collective wait::ld
+        // (r4; C1_DESIGN.md 6.4). tcgen05.wait::ld has no per-operation
+        // form - PTX ISA defines it as blocking on ALL prior tcgen05.ld of
+        // the thread - so the r3 ld/wait/ld/wait chain cannot overlap the
+        // two loads at PTX level; fusing the waits lets the second TMEM
+        // round trip overlap the first (round 2's four chained x32 and
+        // round 3's two chained x64 both kept long_scoreboard on top -
+        // see C1_DESIGN.md 6.2/6.3, which also records why x128 is
+        // rejected by ptxas; NB the overlap is pinned at PTX only, 6.4
+        // records where ptxas re-sinks ld1 at SASS level). Two
+        // outstanding tcgen05.ld is NOT the A5 pattern
+        // (4+ outstanding, hang root cause unlocated): it is the exact
+        // schedule ptxas already emitted for r3's peeled instance, which
+        // the r3 stress runs (2x8000 launches) covered clean; this change
+        // only pins that schedule at PTX level. Each raw word is
+        // dequanted+masked in place and folded into m_local; the whole
+        // row then stays in registers, so nothing touches TMEM between
+        // the vec store (aliases S cols [0,2)) and the P store. The
+        // per-element dequant/max/exp2/d_sum/pack value sequences are
         // those of the 128-thread kernel (:407-449, :459-474; see file
         // header). is_last folds the causal/OOB mask exactly like :431-444.
         // -------------------------------------------------------------------
@@ -648,17 +659,23 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
             // ---- load + dequant + mask + row max, whole row retained
             //      (:407-449; per-element op order unchanged - same ascending
-            //      column order as the four-chunk version, so every float op
+            //      column order as the chunked versions, so every float op
             //      sees the same inputs in the same order). The row array is
             //      uint32_t so each f32 result can overwrite its raw word in
             //      place: the ld's in-flight block and the retained row share
-            //      registers instead of stacking a separate staging array. ----
+            //      registers instead of stacking a separate staging array.
+            //      r4: both x64 lds issue back to back under one collective
+            //      wait so their TMEM-load latencies can overlap (PTX-level
+            //      structure; SASS reality per arch in C1_DESIGN.md 6.4). ----
             uint32_t RS_row[CTA_K];
             float    m_local = -5000000.0f;
 #pragma unroll
             for (uint32_t c = 0; c < CTA_K / 64; c++) {
                 ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
-                tcgen05::tmem_ld_wait();
+            }
+            tcgen05::tmem_ld_wait();
+#pragma unroll
+            for (uint32_t c = 0; c < CTA_K / 64; c++) {
 #pragma unroll
                 for (uint32_t jj = 0; jj < 64; jj += 2) {
                     float s0, s1;

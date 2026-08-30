@@ -254,7 +254,51 @@ M2 若仍不达标的定位顺序:
 2. mma warp 发射间隙:`sm__pipe_tensor_op_cycles_active` 占空;若 QK/PV 间
    有大空洞,检查 s_empty 到达延迟(softmax 关键路径)。
 3. softmax 2 条串行 x64 ld 链仍是热点:源级交错(2 outstanding)按 §6.3
-   方向 3 段的先例与 A5 规则立项。
+   方向 3 段的先例与 A5 规则立项(已落地,见 §6.4)。
+
+### 6.4 round 4:WS 三态启发式 + chunk 交错(2 ld 共用一次 wait)
+
+r3 上机小结(B200,数据在主控 r3 轮记录;口径同 §6.2):
+
+- bench:d128 且 qo_len ≥ 16384 的 10/10 形状 ws/old 1.006-1.027×;
+  s ≤ 4096 全慢(ws 的 grid.x = qo_len/256,是旧 kernel 的一半,小 grid
+  填不满 148 SM 的 wave);d64 慢 8-9%(512 列 TMEM 只用 384)。
+- ncu b4h32s16384 non-causal d128:duration 16.17 ms(old 16.29 ms),
+  Eligible 0.66;softmax 仍受 tcgen05.ld 暴露延迟支配。
+- 压测:2×8000 次连续发射零挂死(r3 的两条 x64 结构,含 ptxas 在
+  per-thread peeled 实例里自发背靠背发射的 2-outstanding 调度)。
+
+两个独立 commit:
+
+1. **SAGEATTN_SM100_WS 三态**(host-only,双 TU probe SASS 逐字节不变)。
+   未设/`auto` = 启发式:HEAD_DIM==128 且 qo_len ≥ 16384 走 ws(16384 是
+   实测全正下界,4096-16384 间无采样点,保守取);`1`/`on` 强制 ws;
+   `0`/`off` 强制旧。env 仍进程内读一次,只缓存模式,启发式分支每次调用
+   按 runtime 的 qo_len 判断。
+2. **chunk 交错:两条 x64 ld 背靠背 + 单次 collective wait**。
+   - wait 语义结论:`tcgen05.wait::ld.sync.aligned` 无操作数、无 per-op
+     形式,PTX ISA 定义为阻塞到本线程此前**全部** tcgen05.ld 完成
+     (cccl `tcgen05_wait.h` 同一形式)。任务书里 ld0/wait0/ld1/wait1 的
+     按序交错表达不出来,按预案改为两条 ld 共用一次 wait、顺序处理两个
+     chunk——总暴露延迟与按序 wait 版相同(两条 ld 同时在飞)。
+   - bit-exact:PTX 逐 opcode 对账,4 实例唯一变化是 wait::ld 各 -2
+     (main + peeled 两处展开各省 1),浮点 op 计数全部不变;处理循环
+     源码未动,列序/fold 序不变 → 值序逐位一致。
+   - A5 边界:2 outstanding 正是 r3 SASS 已出现且 2×8000 压测覆盖过的
+     调度;A5 判负的是 4+ 条批量发射(根因未定位),不越界。
+   - 门禁(nvcc 13.3,4 实例 × sm_100a/sm_110a):0 spill / 0 stack /
+     入口 128 reg;softmax 区峰值不变(sm_100a 170-173,sm_110a 189)。
+   - **ptxas 复沉实测(要点)**:PTX 钉住的背靠背结构到 SASS 不保真。
+     sm_100a:8 个 pair 站点里 6 个 ptxas 仍把 ld1 沉回 chunk0 首个消费
+     点之后(串行 round trip,与 r3 完全同构;in-flight 的 2 个站点也
+     与 r3 相同),净变化只有 2 个实例各 -8 条 NOP——上机预期持平。
+     sm_110a:per-thread peeled 站点从 gap 410 变背靠背 in-flight,
+     main 站点 gap 143-152 → 77-107——有真实交错,或有小改善。
+   - 后续 lever(若 long_scoreboard 仍主导):r3/r4 里唯一稳定 in-flight
+     的站点(per-thread peeled)是因为 mask 的 ISETP 链填在 ld 与首个
+     消费点之间;要在 sm_100a 上强制交错,得给 main 站点也填独立工作
+     (如 mask/scale 预计算重排),需重开 bit-exact 论证,或等 ptxas
+     调度器修正。
 
 ## 7. 风险与回退
 
