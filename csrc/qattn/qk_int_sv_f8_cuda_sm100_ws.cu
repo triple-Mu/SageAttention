@@ -26,8 +26,9 @@
 //   warp  13     load        (single elected thread issues every TMA)
 //   warp  14     epilogue    (idle until M3: TMA-store epilogue)
 //   warp  15     empty
-// setmaxnreg budgets 192/192/96/32 per warpgroup: 128*(192+192+96) + 4*32*32
-// = 65536 registers, exactly one CTA's worth (SM register file).
+// setmaxnreg budgets 192/192/88/40 per warpgroup: 128*(192+192+88+40)
+// = 65536 registers, exactly one CTA's worth (SM register file); see the
+// rationale at kNumRegs* below for the 8-reg shift off the cutedsl split.
 //
 // TMEM plan (512 columns, always alloc 512; lane = attention row within a
 // tile; both tiles use all 128 lanes at different columns):

@@ -33,8 +33,8 @@
 //   * no ptxas C7508 ("'setmaxnreg' ignored") — the kernel must keep
 //     __launch_bounds__(512, 1) for the entry register count to be known;
 //   * 0 spill stores/loads on every instantiation;
-//   * SASS contains USETMAXREG TRY_ALLOC 0xc0 / DEALLOC 0x60 / DEALLOC 0x20
-//     (= the 192/96/32 warpgroup budgets).
+//   * SASS contains USETMAXREG TRY_ALLOC 0xc0 / DEALLOC 0x58 / DEALLOC 0x28
+//     (= the 192/88/40 warpgroup budgets).
 //
 // The explicit instantiations below must track the kernel's namespace and
 // parameter list in csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu by hand.
