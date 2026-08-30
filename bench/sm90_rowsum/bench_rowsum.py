@@ -39,7 +39,28 @@ args = AP.parse_args()
 
 import sageattention  # noqa: F401  (registers torch.ops.sageattention)
 
-OP = torch.ops.sageattention.qattn_sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+
+# stand-in for the retired qattn_sm90_..._fuse_v_scale_attn_inst_buf op:
+# fwd with backend="sm90" launches the identical kernel. `o` stays in the
+# signature but is unused — fwd allocates its own output, and the bench only
+# times, never reads it.
+def OP(q, k, v, o, q_scale, k_scale, v_scale, tensor_layout, is_causal, gran, sm_scale, lse):
+    torch.ops.sageattention.fwd(
+        q,
+        k,
+        v,
+        q_scale,
+        k_scale,
+        v_scale,
+        tensor_layout=tensor_layout,
+        qk_quant_gran=gran,
+        pv_accum_dtype="fp32+fp32",
+        v_layout="mma_k16",
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        return_lse=lse,
+        backend="sm90",
+    )
 
 # (seq, batch, heads): batch/heads shrink with seq so no single point runs long.
 SHAPES = [
