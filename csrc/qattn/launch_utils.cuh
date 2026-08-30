@@ -592,3 +592,52 @@ inline QKVVarlenLayout qkv_varlen_layout_parse(const torch::Tensor& query,
     SAGEATTN_QKV_VARLEN_LOCALS_COMMON(L);                                                                              \
     const uint32_t stride_d_v = static_cast<uint32_t>((L).stride_d_v);                                                 \
     const int64_t  padded_k   = (L).padded_k
+
+// Scale-shape gate shared by every qk_int* launcher's dispatch body. Expands
+// against the LOCALS names above plus the dispatch tree's constexpr
+// QK_QUANT_GRAN. Q_BLOCKS / K_BLOCKS are the per-warp entry counts of the
+// launcher's tiling; kPerThread stores 8 / 4 entries per warp on top of them.
+// The error text is pinned (tests match it) and must show the call site's raw
+// spelling. CHECK_SHAPE cannot be reused for that: a block expression routed
+// through a macro parameter is macro-expanded before CHECK_SHAPE's # sees it
+// (div_ceil would leak its definition into the message), so the helper below
+// takes the already-stringified spelling (# at the outer level suppresses the
+// pre-expansion) next to the live expression.
+#define SAGEATTN_CHECK_SCALE_SHAPE_(x, dims_str, ...)                                                                  \
+    TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), "Tensor " #x " must have shape (" dims_str ")")
+
+#define SAGEATTN_CHECK_QK_SCALE_SHAPES(Q_BLOCKS, K_BLOCKS)                                                             \
+    if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {                                     \
+        SAGEATTN_CHECK_SCALE_SHAPE_(                                                                                   \
+            query_scale, "batch_size, num_qo_heads, " #Q_BLOCKS, batch_size, num_qo_heads, Q_BLOCKS);                  \
+        SAGEATTN_CHECK_SCALE_SHAPE_(                                                                                   \
+            key_scale, "batch_size, num_kv_heads, " #K_BLOCKS, batch_size, num_kv_heads, K_BLOCKS);                    \
+    }                                                                                                                  \
+    else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {                              \
+        SAGEATTN_CHECK_SCALE_SHAPE_(                                                                                   \
+            query_scale, "batch_size, num_qo_heads, " #Q_BLOCKS " * 8", batch_size, num_qo_heads, Q_BLOCKS * 8);       \
+        SAGEATTN_CHECK_SCALE_SHAPE_(                                                                                   \
+            key_scale, "batch_size, num_kv_heads, " #K_BLOCKS " * 4", batch_size, num_kv_heads, K_BLOCKS * 4);         \
+    }                                                                                                                  \
+    else {                                                                                                             \
+        static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)                                    \
+                          || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread),                          \
+                      "Unsupported quantization granularity");                                                         \
+    }
+
+// The varlen counterpart: the packed scale tensors have no batch dimension,
+// and the block counts come from the blk_total() algebra of varlen.h.
+#define SAGEATTN_CHECK_QK_SCALE_SHAPES_VARLEN(Q_BLOCKS, K_BLOCKS)                                                      \
+    if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {                                     \
+        SAGEATTN_CHECK_SCALE_SHAPE_(query_scale, "num_qo_heads, " #Q_BLOCKS, num_qo_heads, Q_BLOCKS);                  \
+        SAGEATTN_CHECK_SCALE_SHAPE_(key_scale, "num_kv_heads, " #K_BLOCKS, num_kv_heads, K_BLOCKS);                    \
+    }                                                                                                                  \
+    else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {                              \
+        SAGEATTN_CHECK_SCALE_SHAPE_(query_scale, "num_qo_heads, " #Q_BLOCKS " * 8", num_qo_heads, Q_BLOCKS * 8);       \
+        SAGEATTN_CHECK_SCALE_SHAPE_(key_scale, "num_kv_heads, " #K_BLOCKS " * 4", num_kv_heads, K_BLOCKS * 4);         \
+    }                                                                                                                  \
+    else {                                                                                                             \
+        static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)                                    \
+                          || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread),                          \
+                      "Unsupported quantization granularity");                                                         \
+    }

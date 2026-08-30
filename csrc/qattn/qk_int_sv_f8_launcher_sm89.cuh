@@ -84,23 +84,8 @@ torch::Tensor qk_int8_sv_f8_fuse_v_scale_attn_launcher_sm89(torch::Tensor       
 
                         constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
-                        if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {
-                            CHECK_SHAPE(
-                                query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
-                            CHECK_SHAPE(
-                                key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K));
-                        }
-                        else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {
-                            CHECK_SHAPE(
-                                query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q) * 8);
-                            CHECK_SHAPE(
-                                key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);
-                        }
-                        else {
-                            static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)
-                                              || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread),
-                                          "Unsupported quantization granularity");
-                        }
+                        SAGEATTN_CHECK_QK_SCALE_SHAPES(div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q),
+                                                       div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K));
 
                         CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
                         if constexpr (FUSE_V_MEAN) {

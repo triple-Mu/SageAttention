@@ -107,24 +107,8 @@ torch::Tensor qk_int8_sv_f8_fuse_v_scale_varlen_attn_launcher_sm89(torch::Tensor
                         // The scale lengths are the block algebra of varlen.h:
                         // total/blk + batch blocks, each carrying the same
                         // per-block entries the dense layout has.
-                        if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {
-                            CHECK_SHAPE(
-                                query_scale, num_qo_heads, blk_total(total_q, batch_size, CTA_Q) * (CTA_Q / WARP_Q));
-                            CHECK_SHAPE(
-                                key_scale, num_kv_heads, blk_total(total_k, batch_size, CTA_K) * (CTA_K / WARP_K));
-                        }
-                        else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {
-                            CHECK_SHAPE(query_scale,
-                                        num_qo_heads,
-                                        blk_total(total_q, batch_size, CTA_Q) * (CTA_Q / WARP_Q) * 8);
-                            CHECK_SHAPE(
-                                key_scale, num_kv_heads, blk_total(total_k, batch_size, CTA_K) * (CTA_K / WARP_K) * 4);
-                        }
-                        else {
-                            static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)
-                                              || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread),
-                                          "Unsupported quantization granularity");
-                        }
+                        SAGEATTN_CHECK_QK_SCALE_SHAPES_VARLEN(blk_total(total_q, batch_size, CTA_Q) * (CTA_Q / WARP_Q),
+                                                              blk_total(total_k, batch_size, CTA_K) * (CTA_K / WARP_K));
 
                         CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 

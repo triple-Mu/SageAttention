@@ -71,23 +71,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                                     ", CTA_K=",
                                     CTA_K);
 
-                        if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {
-                            CHECK_SHAPE(
-                                query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (NUM_THREADS / 32));
-                            CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K));
-                        }
-                        else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {
-                            CHECK_SHAPE(query_scale,
-                                        batch_size,
-                                        num_qo_heads,
-                                        div_ceil(qo_len, CTA_Q) * (NUM_THREADS / 32) * 8);
-                            CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * 4);
-                        }
-                        else {
-                            static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)
-                                              || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread),
-                                          "Unsupported quantization granularity");
-                        }
+                        SAGEATTN_CHECK_QK_SCALE_SHAPES(div_ceil(qo_len, CTA_Q) * (NUM_THREADS / 32),
+                                                       div_ceil(kv_len, CTA_K));
 
                         CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
