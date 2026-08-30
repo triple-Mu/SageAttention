@@ -53,7 +53,9 @@ inputs. On ``--check`` an input hash mismatch is reported as ``ENV-MISMATCH``
 Sections (``--section``, repeatable)
 ------------------------------------
 quant  low-level quantization ops (the former ``_fused`` surface)
-attn   per-arch ``qattn_smXX_*`` kernels on synthetic pre-quantized inputs
+attn   per-arch attention kernels on synthetic pre-quantized inputs (the
+       legacy build calls the ``qattn_smXX_*`` pybind functions, the new one
+       replays the same kernel through ``fwd(..., backend="smXX")``)
 e2e    the public python wrapper end to end
 equiv  new-build-only internal consistency checks; needs no baseline
 
@@ -91,7 +93,10 @@ _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 # --------------------------------------------------------------- arch tables
 
 # arch -> [(kernel name, extra tensor arguments)]; the extras are appended after
-# key_scale in the historical argument order.
+# key_scale in the historical argument order. Only kernels reachable through
+# torch.ops.sageattention.fwd are listed: the two base (no value_scale)
+# sm90/sm100 kernels went away with the qattn_smXX_* ops (their golden cases
+# are skipped via RETIRED_CASE_MARKERS).
 ARCH_ATTN_OPS = {
     80: [
         ("qk_int8_sv_f16_accum_f32_attn", ()),
@@ -106,11 +111,9 @@ ARCH_ATTN_OPS = {
         ("qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf", ("value_scale",)),
     ],
     90: [
-        ("qk_int8_sv_f8_accum_f32_attn_inst_buf", ()),
         ("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", ("value_scale",)),
     ],
     100: [
-        ("qk_int8_sv_f8_accum_f32_attn", ()),
         ("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn", ("value_scale",)),
     ],
     120: [
@@ -170,8 +173,7 @@ E2E_DEFAULT_PV = {80: "fp32", 89: "fp32+fp16", 90: "fp32+fp32", 100: "fp32", 120
 SMOOTH_V_FUSED = {(80, "fp16"), (89, "fp32"), (120, "fp32")}
 
 # (arch, pv_accum_dtype, smooth_v) -> kernel that torch.ops.sageattention.fwd
-# dispatches to; mirrors the switch in fwd_cuda.cu. The two base (no
-# value_scale) sm90/sm100 kernels are unreachable through fwd.
+# dispatches to; mirrors the switch in fwd_cuda.cu.
 FWD_TO_QATTN = {
     (80, "fp32", False): "qk_int8_sv_f16_accum_f32_attn",
     (80, "fp16", False): "qk_int8_sv_f16_accum_f16_attn",
@@ -187,6 +189,11 @@ FWD_TO_QATTN = {
     (120, "fp32", True): "qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn",
     (120, "fp32+fp16", False): "qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
 }
+
+# (arch, kernel name) -> pv_accum_dtype: how NewBackend.attn replays a
+# historical per-arch kernel through fwd (smooth_v needs no entry, it is
+# implied by value_mean being among the kernel's extras).
+QATTN_TO_FWD = {(a, kernel): pv for (a, pv, _sv), kernel in FWD_TO_QATTN.items()}
 
 
 def sm100_tcgen05_enabled():
@@ -383,23 +390,30 @@ class NewBackend:
         sm_scale,
         return_lse,
     ):
-        fn = getattr(self.ops, f"qattn_sm{arch}_{name}")
-        lse = fn(
+        # the qattn_smXX_* ops are retired: replay the case through fwd with
+        # backend= pinning the same arch family (and therefore the same kernel)
+        named = dict(zip(dict(ARCH_ATTN_OPS[arch])[name], extras))
+        fwd_out, lse = self.ops.fwd(
             q,
             k,
             v,
-            out,
             q_scale,
             k_scale,
-            *extras,
-            tensor_layout,
-            bool(is_causal),
-            gran,
-            sm_scale,
-            bool(return_lse),
+            named.get("value_scale"),
+            named.get("value_mean"),
+            tensor_layout=tensor_layout,
+            qk_quant_gran=gran,
+            pv_accum_dtype=QATTN_TO_FWD[(arch, name)],
+            v_layout=ARCH_V[arch][0],
+            is_causal=bool(is_causal),
+            sm_scale=sm_scale,
+            return_lse=bool(return_lse),
+            out_dtype=out.dtype,
+            backend=f"sm{arch}",
         )
-        # the C++ side returns an empty CPU placeholder when return_lse is off
-        return lse if (return_lse and lse is not None and lse.numel()) else None
+        # fwd allocates its output; the harness hashes the caller's buffer
+        out.copy_(fwd_out)
+        return lse if return_lse else None
 
     def quant_per_block_int8(self, x, mean, out, scale, sm_scale, blk, layout):
         self.ops.quant_per_block_int8(x, mean, out, scale, sm_scale, blk, layout)
@@ -851,41 +865,8 @@ def e2e_execute(be, c, inputs):
 # New-build-only self-consistency checks. They need no baseline: each case
 # compares two paths inside the same process and reports "yes"/"no".
 
-EQUIV_ATTN_SHAPES = [(1, 2, 2, 128, 128), (2, 4, 2, 577, 577), (1, 2, 2, 77, 199)]
-
-
 def equiv_cases(env, subset):
     arch = env["e2e_arch"]
-    if arch is not None:
-        for hd in (64, 128):
-            for layout in ("HND", "NHD"):
-                for causal in (False, True):
-                    for lse in (False, True):
-                        for gran in ("per_warp", "per_thread"):
-                            for pv in E2E_PV[arch]:
-                                svs = (False, True) if (arch, pv) in SMOOTH_V_FUSED else (False,)
-                                for smooth_v in svs:
-                                    for b, hq, hk, qo, kv in EQUIV_ATTN_SHAPES:
-                                        if causal and qo != kv:
-                                            continue
-                                        if subset and qo > 256:
-                                            continue
-                                        yield dict(
-                                            kind="fwd_vs_qattn",
-                                            arch=arch,
-                                            hd=hd,
-                                            layout=layout,
-                                            causal=causal,
-                                            lse=lse,
-                                            gran=gran,
-                                            pv=pv,
-                                            smooth_v=smooth_v,
-                                            b=b,
-                                            hq=hq,
-                                            hk=hk,
-                                            qo=qo,
-                                            kv=kv,
-                                        )
     # sageattn_varlen on an equal-length batch must be bit-identical to
     # sageattn on the same tokens: that batch has delta == 0, where the packed
     # kernels' tile structure degenerates to the dense one. Only sm80 has
@@ -921,22 +902,6 @@ def equiv_cases(env, subset):
 
 
 def equiv_build(be, c):
-    if c["kind"] == "fwd_vs_qattn":
-        key = json.dumps(c, sort_keys=True)
-        b, hq, hk, qo, kv, hd, layout = (
-            c["b"],
-            c["hq"],
-            c["hk"],
-            c["qo"],
-            c["kv"],
-            c["hd"],
-            c["layout"],
-        )
-        return {
-            "q": gen(qkv_shape(b, hq, qo, hd, layout), key + "/q", dtype=torch.float16),
-            "k": gen(qkv_shape(b, hk, kv, hd, layout), key + "/k", dtype=torch.float16),
-            "v": gen(qkv_shape(b, hk, kv, hd, layout), key + "/v", dtype=torch.float16),
-        }
     if c["kind"] == "v_pad128":
         key = json.dumps(c, sort_keys=True)
         shape = qkv_shape(1, 2, c["kv"], c["hd"], c["layout"])
@@ -1049,89 +1014,6 @@ def equiv_execute(be, c, inputs):
         if tail.numel() and tail.view(torch.uint8).any():
             return {"equal": "no: padded fp8 tail is not zero"}
         return {"equal": "yes"}
-
-    # fwd vs the per-arch op it dispatches to
-    arch, hd, layout = c["arch"], c["hd"], c["layout"]
-    p = _plan_of(
-        torch.cuda.get_device_capability(inputs["q"].device.index),
-        hd,
-        c["gran"],
-        c["pv"],
-        c["smooth_v"],
-    )
-    if p["error"]:
-        return {"equal": "skip: " + p["error"]}
-    q, k, v = inputs["q"], inputs["k"], inputs["v"]
-    q_int8, q_scale, k_int8, k_scale = ops.quant_qk(
-        q,
-        k,
-        None,
-        tensor_layout=layout,
-        qk_quant_gran=p["qk_quant_gran"],
-        blk_q=p["blk_q"],
-        warp_q=p["warp_q"],
-        blk_k=p["blk_k"],
-        warp_k=p["warp_k"],
-    )
-    value_scale = value_mean = None
-    if p["pv_fp8"]:
-        v_prep, value_scale, value_mean = ops.quant_v_fp8(
-            v,
-            tensor_layout=layout,
-            v_layout=p["v_layout"],
-            scale_max=p["v_scale_max"],
-            smooth_v=p["smooth_v"],
-            pad_multiple=p["v_pad_multiple"],
-        )
-    elif p["smooth_v"]:
-        v_prep, value_mean = ops.sub_mean_v(v, tensor_layout=layout)
-    else:
-        v_prep = v.to(torch.float16)
-
-    out_a, lse_a = ops.fwd(
-        q_int8,
-        k_int8,
-        v_prep,
-        q_scale,
-        k_scale,
-        value_scale,
-        value_mean,
-        tensor_layout=layout,
-        qk_quant_gran=p["qk_quant_gran"],
-        pv_accum_dtype=p["pv_accum_dtype"],
-        v_layout=p["v_layout"],
-        is_causal=c["causal"],
-        sm_scale=hd**-0.5,
-        return_lse=c["lse"],
-        out_dtype=torch.float16,
-    )
-
-    name = FWD_TO_QATTN[(arch, p["pv_accum_dtype"], p["smooth_v"])]
-    extras = dict(ARCH_ATTN_OPS[arch])[name]
-    avail = {"value_scale": value_scale, "value_mean": value_mean}
-    out_b = torch.empty(q_int8.shape, dtype=torch.float16, device=q.device)
-    lse_b = be.attn(
-        arch,
-        name,
-        q_int8,
-        k_int8,
-        v_prep,
-        out_b,
-        q_scale,
-        k_scale,
-        [avail[e] for e in extras],
-        layout,
-        c["causal"],
-        p["qk_quant_gran"],
-        hd**-0.5,
-        c["lse"],
-    )
-    torch.cuda.synchronize()
-    if not torch.equal(out_a, out_b):
-        return {"equal": f"no: fwd != {name} (out)"}
-    if c["lse"] and not torch.equal(lse_a, lse_b):
-        return {"equal": f"no: fwd != {name} (lse)"}
-    return {"equal": "yes"}
 
 
 SECTIONS = {
@@ -1285,6 +1167,18 @@ def locate_diff(golden_t, current_t):
     return f"first diff at {idx} ({elem} of {golden_t.numel()}): {vals}"
 
 
+# Golden cases whose surface was retired with the qattn_smXX_* ops: the
+# fwd_vs_qattn equiv kind, and the two base (no value_scale) kernels fwd
+# cannot reach. A matching golden key counts as skipped, not as a diff. The
+# third marker keeps its closing quote so the fuse_v_scale variants (whose
+# names extend the base one) do not match.
+RETIRED_CASE_MARKERS = (
+    '"kind": "fwd_vs_qattn"',
+    '"name": "qk_int8_sv_f8_accum_f32_attn_inst_buf"',
+    '"name": "qk_int8_sv_f8_accum_f32_attn"',
+)
+
+
 def do_check(be, env, args, golden_dir, results, tensors):
     hpath = golden_dir / "hashes.json"
     if not hpath.exists():
@@ -1328,6 +1222,9 @@ def do_check(be, env, args, golden_dir, results, tensors):
         # a section that was not run here (--section, or equiv on a legacy
         # install) is skipped rather than reported as a thousand MISSINGs
         if section not in args.section or (section == "equiv" and not be.has_equiv):
+            n_skip += 1
+            continue
+        if any(m in key for m in RETIRED_CASE_MARKERS):
             n_skip += 1
             continue
         if not g["stable"]:
