@@ -53,8 +53,11 @@ new(tip)/ fix(tip+预折)轮换顺序抵消热漂移,取轮内配对比值的中
 
 ## 4 残留与后续
 
-- 本机只有 sm_86:sm_80(A100)实跑未验,SASS 为 sm_86 目标码。上机时用
-  L20 同款口径(46 shape 非 causal)复测 fix/base 是否回到 ≈1.0。
+- 已结清——sm_80(A100)实跑:L20(sm_89 SASS)复测 base/fix 0.9995
+  ([P8_SM80_FIX_L20.md](P8_SM80_FIX_L20.md));A100 80GB PCIe(sm_80
+  实卡)8 轮顺序平衡 + causal 控制组漂移校正后 0.9988
+  ([P8_SM80_FIX_A100.md](P8_SM80_FIX_A100.md))。两块数据中心卡上 fold
+  无收益无害,实证收益仅剩本节的 sm_86;回收建议见 A100 报告 §5。
 - varlen hd128 实例 stack 16→24(冷路径);varlen 路径未单独 bench,
   机制与 dense 相同,风险低。
 - 构建系统一个坑(与本修复无关,已绕过):dense sm80 TU 在 ninja deps
