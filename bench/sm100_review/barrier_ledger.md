@@ -103,7 +103,7 @@ threads of a warpgroup arrives once (init count 128 = one completion).
 |---|---|---|---|---|---|
 | load_q | 2 (one-shot) | TMA `expect_tx` (load, per tile) | — (never reused) | mma waits ph 0, once per tile | — |
 | load_kv | 4-slot ring | TMA `expect_tx` (load; item n -> slot n%4) | `tcgen05.commit` by mma after the slot's last reader MMA | mma, ph `(n/4)&1` | load, ph `(n/4-1)&1`, items n>=4 only |
-| mma_s0 / mma_s1 | 1 per tile | `tcgen05.commit` after QK_t chain | arrive x128 by softmax_t (S drained **and** P stored) | softmax_t, ph `j&1` | mma before PV_t(j), ph `j&1` |
+| mma_s0 / mma_s1 | 1 per tile | `tcgen05.commit` after QK_t chain | **two completions per step** (wave14 P chunk delivery), arrive x128 each: #2j = S drained + P chunk 0 (cols [P,P+16)) stored, #2j+1 = P chunk 1 stored | softmax_t, ph `j&1` | mma inside PV_t(j): #2j (always ph 0) before the first PV half, #2j+1 (always ph 1) before the second — constant parities, no phase var |
 | s0_corr / s1_corr (vec) | 1 per tile | arrive x128 by softmax_t (vec stored) | arrive x128 by correction (vec read) | correction, ph `j&1`, j = 0..trip_t | softmax_t at step end, ph `j&1`, j = 0..trip_t-1 |
 | mma_corr | 2 = 1 per O tile | `tcgen05.commit` after PV_t chain | arrive x128 by correction (rescale stored) | correction, ph `j&1` | mma before PV_t(j), j>=1, ph `(j-1)&1` |
 | epi_full | 2 = 1 per O tile, one-shot | arrive x128 by correction (O_t staged to sO, after `fence.proxy.async`) | — (sO never reused; no empty barrier) | epilogue warp, ph 0 | — |
@@ -125,29 +125,32 @@ of item 2j-2 (o0(j-1)) — identical to the dedicated pipe's wait.
 
 ## 2. Event program (source order per role)
 
-mma (elected thread; `[w]`=wait, `[c]`=tcgen05.commit):
+mma (elected thread; `[w]`=wait, `[c]`=tcgen05.commit). `PV_t(j)` expands to
+`[w] s_empty#2j -> PV_t(j) first half (KV cols [0,64)) -> [w] s_empty#2j+1 ->
+second half` (wave14 P chunk delivery); the s_empty completion index below is
+the step's chunk pair `#2j/#2j+1`:
 ```
 [w] q_full#0, [w] kv_full K0      QK0(0)  [c] s0_full#0
 [w] q_full#1                      QK1(0)  [c] s1_full#0   [c] kv_empty(K0)
 [w] kv_full V0
-[w] s0_empty#0                    PV0(0)  [c] corr0_full#0
+[w] s0_empty#0,#1                 PV0(0)  [c] corr0_full#0
 for i = 1 .. trip0-1:
   [w] kv_full K_i                 QK0(i)  [c] s0_full#i
   [w] corr1_empty#(i-2 if i>=2)   -- skipped for the first PV1
-  [w] s1_empty#(i-1)              PV1(i-1)[c] corr1_full#(i-1)  [c] kv_empty(V_{i-1})
+  [w] s1_empty#2(i-1),#2(i-1)+1   PV1(i-1)[c] corr1_full#(i-1)  [c] kv_empty(V_{i-1})
                                   QK1(i)  [c] s1_full#i   [c] kv_empty(K_i)
   [w] kv_full V_i
   [w] corr0_empty#(i-1)
-  [w] s0_empty#i                  PV0(i)  [c] corr0_full#i
+  [w] s0_empty#2i,#2i+1           PV0(i)  [c] corr0_full#i
 for i = trip0 .. trip1-1:         -- causal S1-only rounds
   [w] kv_full K_i
   [w] corr1_empty#(i-2)           -- skipped if PV1 has not run yet
-  [w] s1_empty#(i-1)              PV1(i-1)[c] corr1_full#(i-1)  [c] kv_empty(V_{i-1})
+  [w] s1_empty#2(i-1),#2(i-1)+1   PV1(i-1)[c] corr1_full#(i-1)  [c] kv_empty(V_{i-1})
                                   QK1(i)  [c] s1_full#i   [c] kv_empty(K_i)
   [w] kv_full V_i
 tail:
   [w] corr1_empty#(trip1-2)       -- skipped if trip1 == 1
-  [w] s1_empty#(trip1-1)          PV1(trip1-1) [c] corr1_full#(trip1-1) [c] kv_empty(V_last)
+  [w] s1_empty#2(trip1-1),+1      PV1(trip1-1) [c] corr1_full#(trip1-1) [c] kv_empty(V_last)
 (whole warp) [w] dealloc ph0 -> tcgen05.dealloc(512)
 ```
 
@@ -160,8 +163,10 @@ softmax_t (each of 128 threads; step j):
 [w] s_full#j
 ld chunks 0-3 (one ld + wait::ld each) -> dequant+mask row kept in regs, m_local
 m/denom update; st vec=(m_prev,row_max) -> wait::st, fence, arrive vec_full#j
-exp2+pack from the retained row (no TMEM reads); denom += d_sum
-st P -> wait::st, fence, arrive s_empty#j
+exp2+pack cols [0,64) from the retained row (no TMEM reads)
+st P chunk 0 (x16) -> wait::st, fence, arrive s_empty (completion #2j)
+exp2+pack cols [64,128); denom += d_sum
+st P chunk 1 (x16) -> wait::st, fence, arrive s_empty (completion #2j+1)
 [w] vec_empty#j
 ```
 after the loop: st final vec=(denom,row_max) on the slot acquired by the
@@ -201,7 +206,7 @@ cp.async.bulk.wait_group.read 0     -- sO must outlive the bulk reads
 | kv_full[slot] | one per item mapped to the slot; totals 2*trip1 | 2*trip1 (mma) | 1:1 per item |
 | kv_empty[slot] | 2*trip1 commits (one per item) | max(2*trip1-4, 0) (load, items n>=4) | last <=4 completions unconsumed — harmless (only unmatched **waits** deadlock) |
 | s_full[t] | trip_t | trip_t (softmax_t) | 1:1 |
-| s_empty[t] | trip_t | trip_t (mma, one per PV_t) | 1:1 |
+| s_empty[t] | 2*trip_t (two per step: chunk 0 / chunk 1, x128 each) | 2*trip_t (mma, two per PV_t) | 1:1 |
 | vec_full[t] | trip_t + 1 | trip_t + 1 (correction) | 1:1 |
 | vec_empty[t] | trip_t + 1 | trip_t (softmax_t) | final completion unconsumed — harmless |
 | corr_full[t] | trip_t | trip_t (correction: trip_t-1 rescales + epilog) | 1:1 |
@@ -239,15 +244,23 @@ complete once. (This is also why the probes use a dedicated one-shot
 dealloc barrier instead of re-waiting a per-iteration barrier at an
 arbitrary later phase — see p0c_umma_pipeline.cu.)
 
+s_empty (wave14, two completions per step) discharges the same obligation
+with a shorter chain: at the mma's parity-0 wait for #2j the completion
+count is at most 2j+1 — #2j+2 is softmax step j+1's chunk-0 arrival, which
+needs `s_full#(j+1)` = QK_t(j+1), and the elected thread issues that only
+after this PV_t(j) call returns (both waits passed). Likewise count <= 2j+2
+at the parity-1 wait for #2j+1. Within one step the parities of #2j / #2j+1
+are fixed (0 / 1), which is why the waits need no phase variable.
+
 ## 5. Cross-warp TMEM/smem hazards
 
 | # | hazard | discharged by |
 |---|---|---|
-| H1 | QK_t(j+1) overwrites S_t while softmax_t still reads step j | mma waits `s_empty#j` before PV_t(j), and QK_t(j+1) is issued after that wait in the elected thread's program order; softmax arrives only after its last `tcgen05.ld` of step j completed (`wait::ld` per chunk) and its P `wait::st` + `fence::before_thread_sync` |
+| H1 | QK_t(j+1) overwrites S_t while softmax_t still reads step j | mma waits `s_empty#2j` and `#2j+1` inside PV_t(j), and QK_t(j+1) is issued after that call in the elected thread's program order; softmax's chunk-0 arrival (#2j) already implies the full S row is drained (all `tcgen05.ld` + `wait::ld` precede any P pack) and each arrival follows its chunk's P `wait::st` + `fence::before_thread_sync` |
 | H2 | QK_t(j+1) overwrites P_t cols [32,64) while PV_t(j) still reads P_t | both are UMMA ops issued by the same elected thread into one in-order UMMA queue; PV_t(j) is issued first, so it consumes P before QK_t(j+1) writes (same argument the CUTLASS sm100 FMHA mainloop and the 128-thread kernel's TMEM_COL_P overlay rely on) |
 | **H3** | **QK_t(j+1) overwrites vec_t cols [0,2) before correction read vec_t(j)** | see section 6 |
 | H4 | TMA K/V load overwrites a ring slot still read by an MMA | load waits `kv_empty` of the previous lap; that barrier completes via `tcgen05.commit` issued after the slot's last reader (K_i: QK1(i); V_i: PV1(i)), and commit fires only when those MMAs **retired** |
-| H5 | PV_t(j) reads P_t(j) before all 128 softmax threads stored it | `s_empty#j` completes only after 128 arrivals, each preceded by that thread's P `wait::st` + fence; mma issues `fence::after_thread_sync` after the wait |
+| H5 | PV_t(j) reads P_t(j) before all 128 softmax threads stored it | per chunk: `s_empty#2j` (chunk 0) / `#2j+1` (chunk 1) each complete only after 128 arrivals, each preceded by that thread's chunk `wait::st` + fence; mma issues `fence::after_thread_sync` after each wait, and each PV half touches only its own chunk's P columns while softmax may still be storing the other chunk (disjoint TMEM columns) |
 | H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j); a warp that ballot-skipped the rescale (wave14) has no in-flight TMEM write to order — its arrival is trivially safe |
 | H7 | correction reads O_t (rescale j / epilog) before PV_t(j-1) finished accumulating | `corr_full#(j-1)` completes when the PV chain retired (tcgen05.commit semantics) |
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
@@ -313,10 +326,11 @@ i = 1..trip0-1, S1-only rounds, tail). Induction over spine positions:
   (item 2i+1) needs V_{i-2} released (iteration i-1 < i). Both precede the
   waiting position; the load warp itself blocks only on those releases and
   otherwise runs ahead.
-* `s_empty#j` waits: completed by softmax_t finishing step j, which needs
-  `s_full#j` (QK_t(j), earlier in the spine) and `vec_empty#(j-1)`
-  (correction consumed vec_t(j-1), which needs `corr_full#(j-2)` =
-  PV_t(j-2), earlier in the spine).
+* `s_empty#2j/#2j+1` waits: completed by softmax_t reaching step j's chunk
+  arrivals, which needs `s_full#j` (QK_t(j), earlier in the spine) and
+  `vec_empty#(j-1)` (correction consumed vec_t(j-1), which needs
+  `corr_full#(j-2)` = PV_t(j-2), earlier in the spine); #2j+1 additionally
+  sits behind #2j in softmax's own program order.
 * `corr_empty#(j-1)` waits: completed by correction's rescale(t,j), which
   needs `vec_full#j` (softmax step j, needing `s_full#j` = QK_t(j); in the
   spine QK0(i) precedes PV0(i), and QK1(i) precedes PV1(i) because PV1(i)

@@ -838,3 +838,61 @@ corr_empty 更早到 → mma 的 `wait_corr_empty` 等待缩短。挂账 +2~5% �
 | ncu(b4h32s16384c0) | duration 下降为准;佐证:mma 视角 stalled_barrier(wait_corr_empty)回落、softmax 视角 long_scoreboard(S drain 与 corr 的 TMEM 口争用)回落 |
 | 跳过率抽查(可选) | 临时加 `SAGEATTN_DEBUG` printf 或 ncu source counter 不划算;用 §4.1 模型对照 duration 弹性即可,不单独插桩 |
 
+
+### 11.2 P 64 列分块交付(cudnn bmm2_ready[chunk] 同款,保列序 bit-exact 版)
+
+cudnn DSL 的结构(softmax :1387-1405 分两档 arrive,mma :1079-1093 分两档
+wait):P 按 64 列一档提前交付,mma 在 softmax 打包后半行时就发 PV 前半。
+本实现取 §4.3 预先声明的「保列序只拆 arrive」变体:
+
+* **softmax**:exp2+pack 主循环(w=0..31,每 w 一个 quad)逐 w 的运算体、
+  w 顺序、d_sum 4 链喂法**一行未动**;唯一变化是 w=16 处插入
+  `tcgen05.st.x16`(P 词 [0,16) → cols [P,P+16))+ `wait::st` + fence +
+  arrive,行尾的 x32 store 改为第二条 x16(P 词 [16,32) → [P+16,P+32))。
+  同字节写同列、浮点值序不变 → **bit-exact**,golden-sm100-g1ws 硬判据。
+* **barrier 设计(与 cudnn 的差异)**:不加新 barrier,`s_empty` 每步完成
+  **两次**(每次仍 x128):completion #2j = S 已 drain + P chunk 0 已写,
+  #2j+1 = P 全写完(兼旧「下一 QK 可覆写 S」语义)。偶数次完成恒为
+  parity 0、奇数次恒为 parity 1,mma 的两个 wait 用**常量 parity**,原
+  s0/s1_empty_phase 两个状态寄存器整体删除。phase-alias 自由:mma 等
+  #2j 时完成计数至多 2j+1(#2j+2 需要 QK_t(j+1),而它在本 PV 调用之后
+  才发射)——账本 §4 新段。cudnn 用两个独立 barrier 且 chunk0 计数合并
+  correction 到达(省 mma 一次 corr wait);合并版会把 corr_empty 语义
+  搬家、账本重写面大,本轮不取,留作后续单独可评估项。
+* **mma**:pv 内两段 wait/fence,PV 链前半(v_it 0,1,P cols +[0,16))
+  在 #2j 后发,后半在 #2j+1 后发;`accumulate || (v_it > 0)` 表达式不变。
+* **寄存器工程**(40-reg 区三轮打磨,过程记档防复发):初版(独立
+  kBarSHalf barrier + 共享 phase 翻转)ptxas 把相邻 QK/PV 的 descriptor
+  SHF/LOP3 链批量前置、跨新增 wait spin 携带,mma 区 spill 8-32B;修法
+  = qk/pv 的 descriptor 基址过空 `asm volatile("+r")` 钉在各自 wait 之后
+  (§10.3 pin 同款)+ 常量 parity 删两个 phase 寄存器。v_item 改为按
+  2i±1 现算的变体实测更差(12B spill),保留携带式 v_item。
+
+**触发收益机制**:softmax 的 exp2/pack 段是每步最长的 XU 突发;分块后
+mma 的 PV_t(j) 等待从「整行 pack 完」缩到「半行 pack 完」,PV 前半与
+softmax 后半行的 MUFU 突发重叠。预期 +0~2%(§4.3),短序列/低 trip 弹性
+更大;代价是 softmax 每步多一次 `wait::st` 暴露(x16 store 的回程)与
+mma 每 PV 多一次 wait spin。若上机 bench 出现负差,单 commit revert。
+
+本地门禁(nvcc 13.3,4 实例 × sm_100a/sm_110a):0 spill / 0 stack /
+入口 128 reg;分区峰值 softmax 165-179(sm_110a 188,≤191)、correction
+71-77(≤87)、entry ≤93(≤127);correction/entry 区对 11.1 的 SASS
+opcode 直方图逐项一致(改动只落 softmax/mma 区)。SASS 结构自证:
+STTM.x32 38→30、STTM.x16 0→16(8 个 P store 站点 ×2 chunk,mid-loop
+`if (w==16)` 折叠成单站点),PHASECHK spin 站点 +40。
+
+上机判据(B200,口径同 11.1 表):golden WS=1 对 golden-sm100-g1ws
+`diff=0`(硬判据,出 diff 即 revert——本项从值序上无任何改位来源,
+diff 意味着 barrier/时序 bug 而非舍入);压测 ws_stress 2×8000 零挂死
+(新增关注点:两次完成/步的 parity 方案,挂死症状会落在 mma 的
+s_empty spin,cuda-gdb 按账本 §2 的 #2j/#2j+1 记法读 PC);bench 22 点
+几何均值 >1.005 且无形状 <0.995,短序列点位单独看;ncu
+`sm__pipe_tensor_cycles_active` 占空收窄、mma 视角 stalled_barrier 回落。
+
+### 11.3 wave14 联合上机流程
+
+两 commit 顺序上机:先 11.1(ballot)单独过 golden+bench,再叠 11.2;
+任一项 bench 不达标独立 revert,不连坐。全绿后 XU 利用率复采
+(b4h32s16384c0 全 set,§7.5 历史序列 r5 16.35 → G1 14.69 → 目标带
+≤14.0),BEYOND_CUDNN_PLAN §6 的 Phase A 预算(+3~8% 长序列)以 22 点
+对照 §1.1 的 need 列逐形状销账。
