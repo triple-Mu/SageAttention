@@ -1171,6 +1171,21 @@ cutedsl 用 16 warp 全特化跑到 62-67% SOL,对照基线的 44.8%,这才是�
 同时关掉两条:B1 这类「加深 KV 预取」和 C2 这类「TMEM 内腾挪」在 128 线程
 地基上都已实测判负,不要再试第三种排列。
 
+### C1 ws G1 验收与 golden 切换点(wave11,B200 JID 4027436)
+
+G1(softmax 值域改写,commit ae84b8b,tree dfaebb4)双级门禁全过,收为
+ws kernel 最终态;lever A(5552fc2)的长序列劣化经四态单变量归因坐实后随
+G1 一并消失。全部实测(golden 246 diff 分布、accuracy 0.999242/0.038967、
+2×8000 压测、bench ws/old 1.1308、ncu −10.2%)见
+`bench/sm100_review/C1_DESIGN.md` §9.6,原始数据在集群
+`SageAttention_refactor/logs-w11/`。
+
+**golden 切换点**:自 dfaebb4 起,sm100 ws 路(`SAGEATTN_SM100_WS=1`)的
+bitwise gate 以 `golden-sm100-g1ws`(wave11 重 dump,自检 `ok=2107 diff=0`)
+为准;旧路(`=0`)继续对 `golden-sm100`(`ok=2082 diff=0`)。auto 启发式
+同轮改为 d128 全开(commit a1ca3b7),auto 抽查 d128 1.12-1.52×、d64 恰
+1.0000。
+
 ## 6. 性能决策点
 
 | 项 | 机器 | 命令/指标 | 决策 |

@@ -360,7 +360,8 @@ d64 s32768:
   结论在长序列继续成立。
 
 若未来下调,取 `qo_len >= (is_causal ? 28672 : 8192)` 并接受上表两处
-小负点;本轮只记录,源码阈值不动。
+小负点;本轮只记录,源码阈值不动。(wave11 后此表已过时:G1 落地把
+d128 全域抬到 ws/old ≥1.09,qo_len cut 整体撤销,见 §9.6。)
 
 ## 7. 风险与回退
 ### 6.5 r4 上机小结(wave8,口径同 §6.2)
@@ -429,6 +430,12 @@ softmax 164-170(预算 192)、correction 71-77(88)、mma/load/epi 38(40)。
   (lever A)、`lts__t_sectors_op_write` 回落(lever B)、duration 下降;
 - 压测口径不变(outstanding tcgen05.ld 仍为 2,未触 A5 边界)。
 
+上机结果(wave10 r5 + wave11 四态单变量归因,详见 §9.6):短序列大赢
+(s1024 ws 用时 −24~28%,lever B 的 epilogue 收尾占比效应),但 **lever A
+在长序列(≥16k)劣化 4.8-7.1%**(A-only vs r4,12/12 形状),lever B 收回
+约一半;M2 判据对 r4 min 0.949 未过。该劣化随 G1 重写 softmax 段一并消失,
+lever A 不再单独立项。
+
 ## 7. 与 cutedsl 的执行结构对账(wave9,r4 之后的剩余差距)
 
 口径:我方 = r5 双 lever 后的 ws kernel,数据来自 cuobjdump(nvcc 13.3,
@@ -486,7 +493,7 @@ long_scoreboard 再议,G3 维持 A5 红线不动。
 4. 若 A2/A5 型未定位挂死复现(k_scale 预载/TMEM 批量读的前科),规则不变:
    不重开,绕开该结构。
 
-## 9. G1:softmax 值域改写(wave10,已实现,待上机)
+## 9. G1:softmax 值域改写(wave10 实现;wave11 上机验收通过,见 9.6)
 
 精度换性能改动(既定政策,双级门禁):golden bitwise gate 预期破,验收口径
 = accuracy gate + bench 双闸,上机验收后重 dump golden(流程见 §9.5)。
@@ -599,3 +606,58 @@ per-thread,128 行 × 32 块 × 128 列。
    `tools/compare_reference.py --dump --golden-dir <新目录>` 固化 G1 后
    基线(双路口径不变:0 与 1 各一份);HARDWARE_CHECKLIST 记录切换点
    commit,此后 ws 路的 bitwise gate 以新 golden 为准。
+
+### 9.6 上机实测(wave11,B200;G1 验收通过,收为最终态)
+
+口径:tree dfaebb4(sage-w5,`TORCH_CUDA_ARCH_LIST=10.0a` +
+`-DSAGE_PRUNE_GENCODE=OFF`),B200 单卡独占(umbriel,JID 4027436,
+pytorch_26.07-py3 容器,torch 2.13.0a0 nv26.07 / CUDA 13.3);bench 协议
+同 §6.2/§6.5(独占、双向交替 3 轮取 median,states 轮间 spread ≤0.194%)。
+原始数据与日志:集群 `SageAttention_refactor/logs-w11/`
+({bench,states,gap,autospot,ncu}/ 与 g1_ws?.txt、acc_*、STAGE)。
+
+**双级门禁(§9.5 步骤 1-2、4-5)**:
+
+| 项 | 结果 |
+|---|---|
+| golden WS=0(旧 golden-sm100) | `ok=2082 diff=0 missing=0`(PRUNE=OFF 关掉 wave10 的 missing=792 敞口;旧 kernel TU 真机逐字节不动) |
+| golden WS=1(同一份旧 golden) | `diff=246/2082`,全部圈在 arch=100(attn 186/396、e2e 60/60;causal 两态、lse 两态、整块/尾块 kv 都有)——denom 重结合的 fp16/LSE 舍入翻转,与 9.3 包络一致,无 NaN/Inf |
+| accuracy gate(WS=1) | `pytest test/test_accuracy.py` 54 passed / 8 skipped;数值抄录(scripts-w11/w11_accnum.py,qo 4096 全组合):最差 cos 0.999242 / rel_l1 0.038967(阈 0.99/0.06),与 9.3 仿真及 fp8-PV 后端历史实测(0.99926/0.039)吻合 |
+| 压测(WS=1) | ws_stress SWEEP 2k-128k×causal + s32768 定点 8000×2 零挂死 |
+| golden 重 dump | WS=1 固化到 `golden-sm100-g1ws`(自检 `ok=2107 diff=0`);WS=0 路仍以 `golden-sm100` 为准,launcher 重建后复检 `ok=2082 diff=0` |
+
+**bench 22 点(ws-G1/old/cudnn ×3 轮,logs-w11/bench)**:ws/old 几何均值
+**1.1308**(r5 0.989 → +14%),d128 段 1.1518、20/20 全正
+(s1024 1.18-1.37、s4096 1.13-1.15、长序列 1.10-1.13),d64 仍 0.93-0.95;
+对 r4 的 §6.6 M2 判据 geomean 1.1514、min 1.0040(全过)。
+ws/cudnn 0.8346(d128 0.8621;r5 期 0.753,cutedsl 包络 ~0.95+)。
+
+**四态归因(12 个 d128 长序列形状,s{16384,32768,131072}×causal×b{1,4},
+logs-w11/states;四树同容器同卡,old 跨树一致性 ≤0.09%)**:
+
+| ws 用时对 r4 ws(>1 = 更慢) | geomean | 区间 |
+|---|---|---|
+| A-only(5af2e06 + ws.cu@5552fc2) | **1.0580** | 1.048-1.071(causal 侧更重) |
+| r5(A+B,aa12179) | 1.0315 | 1.002-1.054 |
+| G1-full(dfaebb4) | **0.9135** | 0.879-0.941 |
+
+lever A 长序列劣化坐实(A-only 单变量 +4.8~7.1%);lever B 收回一部分
+(r5 比 A-only 轻);G1 重写 softmax 段后不仅吸收还反超 r4
+(12/12 快 5.9-12.1%,ws/old 全 ≥1.10)。裁决:**收 G1-full 为最终态,
+lever A 不再单独立项**。
+
+**auto 门限重定(commit a1ca3b7)**:gap 补采(§6.5 网格重跑于 G1,
+logs-w11/gap)d128 全正(最差 1.0911 @ b1 s6144 非 causal,causal 段
+1.120-1.125),d64 s32768 仍 0.908-0.933。合并 22 点 + gap + states:
+d128 在 qo 1024-131072 全部 ws/old ≥1.09 → `sm100_ws_auto_pick` 撤销
+qo_len cut,改为 **head_dim==128 即走 WS**,d64 维持不进。重建后 auto
+抽查(logs-w11/autospot):d128 s512/1024/8192/20480/32768 auto/old
+1.12-1.52,d64 s16384 = 1.0000(正确停在旧 kernel)。
+
+**ncu(b4h32s16384c0,ws;logs-w11/ncu/g1_ws_s16384_c0.\*)**:duration
+16.35→**14.69 ms**(−10.2%,绝对判据),SM SOL 49.1→54.5%;
+`smsp__pipe` 侧 mio_throttle 0.62→0.26、not_selected 0.32→0.22
+(串行 ALU 链拆除的直接痕迹)。per-issue stall 比值(long_scoreboard
+4.67→5.24、cyc/issued 8.73→9.55)按既定口径跨版本不可比(每块指令数
+大幅下降,分母缩水);LDTM 结构未动,L2 write sectors 与 r5 持平
+(lever B 保留),L2 read +14%(per-class k_scale 预乘的读放大,非判据)。
