@@ -204,9 +204,7 @@ load_async_4D(uint32_t dst, void const* const src_tma_map, uint32_t bar, int c0,
 __device__ __forceinline__ void commit_bar(uint32_t bar)
 {
 #ifdef SAGE_TCGEN05_ENABLED
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n" ::"r"(bar)
-        : "memory");
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n" ::"r"(bar) : "memory");
 #else
     (void)bar;
     __trap();
@@ -304,8 +302,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     // --- TMEM column plan (see file header) ---
     constexpr uint32_t TMEM_COL_S0     = 0;
     constexpr uint32_t TMEM_COL_S1     = 128;
-    constexpr uint32_t TMEM_COL_VEC    = 0;    // offset inside each S tile
-    constexpr uint32_t TMEM_COL_P      = 32;   // offset inside each S tile
+    constexpr uint32_t TMEM_COL_VEC    = 0;   // offset inside each S tile
+    constexpr uint32_t TMEM_COL_P      = 32;  // offset inside each S tile
     constexpr uint32_t TMEM_COL_O0     = 256;
     constexpr uint32_t TMEM_COL_O1     = 256 + head_dim;
     constexpr uint32_t TMEM_COLS_TOTAL = 512;  // one CTA/SM by construction; alloc all
@@ -350,8 +348,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     const uint32_t warp_group = warp_idx / 4;
 
     extern __shared__ __align__(1024) int8_t smem_[];
-    int8_t*                                  sQ      = smem_;                      // 2 tiles
-    int8_t*                                  sKVring = smem_ + 2 * SMEM_Q_BYTES;   // 4 slots
+    int8_t*                                  sQ      = smem_;                     // 2 tiles
+    int8_t*                                  sKVring = smem_ + 2 * SMEM_Q_BYTES;  // 4 slots
 
     // --- barriers (roles/counts: bench/sm100_review/barrier_ledger.md).
     //     One array so every role addresses them as a single u32 base plus
@@ -372,7 +370,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     };
     __shared__ __align__(8) uint64_t bars[kNumBars];
     __shared__ __align__(4) uint32_t tmem_addr_slot;
-    __shared__ __align__(16) float   sV_scale[fuse_v_scale ? head_dim : 1];
+    __shared__ __align__(16) float sV_scale[fuse_v_scale ? head_dim : 1];
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -396,10 +394,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     // --- stage v_scale in smem (published by the __syncthreads below) ---
     if constexpr (fuse_v_scale) {
         if (threadIdx.x < head_dim) {
-            const float* V_scale_base_ptr =
-                V_scale
-                + static_cast<int64_t>(blockIdx.z) * (gridDim.y / qo_per_kv_head) * head_dim
-                + static_cast<int64_t>(blockIdx.y / qo_per_kv_head) * head_dim;
+            const float* V_scale_base_ptr = V_scale
+                                            + static_cast<int64_t>(blockIdx.z) * (gridDim.y / qo_per_kv_head) * head_dim
+                                            + static_cast<int64_t>(blockIdx.y / qo_per_kv_head) * head_dim;
             sV_scale[threadIdx.x] = V_scale_base_ptr[threadIdx.x];
         }
     }
@@ -448,8 +445,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         const uint32_t bar_empty  = bars_u32 + (kBarSEmpty + tile) * 8;
         const uint32_t bar_vfull  = bars_u32 + (kBarVecFull + tile) * 8;
         const uint32_t bar_vempty = bars_u32 + (kBarVecEmpty + tile) * 8;
-        const uint32_t tmem_row =
-            tmem_addr_slot + ((warp_idx % 4) * 32 << 16) + (tile ? TMEM_COL_S1 : TMEM_COL_S0);
+        const uint32_t tmem_row   = tmem_addr_slot + ((warp_idx % 4) * 32 << 16) + (tile ? TMEM_COL_S1 : TMEM_COL_S0);
 
         float local_sm_scale = sm_scale * math::log2e;  // :237 (softmax runs in base 2)
 
@@ -474,7 +470,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         }
         else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
             const uint32_t num_warp_tiles_q = num_qblocks * (CTA_Q / 32);
-            q_scale_idx = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
+            q_scale_idx                     = static_cast<int64_t>(batch_id) * num_qo_heads * (num_warp_tiles_q * 8)
                           + static_cast<int64_t>(head_id) * (num_warp_tiles_q * 8) + qblk * ((CTA_Q / 32) * 8)
                           + (lane_row / 32) * 8 + (lane_row % 8);
         }
@@ -487,7 +483,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         }
         else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
             const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
-            K_scale_base_ptr = K_scale
+            K_scale_base_ptr          = K_scale
                                + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
                                + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
         }
@@ -517,7 +513,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         // and the max / p / d_sum sequences keep the same order (see file
         // header). is_last folds the causal/OOB mask exactly like :431-444.
         // -------------------------------------------------------------------
-        auto softmax_step = [&](auto is_last_t, uint32_t iter, uint32_t (&RS0_u32)[32]) {
+        auto softmax_step = [&](auto is_last_t, uint32_t iter, uint32_t(&RS0_u32)[32]) {
             constexpr bool is_last = decltype(is_last_t)::value;
 
             // K-scale(s) for this tile (mirrors :400-410)
@@ -605,7 +601,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             const float neg_row_max = -row_max;
             float       d_sum       = 0.0f;
             uint32_t    RP_u32[CTA_K / 4];
-            auto exp2_pack_chunk    = [&](const uint32_t (&rs)[32], uint32_t c) {
+            auto        exp2_pack_chunk = [&](const uint32_t(&rs)[32], uint32_t c) {
 #pragma unroll
                 for (uint32_t w = 0; w < 8; w++) {
                     float p[4];
@@ -699,22 +695,28 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         };
 
         // read vec -> value pair (fenced tcgen05.ld, releases the vec slot)
-        auto read_vec = [&](uint32_t bar_vfull, uint32_t bar_vempty, int& vphase, uint32_t vec_addr, float& v0,
-                            float& v1) {
-            ws::wait_bar(bar_vfull, vphase);
-            vphase ^= 1;
-            tcgen05::tcgen05_fence_after_sync();
-            uint32_t vec_u32[2];
-            ws::tmem_ld_32x32b_x2(vec_u32, vec_addr);
-            tcgen05::tmem_ld_wait();
-            v0 = __uint_as_float(vec_u32[0]);
-            v1 = __uint_as_float(vec_u32[1]);
-            ws::arrive_bar(bar_vempty);
-        };
+        auto read_vec =
+            [&](uint32_t bar_vfull, uint32_t bar_vempty, int& vphase, uint32_t vec_addr, float& v0, float& v1) {
+                ws::wait_bar(bar_vfull, vphase);
+                vphase ^= 1;
+                tcgen05::tcgen05_fence_after_sync();
+                uint32_t vec_u32[2];
+                ws::tmem_ld_32x32b_x2(vec_u32, vec_addr);
+                tcgen05::tmem_ld_wait();
+                v0 = __uint_as_float(vec_u32[0]);
+                v1 = __uint_as_float(vec_u32[1]);
+                ws::arrive_bar(bar_vempty);
+            };
 
         // O_t *= o_scale (float op order mirrors :479-491)
-        auto rescale = [&](uint32_t bar_vfull, uint32_t bar_vempty, int& vphase, uint32_t vec_addr,
-                           uint32_t bar_cfull, uint32_t bar_cempty, int& cphase, uint32_t tmem_o_row) {
+        auto rescale = [&](uint32_t bar_vfull,
+                           uint32_t bar_vempty,
+                           int&     vphase,
+                           uint32_t vec_addr,
+                           uint32_t bar_cfull,
+                           uint32_t bar_cempty,
+                           int&     cphase,
+                           uint32_t tmem_o_row) {
             float m_prev, rmax;
             read_vec(bar_vfull, bar_vempty, vphase, vec_addr, m_prev, rmax);
             const float o_scale = math::ptx_exp2(m_prev - rmax);  // same expr as :456 -> same bits
@@ -737,8 +739,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         };
 
         // final O_t = O_t * d_rcp (* v_scale) -> global (mirrors :567-599)
-        auto epilog = [&](uint32_t bar_vfull, uint32_t bar_vempty, int& vphase, uint32_t vec_addr,
-                          uint32_t bar_cfull, int& cphase, uint32_t tmem_o_row, uint32_t q_idx) {
+        auto epilog = [&](uint32_t bar_vfull,
+                          uint32_t bar_vempty,
+                          int&     vphase,
+                          uint32_t vec_addr,
+                          uint32_t bar_cfull,
+                          int&     cphase,
+                          uint32_t tmem_o_row,
+                          uint32_t q_idx) {
             float denom_t, rmax_unused;
             read_vec(bar_vfull, bar_vempty, vphase, vec_addr, denom_t, rmax_unused);
             ws::wait_bar(bar_cfull, cphase);
@@ -818,8 +826,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
         if (warp_idx == kMmaWarp) {
             if (tcgen05::elect_one()) {
-                const uint32_t trip0   = trip_count(0);
-                const uint32_t trip1   = trip_count(1);
+                const uint32_t trip0 = trip_count(0);
+                const uint32_t trip1 = trip_count(1);
                 // one live TMEM base; per-call +CONST rematerializes freely
                 const uint32_t tb = tmem_addr_slot;
 
@@ -861,8 +869,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 // The bar_s_empty wait is the P-ready acquire: softmax arrives
                 // only after its P tcgen05.st completed (and it doubles as the
                 // S-drained signal for the next QK on this tile).
-                auto pv = [&](uint32_t tmem_O_t, uint32_t tmem_P_t, uint32_t bar_p_ready, int& p_ready_phase,
-                              uint32_t bar_o_done, uint32_t sV_slot, bool accumulate) {
+                auto pv = [&](uint32_t tmem_O_t,
+                              uint32_t tmem_P_t,
+                              uint32_t bar_p_ready,
+                              int&     p_ready_phase,
+                              uint32_t bar_o_done,
+                              uint32_t sV_slot,
+                              bool     accumulate) {
                     ws::wait_bar(bar_p_ready, p_ready_phase);
                     p_ready_phase ^= 1;
                     tcgen05::tcgen05_fence_after_sync();
@@ -892,7 +905,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 qk(tb + TMEM_COL_S1, sQ_u32 + SMEM_Q_BYTES, kv_slot_u32(0), bars_u32 + (kBarSFull + 1) * 8);
                 release_kv(0);  // K_0 (fires when QK10 retired)
                 wait_kv(1);     // V_0
-                pv(tb + TMEM_COL_O0, tb + TMEM_COL_S0 + TMEM_COL_P, bars_u32 + kBarSEmpty * 8, s0_empty_phase, bars_u32 + kBarCorrFull * 8,
+                pv(tb + TMEM_COL_O0,
+                   tb + TMEM_COL_S0 + TMEM_COL_P,
+                   bars_u32 + kBarSEmpty * 8,
+                   s0_empty_phase,
+                   bars_u32 + kBarCorrFull * 8,
                    kv_slot_u32(1),
                    /*accumulate=*/false);
 
@@ -907,11 +924,15 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     if (pv1_started) {
                         wait_corr_empty(bars_u32 + (kBarCorrEmpty + 1) * 8, corr1_empty_phase);
                     }
-                    pv(tb + TMEM_COL_O1, tb + TMEM_COL_S1 + TMEM_COL_P, bars_u32 + (kBarSEmpty + 1) * 8, s1_empty_phase,
-                       bars_u32 + (kBarCorrFull + 1) * 8, kv_slot_u32(v_item),
-                       pv1_started);       // PV1(i-1)
+                    pv(tb + TMEM_COL_O1,
+                       tb + TMEM_COL_S1 + TMEM_COL_P,
+                       bars_u32 + (kBarSEmpty + 1) * 8,
+                       s1_empty_phase,
+                       bars_u32 + (kBarCorrFull + 1) * 8,
+                       kv_slot_u32(v_item),
+                       pv1_started);  // PV1(i-1)
                     pv1_started = true;
-                    release_kv(v_item);    // V_{i-1}
+                    release_kv(v_item);  // V_{i-1}
 
                     qk(tb + TMEM_COL_S1, sQ_u32 + SMEM_Q_BYTES, kv_slot_u32(2 * i), bars_u32 + (kBarSFull + 1) * 8);
                     release_kv(2 * i);  // K_i
@@ -919,7 +940,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     wait_kv(2 * i + 1);  // V_i
                     v_item = 2 * i + 1;
                     wait_corr_empty(bars_u32 + kBarCorrEmpty * 8, corr0_empty_phase);
-                    pv(tb + TMEM_COL_O0, tb + TMEM_COL_S0 + TMEM_COL_P, bars_u32 + kBarSEmpty * 8, s0_empty_phase, bars_u32 + kBarCorrFull * 8,
+                    pv(tb + TMEM_COL_O0,
+                       tb + TMEM_COL_S0 + TMEM_COL_P,
+                       bars_u32 + kBarSEmpty * 8,
+                       s0_empty_phase,
+                       bars_u32 + kBarCorrFull * 8,
                        kv_slot_u32(v_item),
                        /*accumulate=*/true);  // PV0(i)
                 }
@@ -930,8 +955,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     if (pv1_started) {
                         wait_corr_empty(bars_u32 + (kBarCorrEmpty + 1) * 8, corr1_empty_phase);
                     }
-                    pv(tb + TMEM_COL_O1, tb + TMEM_COL_S1 + TMEM_COL_P, bars_u32 + (kBarSEmpty + 1) * 8, s1_empty_phase,
-                       bars_u32 + (kBarCorrFull + 1) * 8, kv_slot_u32(v_item),
+                    pv(tb + TMEM_COL_O1,
+                       tb + TMEM_COL_S1 + TMEM_COL_P,
+                       bars_u32 + (kBarSEmpty + 1) * 8,
+                       s1_empty_phase,
+                       bars_u32 + (kBarCorrFull + 1) * 8,
+                       kv_slot_u32(v_item),
                        pv1_started);  // PV1(i-1)
                     pv1_started = true;
                     release_kv(v_item);
@@ -945,8 +974,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 if (pv1_started) {
                     wait_corr_empty(bars_u32 + (kBarCorrEmpty + 1) * 8, corr1_empty_phase);
                 }
-                pv(tb + TMEM_COL_O1, tb + TMEM_COL_S1 + TMEM_COL_P, bars_u32 + (kBarSEmpty + 1) * 8, s1_empty_phase,
-                   bars_u32 + (kBarCorrFull + 1) * 8, kv_slot_u32(v_item),
+                pv(tb + TMEM_COL_O1,
+                   tb + TMEM_COL_S1 + TMEM_COL_P,
+                   bars_u32 + (kBarSEmpty + 1) * 8,
+                   s1_empty_phase,
+                   bars_u32 + (kBarCorrFull + 1) * 8,
+                   kv_slot_u32(v_item),
                    pv1_started);
                 release_kv(v_item);
             }
@@ -970,11 +1003,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 // laps >= 1 wait for the mma warp's retire-commit, whose
                 // phase is derivable from the item: slot n%4 has completed
                 // n/4 empty phases before item n needs it -> wait (n/4-1)&1.
-                const uint32_t bars_u32 = ws::smem_u32(bars);
-                const uint32_t sQ_u32   = ws::smem_u32(sQ);
-                const uint32_t ring_u32 = sQ_u32 + 2 * SMEM_Q_BYTES;
-                auto kv_full_bar  = [&](uint32_t item) { return bars_u32 + (kBarKvFull + (item & 3)) * 8; };
-                auto kv_empty_wait = [&](uint32_t item) {
+                const uint32_t bars_u32      = ws::smem_u32(bars);
+                const uint32_t sQ_u32        = ws::smem_u32(sQ);
+                const uint32_t ring_u32      = sQ_u32 + 2 * SMEM_Q_BYTES;
+                auto           kv_full_bar   = [&](uint32_t item) { return bars_u32 + (kBarKvFull + (item & 3)) * 8; };
+                auto           kv_empty_wait = [&](uint32_t item) {
                     if (item >= 4) {
                         ws::wait_bar(bars_u32 + (kBarKvEmpty + (item & 3)) * 8, ((item >> 2) - 1) & 1);
                     }
@@ -986,8 +1019,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 ws::expect_bytes_bar<SMEM_KV_BYTES>(kv_full_bar(0));
                 ws::load_async_4D(ring_u32, &tensorMapK, kv_full_bar(0), 0, 0, kv_head_id, batch_id);
                 ws::expect_bytes_bar<SMEM_Q_BYTES>(bars_u32 + (kBarQFull + 1) * 8);
-                ws::load_async_4D(sQ_u32 + SMEM_Q_BYTES, &tensorMapQ, bars_u32 + (kBarQFull + 1) * 8, 0,
-                                  cta_idx_q * (2 * CTA_Q) + CTA_Q, head_id, batch_id);
+                ws::load_async_4D(sQ_u32 + SMEM_Q_BYTES,
+                                  &tensorMapQ,
+                                  bars_u32 + (kBarQFull + 1) * 8,
+                                  0,
+                                  cta_idx_q * (2 * CTA_Q) + CTA_Q,
+                                  head_id,
+                                  batch_id);
                 ws::expect_bytes_bar<SMEM_KV_BYTES>(kv_full_bar(1));
                 ws::load_async_4D(ring_u32 + SMEM_KV_BYTES, &tensorMapV, kv_full_bar(1), 0, 0, kv_head_id, batch_id);
 
@@ -995,14 +1033,24 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     const uint32_t k_item = 2 * i;
                     kv_empty_wait(k_item);
                     ws::expect_bytes_bar<SMEM_KV_BYTES>(kv_full_bar(k_item));
-                    ws::load_async_4D(ring_u32 + (k_item & 3) * SMEM_KV_BYTES, &tensorMapK, kv_full_bar(k_item), 0,
-                                      i * CTA_K, kv_head_id, batch_id);
+                    ws::load_async_4D(ring_u32 + (k_item & 3) * SMEM_KV_BYTES,
+                                      &tensorMapK,
+                                      kv_full_bar(k_item),
+                                      0,
+                                      i * CTA_K,
+                                      kv_head_id,
+                                      batch_id);
 
                     const uint32_t v_item = 2 * i + 1;
                     kv_empty_wait(v_item);
                     ws::expect_bytes_bar<SMEM_KV_BYTES>(kv_full_bar(v_item));
-                    ws::load_async_4D(ring_u32 + (v_item & 3) * SMEM_KV_BYTES, &tensorMapV, kv_full_bar(v_item),
-                                      i * CTA_K, 0, kv_head_id, batch_id);
+                    ws::load_async_4D(ring_u32 + (v_item & 3) * SMEM_KV_BYTES,
+                                      &tensorMapV,
+                                      kv_full_bar(v_item),
+                                      i * CTA_K,
+                                      0,
+                                      kv_head_id,
+                                      batch_id);
                 }
             }
         }
@@ -1124,8 +1172,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
                                                                           RETURN_LSE,
                                                                           true>;
                         // 2 Q tiles + 4-slot KV ring (barriers/v_scale are static smem)
-                        size_t smem_bytes = 2 * CTA_Q * HEAD_DIM * sizeof(int8_t)
-                                            + 4 * CTA_K * HEAD_DIM * sizeof(int8_t);
+                        size_t smem_bytes =
+                            2 * CTA_Q * HEAD_DIM * sizeof(int8_t) + 4 * CTA_K * HEAD_DIM * sizeof(int8_t);
                         sage::set_max_dynamic_smem_once(kernel, smem_bytes, query.get_device());
 
                         dim3 grid(div_ceil(qo_len, 2 * CTA_Q), num_qo_heads, batch_size);
