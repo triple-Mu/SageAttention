@@ -34,7 +34,7 @@ from typing import Literal, Optional, Tuple, Union, overload
 import torch
 
 from ._plan import get_plan
-from .core import _LOG2E_V2, _pad_qkv_head_dim, _warned_configs
+from .core import _LOG2E_V2, _check_qkv_common, _pad_qkv_head_dim, _warned_configs
 
 # Backends with a packed-layout attention kernel, mirroring the dispatch table
 # in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
@@ -212,24 +212,13 @@ def sageattn_varlen(
     3. A prefix sum that disagrees with ``q.size(0)`` / ``k.size(0)`` reads out
        of bounds. Nothing on the host validates it.
     """
-    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
-        raise NotImplementedError(
-            "SageAttention has no backward; call under torch.no_grad() or detach inputs"
-        )
-
-    dtype = q.dtype
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in (torch.float16, torch.bfloat16), "Input tensors must be float16 or bfloat16"
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    _check_qkv_common(q, k, v)
     assert q.dim() == k.dim() == v.dim() == 3, (
         "q/k/v must be packed [total_tokens, heads, head_dim]; use sageattn() for a dense batch"
     )
     assert k.size(0) == v.size(0), "k and v must carry the same tokens"
-    # checked before the pad: F.pad always returns a contiguous tensor
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, (
-        "Last dim of qkv must be contiguous."
-    )
+
+    dtype = q.dtype
     q, k, v, head_dim_og = _pad_qkv_head_dim(q, k, v)
 
     if sm_scale is None:

@@ -30,6 +30,23 @@ _LOG2E_V2 = 1.44269504
 _warned_configs: Set[Tuple[Tuple[int, int], str]] = set()
 
 
+def _check_qkv_common(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    """Entry checks shared by sageattn and sageattn_varlen. Must run before
+    _pad_qkv_head_dim: F.pad always returns a contiguous tensor, so after it
+    the stride assert would be vacuously true."""
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        raise NotImplementedError(
+            "SageAttention has no backward; call under torch.no_grad() or detach inputs"
+        )
+    assert q.is_cuda, "Input tensors must be on cuda."
+    assert q.dtype in (torch.float16, torch.bfloat16), "Input tensors must be float16 or bfloat16"
+    assert q.device == k.device == v.device, "All tensors must be on the same device."
+    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, (
+        "Last dim of qkv must be contiguous."
+    )
+
+
 def _pad_qkv_head_dim(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -175,22 +192,9 @@ def sageattn(
         sm_scale = scale
     del enable_gqa  # GQA is always supported; flag kept for signature parity
 
-    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
-        raise NotImplementedError(
-            "SageAttention has no backward; call under torch.no_grad() or detach inputs"
-        )
+    _check_qkv_common(q, k, v)
 
     dtype = q.dtype
-    assert q.is_cuda, "Input tensors must be on cuda."
-    assert dtype in (torch.float16, torch.bfloat16), "Input tensors must be float16 or bfloat16"
-    assert q.device == k.device == v.device, "All tensors must be on the same device."
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # checked before the pad: F.pad always returns a contiguous tensor, so
-    # after it the assert would be vacuously true
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, (
-        "Last dim of qkv must be contiguous."
-    )
     q, k, v, head_dim_og = _pad_qkv_head_dim(q, k, v)
 
     if sm_scale is None:
