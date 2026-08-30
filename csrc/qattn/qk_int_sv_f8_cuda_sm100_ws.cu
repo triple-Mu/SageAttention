@@ -565,8 +565,23 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                                + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
         }
         constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+        constexpr uint32_t kNumKScales           = (K_GRAN == QuantGranularity::kPerThread) ? 4 : 1;
 
         const float q_scale = Q_scale[q_scale_idx];
+
+        // K-scale software prefetch (r5 lever A). The raw k-scale word(s) of
+        // block iter+1 are loaded inside step iter's tcgen05.ld shadow (below);
+        // without it the loop-top LDG serializes ahead of the first LDTM
+        // whenever the s_full wait falls through immediately (softmax is the
+        // laggard), because in-order issue blocks the LDTM behind the
+        // dequant-scale FMUL that consumes the LDG. Pure load motion: the
+        // q_scale multiply stays at the top of the consuming step, so the
+        // float op sequence is unchanged (bit-exact contract intact).
+        float k_scale_pref[kNumKScales];
+#pragma unroll
+        for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+            k_scale_pref[cls] = K_scale_base_ptr[cls];  // block 0
+        }
 
         // --- flash-attention state (mirrors :287-288) ---
         float row_max = -5000000.0f;
@@ -602,16 +617,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         auto softmax_step = [&](auto is_last_t, uint32_t iter) {
             constexpr bool is_last = decltype(is_last_t)::value;
 
-            // K-scale(s) for this tile (mirrors :400-410)
-            float dequant_scale[(K_GRAN == QuantGranularity::kPerThread) ? 4 : 1];
-            if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+            // K-scale(s) for this tile (mirrors :400-410; the raw word(s) were
+            // prefetched into k_scale_pref during the previous step's ld shadow,
+            // same value = same product bits)
+            float dequant_scale[kNumKScales];
 #pragma unroll
-                for (uint32_t cls = 0; cls < 4; cls++) {
-                    dequant_scale[cls] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset + cls];
-                }
-            }
-            else {
-                dequant_scale[0] = q_scale * K_scale_base_ptr[iter * k_scale_advance_offset];
+            for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+                dequant_scale[cls] = q_scale * k_scale_pref[cls];
             }
 
             // dequant + fused mask for the S column pair (j, j+1), j even
@@ -672,6 +684,18 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 #pragma unroll
             for (uint32_t c = 0; c < CTA_K / 64; c++) {
                 ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
+            }
+            // r5 lever A: fill the ld shadow with the next block's k-scale
+            // prefetch - S-independent loads issued after both LDTMs, before
+            // the collective wait, so the LDG round trip rides the TMEM-load
+            // latency instead of preceding the next step's first LDTM. The
+            // peeled step has no successor (and its gap already holds the
+            // hoisted mask ISETP chain, the one site r4 found in-flight).
+            if constexpr (!is_last) {
+#pragma unroll
+                for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+                    k_scale_pref[cls] = K_scale_base_ptr[(iter + 1) * k_scale_advance_offset + cls];
+                }
             }
             tcgen05::tmem_ld_wait();
 #pragma unroll
