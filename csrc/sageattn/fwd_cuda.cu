@@ -93,6 +93,18 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
     Plan      plan     = resolve(
         cc, head_dim, req_backend, gran, pv, value_mean.has_value() ? std::optional<bool>(true) : std::nullopt);
     TORCH_CHECK(plan.error.empty(), "sageattention.fwd: ", plan.error);
+    // Fail here (with a cure) rather than at launch with
+    // cudaErrorNoKernelImageForDevice: a compiled family can still miss this
+    // device's SASS, e.g. an explicit `backend` override onto a family whose
+    // gencode list was narrowed by SAGE_PRUNE_GENCODE.
+    TORCH_CHECK(backend_serves(plan.backend, cc),
+                "sageattention.fwd: the ",
+                name(plan.backend),
+                " kernels in this build (compute capabilities [" SAGEATTN_BUILT_ARCHS_STR
+                "]) carry no cubin or PTX loadable on sm_",
+                cc.major,
+                cc.minor,
+                "; rebuild with that capability in TORCH_CUDA_ARCH_LIST or drop the explicit backend override");
     // fwd receives already-quantized inputs, so the caller must have fetched the
     // same plan; re-check the request against the resolved plan (a mismatch
     // means the tensors were prepared for a different kernel).

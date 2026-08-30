@@ -76,4 +76,12 @@ Plan resolve(CC                       cc,
 // Which kernel families were compiled into this extension (build_config.h).
 bool backend_compiled(Backend b);
 
+// Per-arch refinement of backend_compiled(): true when the family's fatbin
+// carries a cubin (or forward-JITable PTX) the driver can load on this
+// device. A compiled family can still miss a device when its gencode list
+// was narrowed (SAGE_PRUNE_GENCODE) or never targeted it; a launch then dies
+// with cudaErrorNoKernelImageForDevice, so the fwd entry points check this
+// up front and fail with an actionable message instead.
+bool backend_serves(Backend b, CC cc);
+
 }  // namespace sage

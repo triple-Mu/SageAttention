@@ -91,6 +91,17 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_varlen_cuda(const at::Tens
                         value_mean.has_value() ? std::optional<bool>(true) : std::nullopt,
                         /*varlen=*/true);
     TORCH_CHECK(plan.error.empty(), "sageattention.fwd_varlen: ", plan.error);
+    // Same per-arch gate as fwd_cuda.cu: a compiled family whose gencode list
+    // does not cover this device would otherwise die at launch with
+    // cudaErrorNoKernelImageForDevice.
+    TORCH_CHECK(backend_serves(plan.backend, cc),
+                "sageattention.fwd_varlen: the ",
+                name(plan.backend),
+                " kernels in this build (compute capabilities [" SAGEATTN_BUILT_ARCHS_STR
+                "]) carry no cubin or PTX loadable on sm_",
+                cc.major,
+                cc.minor,
+                "; rebuild with that capability in TORCH_CUDA_ARCH_LIST");
     TORCH_CHECK(plan.gran == gran,
                 "qk_quant_gran \"",
                 name(gran),

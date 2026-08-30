@@ -242,6 +242,23 @@ else()
   message(STATUS "[sageattention] skip SM120: no requested compute capability is served by it")
 endif()
 
+# Per-family gencode lists for the generated header (backend_serves() input):
+# "M.m" -> major*10+minor, cubin entries plus the +PTX subset (plain kinds
+# only; the accel families never embed PTX, see sage_gencode_flags).
+foreach(_g SM80 SM89 SM90 SM100 SM120)
+  set(_cubin_ccs "")
+  set(_ptx_ccs "")
+  foreach(cc IN LISTS SAGE_ARCHS_${_g})
+    string(REPLACE "." "" _n "${cc}")
+    list(APPEND _cubin_ccs "${_n}")
+    if(NOT SAGE_KIND_${_g} STREQUAL "accel" AND "${cc}" IN_LIST SAGE_PTX_ARCHS)
+      list(APPEND _ptx_ccs "${_n}")
+    endif()
+  endforeach()
+  string(REPLACE ";" "," SAGEATTN_${_g}_CUBIN_CCS "${_cubin_ccs}")
+  string(REPLACE ";" "," SAGEATTN_${_g}_PTX_CCS "${_ptx_ccs}")
+endforeach()
+
 configure_file(cmake/sageattn_build_config.h.in
                "${CMAKE_CURRENT_BINARY_DIR}/generated/sageattn_build_config.h" @ONLY)
 

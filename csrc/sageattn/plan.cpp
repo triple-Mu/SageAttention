@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <sstream>
 
 #include "sageattn_build_config.h"
@@ -40,6 +41,26 @@ bool sm100_tcgen05_enabled()
     return enabled;
 }
 
+// CUDA loader compatibility against one family's fatbin entry lists (the
+// SAGEATTN_*_CCS macros, major*10+minor). Plain cubins load on same-major
+// devices with an equal-or-higher minor; PTX JITs forward onto any newer
+// capability; arch-specific (sm_XXa) cubins load on exactly their own cc.
+bool sass_loadable(std::initializer_list<int> cubins, std::initializer_list<int> ptx, bool accel, CC cc)
+{
+    const int dev = cc.major * 10 + cc.minor;
+    for (int e : cubins) {
+        if (accel ? e == dev : (e / 10 == cc.major && e % 10 <= cc.minor)) {
+            return true;
+        }
+    }
+    for (int e : ptx) {
+        if (e <= dev) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 bool backend_compiled(Backend backend)
@@ -55,6 +76,23 @@ bool backend_compiled(Backend backend)
             return SAGEATTN_BUILD_SM100;
         case Backend::kSm120F8:
             return SAGEATTN_BUILD_SM120;
+    }
+    return false;
+}
+
+bool backend_serves(Backend backend, CC cc)
+{
+    switch (backend) {
+        case Backend::kSm80F16:
+            return sass_loadable(SAGEATTN_SM80_CUBIN_CCS, SAGEATTN_SM80_PTX_CCS, /*accel=*/false, cc);
+        case Backend::kSm89F8:
+            return sass_loadable(SAGEATTN_SM89_CUBIN_CCS, SAGEATTN_SM89_PTX_CCS, /*accel=*/false, cc);
+        case Backend::kSm90F8:
+            return sass_loadable(SAGEATTN_SM90_CUBIN_CCS, {}, /*accel=*/true, cc);
+        case Backend::kSm100F8:
+            return sass_loadable(SAGEATTN_SM100_CUBIN_CCS, {}, /*accel=*/true, cc);
+        case Backend::kSm120F8:
+            return sass_loadable(SAGEATTN_SM120_CUBIN_CCS, SAGEATTN_SM120_PTX_CCS, /*accel=*/false, cc);
     }
     return false;
 }

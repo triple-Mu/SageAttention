@@ -10,6 +10,21 @@
 #cmakedefine01 SAGEATTN_BUILD_SM100
 #cmakedefine01 SAGEATTN_BUILD_SM120
 
+// Per-family gencode lists as actually built (i.e. after SAGE_PRUNE_GENCODE,
+// when it is ON), encoded as major*10+minor integer initializer lists.
+// *_CUBIN_CCS are the SASS entries (the accel families emit arch-specific
+// sm_XXa code, loadable on exactly that capability); *_PTX_CCS the subset
+// that also embedded forward-JITable PTX. backend_serves() (plan.cpp) turns
+// these into "can this family launch on this device" answers.
+#define SAGEATTN_SM80_CUBIN_CCS  {@SAGEATTN_SM80_CUBIN_CCS@}
+#define SAGEATTN_SM80_PTX_CCS    {@SAGEATTN_SM80_PTX_CCS@}
+#define SAGEATTN_SM89_CUBIN_CCS  {@SAGEATTN_SM89_CUBIN_CCS@}
+#define SAGEATTN_SM89_PTX_CCS    {@SAGEATTN_SM89_PTX_CCS@}
+#define SAGEATTN_SM90_CUBIN_CCS  {@SAGEATTN_SM90_CUBIN_CCS@}
+#define SAGEATTN_SM100_CUBIN_CCS {@SAGEATTN_SM100_CUBIN_CCS@}
+#define SAGEATTN_SM120_CUBIN_CCS {@SAGEATTN_SM120_CUBIN_CCS@}
+#define SAGEATTN_SM120_PTX_CCS   {@SAGEATTN_SM120_PTX_CCS@}
+
 // Whether the varlen (packed [total_tokens, heads, head_dim]) kernel TUs were
 // compiled (CMake -DSAGE_BUILD_VARLEN=OFF drops them). The varlen ops are
 // always registered, so a build without them fails with a message instead of
