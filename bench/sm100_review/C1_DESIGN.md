@@ -739,13 +739,27 @@ qo_len cut,改为 **head_dim==128 即走 WS**,d64 维持不进。重建后 auto
 `qo_per_kv_head` 过一条空 `asm volatile`,把回退地址算式钉回 softmax
 段(改动前的活跃区间),spill 归零。
 
-### 10.4 上机判据(下一会话,B200)
+### 10.4 上机判据与实测(wave14,B200;验收通过)
 
-| 项 | 判据 |
-|---|---|
-| golden(`SAGEATTN_SM100_WS=1`,golden-sm100-g1ws) | `diff=0`(§10.2 是逐位论证,不放宽) |
-| golden(WS=0,golden-sm100) | `diff=0`(旧 kernel TU 未动,应逐字节不变) |
-| 压测 | ws_stress 2×8000 零挂死;**另加一个 kv_len > 131072 的 case**(如 s=139264=1088 块)实跑回退分支 |
-| bench 22 点 vs G1(97c5b2b) | 几何均值 >1.005 才算收益成立(>0.5% 口径);无形状 <0.995 |
-| ncu(b4h32s16384c0,对齐 §9.6 口径) | L2 read sectors 回落到 r5 量级(消掉 +14%);步首 long_scoreboard 占比下降为方向性佐证(跨版本比值口径注意 §9.6 的分母陷阱) |
-| 回退 | 任一硬闸失败即整 commit revert(单 commit,无交叉依赖) |
+口径:tree a88057d(sage-w6,`TORCH_CUDA_ARCH_LIST=10.0a` +
+`-DSAGE_PRUNE_GENCODE=OFF`),B200 单卡独占(umb-b200-262,JID 4028527,
+pytorch_26.07-py3,torch 2.13.0a0 nv26.07 / CUDA 13.3 / cudnn 9.24);
+G1 对照 = 同容器同卡的 sage-w5 预建树(dfaebb4),bench 四方
+(old / ws-G2 / ws-G1 / cudnn)×3 轮轮换取 median。原始数据:集群
+`SageAttention_refactor/logs-w14/`(bench/、ncu/、g2_ws?.txt、stress_*)。
+
+| 项 | 判据 | 实测(wave14) |
+|---|---|---|
+| golden(`SAGEATTN_SM100_WS=1`,golden-sm100-g1ws) | `diff=0`(§10.2 是逐位论证,不放宽) | `ok=2107 diff=0 missing=0` → 过 |
+| golden(WS=0,golden-sm100) | `diff=0`(旧 kernel TU 未动) | `ok=2082 diff=0 missing=0`(extra=25 = varlen M2 新 case 不在旧 golden,预期)→ 过 |
+| 压测 | ws_stress 2×8000 零挂死;**另加 kv_len > 131072 case**(s=139264=1088 块)实跑回退分支 | SWEEP + s32768 8000×2 零挂死(703s);s139264 300×2 零挂死(回退分支实跑);回退分支数值对旧 kernel cos ≥0.9999997 / rel_l1 ≤5e-4(s131072 对照同量级,fallback_check.txt)→ 过 |
+| bench 22 点 vs G1 | 几何均值 >1.005(>0.5% 口径);无形状 <0.995 | 同场 G2/G1 geomean **1.0112**,min 0.9997(causal b4 s1024);w11 跨场差分 1.0105、old 锚定 1.0113 同向 → 过 |
+| ncu(b4h32s16384c0,对齐 §9.6 口径) | L2 read sectors 回落到 r5 量级;步首 long_scoreboard 下降为方向性佐证 | duration 14.69→**14.48 ms**(−1.4%);long_scoreboard/issue 5.242→5.044(−3.8%,两版指令流仅换数据源,比值可比);**L2 read 1087.1M ≈ G1 1087.9M,未回落**(r5 953.7M)——wave11「+14% 归因 k_scale 广播 LDG」不成立:该路径总量 ~10⁷ sector 量级,撑不起 +1.3×10⁸;G2 收益来自消 stall,不来自省 L2 流量 |
+| 回退 | 任一硬闸失败即整 commit revert(单 commit,无交叉依赖) | 不触发 |
+
+结论:**G2 落袋**。G2/G1 分布:非 causal 中段(s4096-16384)+1.5-3.2%,
+长序列 +0.4-1.0%,causal 段 +0.8-1.6%,d64 +0.8-1.5%;唯一持平点
+causal b4 s1024(0.9997)。新目标线:ws/old 22 点 geomean **1.1436**
+(d128 1.1649;w11 为 1.1308/1.1518),ws/cudnn **0.8412**(d128
+0.8691;w11 为 0.8346/0.8621)。cudnn 同场复测与 w11 偏差 geomean 0.3%
+(BEYOND_CUDNN_PLAN §1.1 目标线仍有效;cudnn 版本 9.24.0)。

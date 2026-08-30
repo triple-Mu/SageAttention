@@ -65,6 +65,12 @@ s32768 0.935、s131072 0.967;d128 全段 0.862、22 点全段 0.835
 - s1024 b1 已超(cudnn 小 grid 自己也填不满);b4 s1024 的 39-57% 缺口同属
   Phase B 主场。
 
+wave14 复测(2026-08-31,B200 同容器同卡,`logs-w14/bench`;cudnn 9.24.0,
+torch 2.13.0a0 nv26.07):cudnn 22 点与本表偏差 geomean 0.3%(最大单形状
+5.8% @ nc b4 s1024,微秒级形状抖动),**目标线沿用本表**。ws 侧 G2 落袋后
+ws/cudnn 22 点 0.835→**0.841**(d128 0.862→0.869);逐 seq 行几何均值
+s1024 0.827、s4096 0.754、s16384 0.884、s32768 0.934、s131072 0.962。
+
 ### 1.2 d64(单列,不进本役主线)
 
 | 形状(hd64 nc) | cudnn ms | 现行(old kernel)ms | 比值 | need |
@@ -479,7 +485,44 @@ Phase A 每合一项重采 d128 nc b4 s16384 全 set(历史序列:r5 16.35 → G
 目标 ≤13.5);XU% 目标带 57-62%。bench 协议照 §6.5(双向轮换 3 轮 median,
 cudnn 同场重测,不引历史值)。
 
----
+### 7.6 wave14 采集实录(B200,cudnn 9.24.0;§7.2 清单的 b4 四形状)
+
+数据:集群 `logs-w14/ncu/`(cudnn_* 与 ws_* 各 4 形状,sections 版 +
+XU metrics 版;ws s16384c0 的 sections = `g2_ws_s16384_c0`)。kernel 名
+(torch profiler):`cudnn_generated_fort_native_sdpa_sm100_flash_fprop_f16_
+knob_1_128x128x128_4x1x1_cga1x1x1_kernel0_0`。
+
+**调度证据(§7.3 首采,四形状一致)**:grid == tile 数(b4h32:8192/2048)
+→ **非 persistent**;`cga1x1x1` → **无 cluster**(§2 的 cta_group::2 情报只
+适用其 DSL 变体,闭源 prefill 没开);512 线程 / 128 reg(setmaxnreg 全特
+化)/ dyn smem 232.45KB(fp16 KV ring,比我们 163.84KB 多 68.6KB)。
+
+| 指标(b4h32,c0/c1 = causal) | cudnn s16k c0 | ws s16k c0 | cudnn s16k c1 | ws s16k c1 | cudnn s4k c0 | ws s4k c0 | cudnn s4k c1 | ws s4k c1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| duration(ncu 锁频) | 12.03 ms | 14.48 ms | 6.33 ms | 7.55 ms | 768 µs | 975 µs | 430 µs | 594 µs |
+| SM throughput % | 84.1 | 55.3 | 84.1 | 53.4 | 81.7 | 51.5 | 75.4 | 43.6 |
+| tensor pipe active % | **82.0** | 27.2 | 81.8 | 26.3 | 79.3 | 25.3 | 72.5 | 21.4 |
+| XU % of peak | **62.0** | 55.3 | 62.1 | 53.4 | 60.3 | 51.5 | 55.6 | 43.6 |
+| eligible / issued per sched | 0.73/0.51 | 0.50/0.40 | 0.75/0.53 | 0.48/0.40 | 0.72/0.52 | 0.48/0.39 | 0.74/0.52 | 0.46/0.38 |
+| stall long_scoreboard / wait(per issue) | 3.97/0.92 | 5.04/1.83 | 3.64/0.89 | 5.03/1.82 | 3.76/0.87 | 5.01/1.80 | 3.77/0.89 | 5.03/1.77 |
+| L2 read sectors | 1.087G | 1.087G | 1.139G | 0.569G | 90.0M | 65.2M | 84.9M | 39.5M |
+| inst executed(总) | 5.33G | 6.22G | 2.81G | 3.18G | 341M | 404M | 199M | 221M |
+| 其中 pipe_xu | 0.81G(15.3%) | 1.09G(17.5%) | 0.41G | 0.55G | 50.9M | 68.3M | 27.2M | 35.3M |
+
+**M6 裁决(§3 形态税 / I2F-税理论)**:cudnn XU 55.6-62.1% of peak,
+**高于**我们的 43.6-55.3%,远超预期带(35-45%)→ **I2F/F2FP 税不是差距
+主因,理论修正**。两侧 XU 指令占比接近(15.3% vs 17.5%);我们总指令多
+14-17%,但真正的分界在:(1) cudnn 的 SOL 限制器是 tensor pipe
+(72-82% active,fp16 MMA 每 FLOP 占 2× tensor 周期,把非 tensor 工作全部
+藏进 MMA 阴影里);我们 int8/fp8 MMA 只占 27%,阴影太短,XU/发射效率直接
+暴露成关键路径。(2) 发射效率:cudnn eligible 0.72-0.75 / issued
+0.51-0.53,我们 0.46-0.50 / 0.38-0.40;per-issue 依赖等待 cudnn
+long_scoreboard 3.6-4.0 + wait 0.9,我们 5.0 + 1.8——**每发射的定长依赖
+等待(wait)是 cudnn 的 2 倍**,softmax 串行链仍是主攻面。(3) causal 侧
+cudnn L2 read 反而比 nc 多(1.139G vs 1.087G,我们 0.569G 减半)——它用
+多读换调度均匀,佐证 §4.4 的 LPT/重排方向。persistent/CLC 与 cga2 在闭源
+prefill kernel 里都没开,§4.4/§4.6 的预期收益不能再拿「cudnn 有」背书,
+要靠自己的消融立项。
 
 ## 附录 A:黑名单对照总表(立项前必查)
 
