@@ -53,7 +53,7 @@ requires_cuda = pytest.mark.skipif(not CUDA_AVAILABLE, reason="needs CUDA")
 # written against the public entry point and say nothing about tile geometry or
 # accumulator, so they run on whichever of these the device resolves to; the
 # kernel-level tests stay pinned to one backend with requires_backend.
-VARLEN_BACKENDS = ("sm80", "sm89", "sm90", "sm120")
+VARLEN_BACKENDS = ("sm80", "sm89", "sm90", "sm100", "sm120")
 requires_varlen_backend = pytest.mark.skipif(
     not any(backend_available(b) for b in VARLEN_BACKENDS),
     reason=f"no packed-layout backend runnable here "

@@ -38,7 +38,7 @@ from .core import _LOG2E_V2, _check_qkv_common, _pad_qkv_head_dim, _warn_smooth_
 # Backends with a packed-layout attention kernel, mirroring the dispatch table
 # in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
 # raise keeps a device without one from paying for the quantization first.
-_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm90", "sm120"})
+_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm90", "sm100", "sm120"})
 
 
 def _segment_ids(cu_seqlens: torch.Tensor, batch_size: int, total: int) -> torch.Tensor:
@@ -182,7 +182,9 @@ def sageattn_varlen(
         batch's. smooth_v has no varlen kernel and is ignored (with a warning).
         Each arch instantiates the packed kernel at its default
         pv_accum_dtype only (sm80 "fp32", sm89 "fp32+fp16", sm90 "fp32+fp32",
-        sm120 "fp32"); another value raises rather than falling back.
+        sm100 "fp32", sm120 "fp32"); another value raises rather than falling
+        back. On sm100 the packed kernel is always the classic 128-thread one;
+        the SAGEATTN_SM100_WS switch routes dense calls only.
 
     Returns
     -------
@@ -191,8 +193,9 @@ def sageattn_varlen(
     Raises
     ------
     NotImplementedError
-        On a device without a packed kernel. sm80/sm86, sm89, sm90 and sm120
-        have one; the sm100 tcgen05 path does not.
+        On a device without a packed kernel. Every backend has one today, so
+        this fires only on a plan that resolves to a backend this table has
+        not caught up with.
     RuntimeError
         From the op, on a build configured with ``-DSAGE_BUILD_VARLEN=OFF``
         (which leaves out every packed kernel).

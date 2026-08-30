@@ -46,6 +46,9 @@
 #if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM90
 #include "../qattn/attn_cuda_sm90_varlen.h"
 #endif
+#if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM100
+#include "../qattn/attn_cuda_sm100_varlen.h"
+#endif
 #if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM120
 #include "../qattn/attn_cuda_sm120_varlen.h"
 #endif
@@ -215,6 +218,33 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_varlen_cuda(const at::Tens
                                                                                          gran_int,
                                                                                          sm_scale_f32,
                                                                                          return_lse_int);
+            break;
+        }
+#endif
+#if SAGEATTN_BUILD_VARLEN && SAGEATTN_BUILD_SM100
+        case Backend::kSm100F8: {
+            // one instantiation, the default pv_accum_dtype for sm100 (its only
+            // one); varlen always runs the classic 128-thread kernel, the
+            // SAGEATTN_SM100_WS switch routes dense calls only
+            TORCH_CHECK(plan.pv == PVAccum::kFp32,
+                        "pv_accum_dtype \"",
+                        name(plan.pv),
+                        "\" has no varlen kernel yet; sm100 varlen implements \"fp32\"");
+            lse = sm100_varlen::qk_int8_sv_f8_accum_f32_fuse_v_scale_varlen_attn(query,
+                                                                                 key,
+                                                                                 value,
+                                                                                 out,
+                                                                                 query_scale,
+                                                                                 key_scale,
+                                                                                 *value_scale,
+                                                                                 cu_seqlens_q,
+                                                                                 cu_seqlens_k,
+                                                                                 max_q,
+                                                                                 max_k,
+                                                                                 causal_int,
+                                                                                 gran_int,
+                                                                                 sm_scale_f32,
+                                                                                 return_lse_int);
             break;
         }
 #endif

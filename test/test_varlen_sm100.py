@@ -1,0 +1,518 @@
+"""The sm100 varlen kernel: the packed layout over the tcgen05 fp8 V^T path.
+
+test_varlen.py holds the sm80 half and the shared contract; this file is the
+same set of gates as test_varlen_sm90.py on the arch whose CTA is 128x128, one
+warpgroup, thread == row. The equal-length batch is still the gate that pins
+the kernel: with delta == 0 the varlen tile structure is the dense one, and
+sm100 folds no dequant scale into sm_scale, so the two must agree bit for bit.
+
+The value tensor is per_channel_fp8(..., permute=False): transposed, padded
+per sequence to CTA_K = 128 and in LINEAR kv order (the TS TMEM contract of
+qk_int_sv_f8_sm100_impl.cuh), not the mma_k16 order the other archs take.
+
+The ``sageattn_varlen`` end-to-end tests live in test_varlen.py, which runs
+them on whichever packed backend the device resolves to.
+"""
+
+import os
+
+import pytest
+import torch
+from torch.library import opcheck
+
+from conftest import cos_sim, rel_l1, requires_backend, requires_varlen
+
+# The equal-length gates compare fwd_varlen (always the classic 128-thread
+# kernel) against the dense sm100 entry bit for bit, so the dense side must
+# run the same kernel body. SAGEATTN_SM100_WS routes dense d128 calls to the
+# warp-specialized kernel and is read once per process at the first dense
+# call; nothing has launched at collection time, so pinning it off here is
+# safe. An explicit WS-on/auto environment wins - the file then skips instead
+# of comparing two different kernels.
+_WS_MODE = os.environ.setdefault("SAGEATTN_SM100_WS", "0")
+_WS_ROUTES_DENSE = _WS_MODE in ("auto", "AUTO", "1", "on", "ON", "TRUE", "true", "YES", "yes")
+
+DEV = "cuda"
+OPS = torch.ops.sageattention
+pytestmark = [
+    requires_varlen,
+    requires_backend("sm100"),
+    pytest.mark.skipif(
+        _WS_ROUTES_DENSE,
+        reason=f"SAGEATTN_SM100_WS={_WS_MODE} routes the dense reference to the ws kernel; "
+        "the bitwise gates need the classic one (unset it or set 0)",
+    ),
+]
+
+# sm100 quantization tile geometry (plan.cpp fill_tiles) and V^T padding
+BLKQ, WARPQ, BLKK, WARPK = 128, 32, 128, 128
+GEOM = dict(blk_q=BLKQ, warp_q=WARPQ, blk_k=BLKK, warp_k=WARPK)
+V_PAD = 128  # plan.cpp v_pad_of(sm100); fwd_cuda pins it equal to blk_k
+SCALE_MAX = 448.0
+PV = "fp32"  # the only pv_accum_dtype sm100 supports
+V_LAYOUT = "linear"  # per_channel_fp8 permute=False, the sm100 TS contract
+
+# opcheck's "test_schema" util clones/compares inputs with ops torch does not
+# implement for Float8_e4m3fn on CUDA; test_ops.py skips it the same way.
+NO_SCHEMA_FP8 = ("test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic")
+
+# the sageattn accuracy gates (test_accuracy.py)
+COS_MIN = 0.99
+REL_L1_MAX = 0.06
+
+
+def cu_of(lens):
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    return cu
+
+
+def blk_offset(cu, b, cta_tokens):
+    """csrc/sageattn/varlen.h: sequence b's first CTA-sized block."""
+    return cu[b] // cta_tokens + b
+
+
+def blk_total(total, batch, cta_tokens):
+    return total // cta_tokens + batch
+
+
+def seg_max(cu):
+    cu = cu.tolist() if torch.is_tensor(cu) else cu
+    return max(cu[i + 1] - cu[i] for i in range(len(cu) - 1))
+
+
+def pack(dense, lens):
+    """[B, H, N, D] -> [sum(lens), H, D], sequence b keeping its first tokens."""
+    dense = dense.transpose(1, 2)  # [B, N, H, D]
+    return torch.cat([dense[b, : lens[b]] for b in range(len(lens))], dim=0).contiguous()
+
+
+def unpack_lse(lse, lens):
+    """[heads, total] -> [batch, heads, n] for an equal-length batch."""
+    h, _ = lse.shape
+    return lse.view(h, len(lens), lens[0]).transpose(0, 1).contiguous()
+
+
+def rand_qkv(b, h_qo, h_kv, n, head_dim, seed=0, dtype=torch.float16):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+
+    def one(h):
+        return torch.randn((b, h, n, head_dim), device=DEV, dtype=dtype, generator=g)
+
+    return one(h_qo), one(h_kv), one(h_kv)
+
+
+def quant_v_dense(v_hnd):
+    """[B, H, N, D] -> ([B, H, D, round_up(N, 128)] fp8 linear order, [B, H, D] scale)."""
+    v_fp8, v_scale, _ = OPS.quant_v_fp8(
+        v_hnd,
+        tensor_layout="HND",
+        v_layout=V_LAYOUT,
+        scale_max=SCALE_MAX,
+        smooth_v=False,
+        pad_multiple=V_PAD,
+    )
+    return v_fp8, v_scale
+
+
+def pack_v_fp8(v_packed, cu_k, max_seqlen_k):
+    """The varlen V^T slab and its scales, as the sm100 kernel wants them:
+    ``[kv_heads, head_dim, blk_total(total_k, batch, 128) * 128]`` fp8 in
+    linear kv order and ``[batch, kv_heads, head_dim]`` float32. pad_multiple
+    is CTA_K, which is what the launcher pins the padded extent against."""
+    v_fp8, v_scale, _ = OPS.quant_v_fp8_varlen(
+        v_packed,
+        cu_k,
+        max_seqlen_k=max_seqlen_k,
+        v_layout=V_LAYOUT,
+        scale_max=SCALE_MAX,
+        smooth_v=False,
+        pad_multiple=V_PAD,
+    )
+    return v_fp8, v_scale
+
+
+def quant_varlen(q, k, cu_q, cu_k, gran, key_mean=None):
+    return OPS.quant_qk_varlen(
+        q,
+        k,
+        cu_q,
+        cu_k,
+        key_mean,
+        max_seqlen_q=seg_max(cu_q),
+        max_seqlen_k=seg_max(cu_k),
+        qk_quant_gran=gran,
+        **GEOM,
+    )
+
+
+def fwd_varlen(q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale, cu_q, cu_k, causal, gran, lse=False):
+    return OPS.fwd_varlen(
+        q_int8,
+        k_int8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        cu_q,
+        cu_k,
+        v_scale,
+        None,
+        max_seqlen_q=seg_max(cu_q),
+        max_seqlen_k=seg_max(cu_k),
+        qk_quant_gran=gran,
+        pv_accum_dtype=PV,
+        v_layout=V_LAYOUT,
+        is_causal=causal,
+        sm_scale=q_int8.size(-1) ** -0.5,
+        return_lse=lse,
+        out_dtype=torch.float16,
+    )
+
+
+def fwd_dense(q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale, causal, gran, lse=False):
+    return OPS.fwd(
+        q_int8,
+        k_int8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        None,
+        tensor_layout="HND",
+        qk_quant_gran=gran,
+        pv_accum_dtype=PV,
+        v_layout=V_LAYOUT,
+        is_causal=causal,
+        sm_scale=q_int8.size(-1) ** -0.5,
+        return_lse=lse,
+        out_dtype=torch.float16,
+    )
+
+
+# --------------------------------------------------- the sm100 quant four-tuple
+
+
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_quant_qk_varlen_sm100_geometry_equals_dense(gran, head_dim):
+    """The sm100 quantization four-tuple (blk_q=128, warp_q=32, blk_k=128,
+    warp_k=128): the Q side is the sm89/sm120 varlen geometry and the K side
+    the sm90 one, but this exact combination first ships here. On an
+    equal-length batch the packed int8 and the per-sequence scale slices must
+    equal the dense ones bit for bit."""
+    b, heads, n = 3, 2, 300  # not a multiple of either tile
+    q, k, _ = rand_qkv(b, heads, heads, n, head_dim, seed=41)
+    lens = [n] * b
+    cq = cu_of(lens)
+    cu = torch.tensor(cq, device=DEV, dtype=torch.int32)
+
+    dq, dqs, dk, dks = OPS.quant_qk(q, k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM)
+    pq, pqs, pk, pks = quant_varlen(pack(q, lens), pack(k, lens), cu, cu, gran)
+
+    assert torch.equal(pq, pack(dq, lens)), "q int8"
+    assert torch.equal(pk, pack(dk, lens)), "k int8"
+
+    eq = {"per_warp": BLKQ // WARPQ, "per_thread": (BLKQ // WARPQ) * 8}[gran]  # Q entries per block
+    ek = {"per_warp": 1, "per_thread": 4}[gran]  # K entries per block
+    nblk = (n + BLKQ - 1) // BLKQ
+    for b_i in range(b):
+        base = blk_offset(cq, b_i, BLKQ)
+        assert torch.equal(pqs[:, base * eq : (base + nblk) * eq], dqs[b_i]), f"q_scale seq {b_i}"
+        assert torch.equal(pks[:, base * ek : (base + nblk) * ek], dks[b_i]), f"k_scale seq {b_i}"
+
+
+# ------------------------------------------------------------- the dense gates
+
+
+FWD_SHAPES = [
+    # (batch, qo heads, kv heads, seq len)
+    (1, 2, 2, 128),
+    (2, 4, 2, 256),  # GQA
+    (3, 2, 2, 100),  # not a multiple of CTA_Q or CTA_K
+    (2, 1, 1, 577),
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("b,h_qo,h_kv,n", FWD_SHAPES, ids=lambda p: str(p))
+def test_fwd_varlen_equals_dense(causal, gran, head_dim, b, h_qo, h_kv, n):
+    """An equal-length batch has delta == 0, where bottom-right causal is the
+    dense top-left one and first_masked_tile lands on num_iterations - 1, i.e.
+    the dense "mask only the peeled tile" structure. Both outputs must
+    therefore be bit-identical."""
+    q, k, v = rand_qkv(b, h_qo, h_kv, n, head_dim, seed=(b * 977 + n) % 2**31)
+    lens = [n] * b
+    cu = torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32)
+
+    dq, dqs, dk, dks = OPS.quant_qk(q, k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM)
+    dv, dvs = quant_v_dense(v)
+    out_d, lse_d = fwd_dense(dq, dk, dv, dqs, dks, dvs, causal, gran, lse=True)
+
+    pq, pqs, pk, pks = quant_varlen(pack(q, lens), pack(k, lens), cu, cu, gran)
+    pv_fp8, pvs = pack_v_fp8(pack(v, lens), cu, n)
+    out_v, lse_v = fwd_varlen(pq, pk, pv_fp8, pqs, pks, pvs, cu, cu, causal, gran, lse=True)
+
+    assert torch.equal(out_v, pack(out_d, lens)), "out"
+    assert torch.equal(unpack_lse(lse_v, lens), lse_d), "lse"
+
+
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fwd_varlen_ragged_equals_per_sequence_dense(gran, head_dim):
+    """Ragged, non-causal: each sequence must come out exactly as a batch-of-one
+    dense run of itself, including sequences whose q and kv lengths differ. This
+    is the test that catches a K tile reading across a sequence boundary."""
+    q_lens = [37, 128, 300, 1]
+    k_lens = [200, 128, 64, 999]
+    cq, ck = cu_of(q_lens), cu_of(k_lens)
+    cu_q = torch.tensor(cq, device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(ck, device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(17)
+    heads = 2
+    q = torch.randn((sum(q_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, gran)
+    pv_fp8, pvs = pack_v_fp8(v, cu_k, max(k_lens))
+    out_v, lse_v = fwd_varlen(pq, pk, pv_fp8, pqs, pks, pvs, cu_q, cu_k, False, gran, lse=True)
+
+    for b in range(len(q_lens)):
+        one_q = q[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_k = k[ck[b] : ck[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_v = v[ck[b] : ck[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        dq, dqs, dk, dks = OPS.quant_qk(
+            one_q, one_k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM
+        )
+        dv, dvs = quant_v_dense(one_v)
+        out_d, lse_d = fwd_dense(dq, dk, dv, dqs, dks, dvs, False, gran, lse=True)
+        got = out_v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0)
+        assert torch.equal(got, out_d), f"out sequence {b}"
+        assert torch.equal(lse_v[:, cq[b] : cq[b + 1]].unsqueeze(0), lse_d), f"lse sequence {b}"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_fwd_varlen_long_packed_tensor(causal):
+    """The tensor maps describe the whole packed tensor, so their major
+    dimension is total_tokens and not one sequence's length -- an extent no
+    dense map ever carries, and the one place cuTensorMapEncodeTiled's 2^32 /
+    2^40 limits could bite. 129536 tokens with a 64K sequence in front of a 4K
+    one exercises the encode and the offsets together."""
+    lens = [65536, 40000, 20000, 4000]
+    heads, head_dim, gran = 2, 128, "per_thread"
+    cq = cu_of(lens)
+    cu = torch.tensor(cq, device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(23)
+    q = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    out_v, _ = sage_varlen_raw(q, k, v, cu, cu, causal, gran, lse=True)
+
+    for b in range(len(lens)):
+        one_q = q[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_k = k[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        one_v = v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0).contiguous()
+        dq, dqs, dk, dks = OPS.quant_qk(
+            one_q, one_k, None, tensor_layout="HND", qk_quant_gran=gran, **GEOM
+        )
+        dv, dvs = quant_v_dense(one_v)
+        out_d, _ = fwd_dense(dq, dk, dv, dqs, dks, dvs, causal, gran, lse=True)
+        got = out_v[cq[b] : cq[b + 1]].transpose(0, 1).unsqueeze(0)
+        assert torch.equal(got, out_d), f"out sequence {b}"
+
+
+# --------------------------------------------- bottom-right causal (delta != 0)
+
+
+def sdpa_varlen_ref(q, k, v, cu_q, cu_k, is_causal, sm_scale):
+    """Per-sequence fp32 attention over packed inputs, with flash-attention's
+    bottom-right causal alignment. A row that admits no key gets a zero output
+    and an lse of -inf, which is what the kernel is required to write."""
+    out = torch.zeros_like(q, dtype=torch.float32)
+    lse = torch.full((q.size(1), q.size(0)), float("-inf"), device=q.device, dtype=torch.float32)
+    for b in range(len(cu_q) - 1):
+        qs, qe, ks, ke = cu_q[b], cu_q[b + 1], cu_k[b], cu_k[b + 1]
+        if qe == qs or ke == ks:
+            continue
+        qb = q[qs:qe].transpose(0, 1).float()  # [heads, n_q, head_dim]
+        kb = k[ks:ke].transpose(0, 1).float()
+        vb = v[ks:ke].transpose(0, 1).float()
+        if qb.size(0) != kb.size(0):
+            rep = qb.size(0) // kb.size(0)
+            kb, vb = kb.repeat_interleave(rep, 0), vb.repeat_interleave(rep, 0)
+        s = torch.matmul(qb, kb.transpose(-1, -2)) * sm_scale
+        if is_causal:
+            n_q, n_k = s.size(-2), s.size(-1)
+            keep = torch.ones(n_q, n_k, dtype=torch.bool, device=s.device).tril(diagonal=n_k - n_q)
+            s = s.masked_fill(~keep, float("-inf"))
+        p = torch.nan_to_num(torch.softmax(s, dim=-1))  # all-masked rows -> 0
+        out[qs:qe] = torch.matmul(p, vb).transpose(0, 1)
+        lse[:, qs:qe] = torch.logsumexp(s, dim=-1)
+    return out, lse
+
+
+def sage_varlen_raw(q, k, v, cu_q, cu_k, causal, gran, lse=False):
+    """quant_qk_varlen + quant_v_fp8_varlen + fwd_varlen: the kernel pipeline
+    without the Python-side smooth_k."""
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, gran)
+    pv_fp8, pvs = pack_v_fp8(v, cu_k, seg_max(cu_k))
+    return fwd_varlen(pq, pk, pv_fp8, pqs, pks, pvs, cu_q, cu_k, causal, gran, lse=lse)
+
+
+# (q_lens, k_lens) -- each has a sequence whose delta is not a multiple of
+# CTA_K, which is where the diagonal band crosses a second KV tile
+CAUSAL_RAGGED = [
+    ([128, 64], [128, 64]),  # delta == 0, the dense structure
+    ([100, 200], [163, 200]),  # delta = 63: not a CTA_K multiple
+    ([300], [428]),  # delta = 128: exactly one tile
+    ([1000], [1]),  # R2: kv far shorter than qo, most rows admit no key
+    ([64, 130], [300, 131]),  # mixed, both off every alignment
+]
+
+
+@pytest.mark.parametrize("gran", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("q_lens,k_lens", CAUSAL_RAGGED, ids=lambda p: "x".join(map(str, p)))
+def test_fwd_varlen_bottom_right_causal(gran, head_dim, q_lens, k_lens):
+    cu_q = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(cu_of(k_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(7)
+    heads = 2
+    q = torch.randn((sum(q_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    out, lse = sage_varlen_raw(q, k, v, cu_q, cu_k, True, gran, lse=True)
+    ref, ref_lse = sdpa_varlen_ref(
+        q, k, v, cu_of(q_lens), cu_of(k_lens), True, head_dim**-0.5
+    )
+
+    live = ref_lse.isfinite()
+    assert torch.equal(lse.isfinite(), live), "the -inf rows must be exactly the empty ones"
+    assert cos_sim(out[live.any(0)], ref[live.any(0)]) > COS_MIN
+    assert rel_l1(out[live.any(0)], ref[live.any(0)]) < REL_L1_MAX
+    dead = ~live.any(0)
+    if dead.any():
+        assert torch.equal(out[dead], torch.zeros_like(out[dead])), "empty rows must be zero"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_fwd_varlen_empty_kv_sequence(causal):
+    """A sequence with no keys at all: zero output, -inf lse, and the other
+    sequences unaffected."""
+    q_lens = [64, 96, 32]
+    k_lens = [128, 0, 64]
+    cu_q = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(cu_of(k_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(3)
+    heads, head_dim = 2, 128
+    q = torch.randn((sum(q_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    out, lse = sage_varlen_raw(q, k, v, cu_q, cu_k, causal, "per_thread", lse=True)
+    cq = cu_of(q_lens)
+    empty = slice(cq[1], cq[2])
+    assert torch.equal(out[empty], torch.zeros_like(out[empty]))
+    assert torch.equal(lse[:, empty], torch.full_like(lse[:, empty], float("-inf")))
+    assert lse[:, cq[0] : cq[1]].isfinite().all()
+    assert lse[:, cq[2] : cq[3]].isfinite().all()
+
+
+def test_fwd_varlen_cudagraph():
+    """Only the contents of cu_seqlens may change between replays. The captured
+    graph keeps the tensor maps it was built with, which is legal exactly
+    because they carry no cu_seqlens value: the maps describe the whole packed
+    tensor and the sequence offset is a kernel-side coordinate.
+
+    Everything the segmentation *does* change - the scales and the V^T slab -
+    keeps its shape across replays (varlen.h Property 2), so it is recomputed
+    outside the graph and copied into the resident buffers the capture saw.
+    """
+    total, heads, head_dim, gran = 512, 2, 128, "per_thread"
+    g = torch.Generator(device=DEV).manual_seed(11)
+    q = torch.randn((total, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((total, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((total, heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    segmentations = [[256, 256], [384, 128], [200, 312], [511, 1]]
+    max_len = max(max(s) for s in segmentations)  # the model's upper bound
+    cu = torch.tensor(cu_of(segmentations[0]), device=DEV, dtype=torch.int32)
+
+    def prepare(lens):
+        cu.copy_(torch.tensor(cu_of(lens), device=DEV, dtype=torch.int32))
+        qi, qs, ki, ks = OPS.quant_qk_varlen(
+            q, k, cu, cu, None, max_seqlen_q=max_len, max_seqlen_k=max_len,
+            qk_quant_gran=gran, **GEOM,
+        )
+        vf, vs = pack_v_fp8(v, cu, max_len)
+        return qi, qs, ki, ks, vf, vs
+
+    pq, pqs, pk, pks, pv, pvs = prepare(segmentations[0])
+
+    def attend():
+        return OPS.fwd_varlen(
+            pq, pk, pv, pqs, pks, cu, cu, pvs, None,
+            max_seqlen_q=max_len, max_seqlen_k=max_len, qk_quant_gran=gran,
+            pv_accum_dtype=PV, v_layout=V_LAYOUT, is_causal=True,
+            sm_scale=head_dim**-0.5, return_lse=False, out_dtype=torch.float16,
+        )[0]
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            attend()
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graphed = attend()
+
+    for lens in segmentations:
+        qi, qs, ki, ks, vf, vs = prepare(lens)
+        pq.copy_(qi)
+        pk.copy_(ki)
+        pqs.copy_(qs)
+        pks.copy_(ks)
+        pv.copy_(vf)
+        pvs.copy_(vs)
+        graph.replay()
+        replayed = graphed.clone()
+        assert torch.equal(replayed, attend()), f"segmentation {lens}"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_opcheck_fwd_varlen(causal, return_lse):
+    q_lens, k_lens = [64, 100], [128, 100]
+    cu_q = torch.tensor(cu_of(q_lens), device=DEV, dtype=torch.int32)
+    cu_k = torch.tensor(cu_of(k_lens), device=DEV, dtype=torch.int32)
+    g = torch.Generator(device=DEV).manual_seed(5)
+    heads, head_dim = 2, 64
+    q = torch.randn((sum(q_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    k = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+    v = torch.randn((sum(k_lens), heads, head_dim), device=DEV, dtype=torch.float16, generator=g)
+
+    pq, pqs, pk, pks = quant_varlen(q, k, cu_q, cu_k, "per_thread")
+    pv_fp8, pvs = pack_v_fp8(v, cu_k, max(k_lens))
+    opcheck(
+        OPS.fwd_varlen.default,
+        (pq, pk, pv_fp8, pqs, pks, cu_q, cu_k, pvs, None),
+        {
+            "max_seqlen_q": seg_max(cu_q),
+            "max_seqlen_k": seg_max(cu_k),
+            "qk_quant_gran": "per_thread",
+            "pv_accum_dtype": PV,
+            "v_layout": V_LAYOUT,
+            "is_causal": causal,
+            "sm_scale": head_dim**-0.5,
+            "return_lse": return_lse,
+            "out_dtype": torch.float16,
+        },
+        test_utils=NO_SCHEMA_FP8,
+    )

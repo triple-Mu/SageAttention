@@ -312,13 +312,6 @@ Plan resolve(CC                       cc,
         plan.error = not_compiled_msg(plan.backend, cc);
         return plan;
     }
-    if (varlen && plan.backend == Backend::kSm100F8) {
-        // The tcgen05 kernels address K/V through tensor maps built per batch
-        // entry; the packed layout needs a different one and has not been
-        // written yet. Erroring beats silently reading across sequences.
-        plan.error = "varlen is not supported by the sm100 backend";
-        return plan;
-    }
 
     // ---- 2. defaults ----
     plan.gran     = req_gran ? *req_gran : (forced_fallback ? QuantGran::kPerWarp : default_gran(plan.backend));

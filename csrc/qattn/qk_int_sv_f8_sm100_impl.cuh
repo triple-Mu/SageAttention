@@ -53,11 +53,10 @@
 // host launchers) so that a second translation unit can include the same
 // body; the split is a pure move, the kernel text below is unchanged.
 //
-// That second translation unit will be qk_int_sv_f8_cuda_sm100_varlen.cu,
-// compiling this body with SAGE_VARLEN defined: q/k/v packed to
-// [total_tokens, heads, head_dim], blockIdx.z selecting a sequence of a
-// cu_seqlens prefix sum instead of a batch entry (not implemented yet; the
-// macro is reserved and has no effect today). The choice of #ifdef over a
+// That second translation unit is qk_int_sv_f8_cuda_sm100_varlen.cu, which
+// compiles this body with SAGE_VARLEN defined: q/k/v are packed to
+// [total_tokens, heads, head_dim] and blockIdx.z selects a sequence of a
+// cu_seqlens prefix sum instead of a batch entry. The choice of #ifdef over a
 // `bool kVarlen` template parameter is what keeps the dense kernel's SASS
 // byte-identical - a template parameter changes the kernel's parameter space
 // and its constant-bank layout, so the dense instantiation could not be
@@ -77,6 +76,15 @@
 #include "../math.cuh"
 #include "../numeric_conversion.cuh"
 #include "../tcgen05.cuh"
+
+#ifdef SAGE_VARLEN
+// Varlen-only include: unlike qk_int_sv_f8_sm90_impl.cuh this one is guarded,
+// because here the dense-TU SASS gate is byte-identity of the whole cuobjdump
+// dump and pulling a header into the dense TU moves the emission position of
+// torch's cub::detail::EmptyKernel boilerplate (every kernel's own stream
+// stays identical; only the ELF section order shifts).
+#include "../sageattn/seqlen_info.cuh"
+#endif
 
 #ifdef SAGE_SM100_DEVICE_ONLY
 
@@ -161,8 +169,21 @@ __global__ void __launch_bounds__(NUM_THREADS)
                                     const int64_t  stride_batch_o,
                                     const int64_t  stride_h_o,
                                     uint32_t       stride_seq_o,
+#ifdef SAGE_VARLEN
+                                    // [batch_size + 1] prefix sums; the sequence lengths, the scale
+                                    // block bases and the padded V^T slab base are derived from them
+                                    // per block. The *_stride_h are the packed tensors' per-head
+                                    // extents, which the dense kernel instead reads out of gridDim
+                                    // (query scale) or recomputes from kv_len (key scale).
+                                    const int32_t* __restrict__ cu_seqlens_q,
+                                    const int32_t* __restrict__ cu_seqlens_k,
+                                    const uint32_t q_scale_stride_h,
+                                    const uint32_t k_scale_stride_h,
+                                    const uint32_t lse_stride_h,
+#else
                                     const uint32_t qo_len,
                                     const uint32_t kv_len,
+#endif
                                     const uint32_t qo_per_kv_head,
                                     float          sm_scale)
 {
@@ -255,6 +276,73 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint32_t num_qo_heads = gridDim.y;
     const uint32_t kv_head_id   = head_id / qo_per_kv_head;
 
+#ifdef SAGE_VARLEN
+    // blockIdx.z is a sequence of the prefix sums, not a batch entry. From here
+    // down every length and every index is sequence-relative, exactly as the
+    // dense kernel's are relative to its batch entry; the sequence's absolute
+    // position enters the TMA coordinates, the scale block bases and the O / lse
+    // pointers, and nowhere else.
+    const SeqlenInfo<true, CTA_Q, CTA_K> seq_info(cu_seqlens_q, cu_seqlens_k, batch_id);
+    const uint32_t                       qo_len = seq_info.seqlen_q;
+    const uint32_t                       kv_len = seq_info.seqlen_k;
+    // The grid is opened to max_seqlen_q, so most sequences leave part of it
+    // empty. Block-uniform, and ahead of the barrier init, the TMA issues and
+    // the TMEM alloc below.
+    if (cta_idx_q * CTA_Q >= qo_len) {
+        return;
+    }
+
+    // Bottom-right alignment (flash-attention semantics): row q of the sequence
+    // attends to keys up to q + delta. delta is signed - kv shorter than qo is
+    // legal - so the whole trip-count computation is int32; the dense uint32
+    // form would wrap a negative bound into an enormous number of iterations.
+    // Unlike the dense kernel, which derives its trip count after the Q wait,
+    // this one is needed up here: the zero-trip exit below must leave before
+    // any barrier is initialized or TMA issued.
+    const int32_t causal_bound   = static_cast<int32_t>((cta_idx_q + 1) * CTA_Q) + seq_info.delta;
+    const int32_t kv_bound       = (mask_mode == MaskMode::kCausal) ? min(static_cast<int32_t>(kv_len), causal_bound) :
+                                                                      static_cast<int32_t>(kv_len);
+    const int32_t num_iterations = div_ceil(kv_bound, static_cast<int32_t>(CTA_K));
+
+    // The first KV tile holding a masked element. The dense kernel masks
+    // exactly one tile (the peeled last one); with delta not a multiple of
+    // CTA_K the diagonal band straddles two, so masking becomes a runtime
+    // tile-index predicate (see the mask block in process_tile). Clamping to
+    // num_iterations - 1 makes delta == 0 reproduce the dense tile structure
+    // exactly. Unlike sm90 there is no numerical constraint behind the clamp -
+    // the dequant scale is multiplied element-wise on every tile, masked or
+    // not - it only keeps the masking work minimal.
+    const int32_t first_masked_tile =
+        (mask_mode == MaskMode::kCausal) ?
+            max(0,
+                min(num_iterations - 1,
+                    (static_cast<int32_t>(cta_idx_q * CTA_Q) + seq_info.delta) / static_cast<int32_t>(CTA_K))) :
+            num_iterations - 1;
+
+    if (num_iterations <= 0) {
+        // No KV tile at all: an empty key sequence, or a causal CTA whose rows
+        // admit no key. O is a zero row and lse is -inf. Leaving from here,
+        // before the barriers are initialized, keeps no TMA in flight; thread
+        // == row makes the zero fill a plain row store.
+        const uint32_t zero_q_idx = cta_idx_q * CTA_Q + row_id;
+        if (zero_q_idx < qo_len) {
+            DTypeOut* O_zero_ptr = O + static_cast<int64_t>(seq_info.offset_q + zero_q_idx) * stride_seq_o
+                                   + static_cast<int64_t>(head_id) * stride_h_o;
+#pragma unroll
+            for (uint32_t jj = 0; jj < head_dim / 2; jj++) {
+                // DTypeOut is half or nv_bfloat16; a zero of either is a zero
+                // bit pattern, and the pair store matches the dense epilogue's
+                // 4-byte alignment.
+                reinterpret_cast<uint32_t*>(O_zero_ptr)[jj] = 0u;
+            }
+            if constexpr (return_lse) {
+                Lse[static_cast<int64_t>(head_id) * lse_stride_h + seq_info.offset_q + zero_q_idx] = -INFINITY;
+            }
+        }
+        return;
+    }
+#endif
+
     sm_scale *= math::log2e;  // softmax runs in base 2 (attn_utils.cuh convention)
 
     extern __shared__ __align__(1024) int8_t smem_[];
@@ -270,6 +358,31 @@ __global__ void __launch_bounds__(NUM_THREADS)
     int64_t      q_scale_idx;
     const float* K_scale_base_ptr;
 
+#ifdef SAGE_VARLEN
+    // The packed scales are [heads, blocks]: the batch dimension is gone and
+    // the sequence's own blocks start at varlen.h's blk_offset, which is the
+    // same expression the quantization kernel wrote them with. Deriving the
+    // per-head extent from gridDim (the dense form below) or from kv_len would
+    // be wrong here twice over - the grid covers max_seqlen, and the blocks of
+    // the earlier sequences sit in front of this one's. The within-block terms
+    // (row_id / 32, row_id % 8, the 4 per-tile K classes) are the dense ones.
+    constexpr uint32_t q_scale_per_cta = (Q_GRAN == QuantGranularity::kPerWarp) ? (CTA_Q / 32) : (CTA_Q / 32) * 8;
+    constexpr uint32_t k_scale_per_cta = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+
+    q_scale_idx = static_cast<int64_t>(head_id) * q_scale_stride_h
+                  + static_cast<int64_t>(seq_info.blk_q_base + cta_idx_q) * q_scale_per_cta;
+    if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
+        // per_warp_int8_cuda(BLKQ=128, WARPQ=32): 4 scales per block, one per 32 rows
+        q_scale_idx += row_id / 32;
+    }
+    else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
+        // per_thread quant (WARPQ=32): 8 scales per 32-row group, class = row_id % 8
+        q_scale_idx += (row_id / 32) * 8 + (row_id % 8);
+    }
+
+    K_scale_base_ptr = K_scale + static_cast<int64_t>(kv_head_id) * k_scale_stride_h
+                       + static_cast<int64_t>(seq_info.blk_k_base) * k_scale_per_cta;
+#else
     if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
         // per_warp_int8_cuda(BLKQ=128, WARPQ=32): 4 scales per block, one per 32 rows
         const uint32_t num_warp_tiles_q = gridDim.x * (CTA_Q / 32);
@@ -295,6 +408,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
         K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
                            + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
     }
+#endif
 
     constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
 
@@ -330,9 +444,23 @@ __global__ void __launch_bounds__(NUM_THREADS)
         tcgen05::expect_bytes<(CTA_Q * head_dim) * sizeof(int8_t)>(&barrier_Q);
         tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
         tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
+#ifdef SAGE_VARLEN
+        // The tensor maps are rank-4 with a batch extent of 1, so the batch
+        // coordinate is always 0 and the sequence's offset rides in the token
+        // coordinate instead. That is what keeps the maps free of any
+        // cu_seqlens value and therefore safe to capture in a cudagraph.
+        //
+        // Q and K move in tokens; V is the block-padded V^T slab, so it moves
+        // in varlen.h's pad_offset - which is blk_k_base * CTA_K exactly
+        // because fwd_cuda pins v_pad_multiple == blk_k.
+        tcgen05::load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, seq_info.offset_q + cta_idx_q * CTA_Q, head_id, 0);
+        tcgen05::load_async_4D(sK, &tensorMapK, &barrier_K, 0, seq_info.offset_k, kv_head_id, 0);
+        tcgen05::load_async_4D(sV, &tensorMapV, &barrier_V, seq_info.blk_k_base * CTA_K, 0, kv_head_id, 0);
+#else
         tcgen05::load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, cta_idx_q * CTA_Q, head_id, batch_id);
         tcgen05::load_async_4D(sK, &tensorMapK, &barrier_K, 0, 0, kv_head_id, batch_id);
         tcgen05::load_async_4D(sV, &tensorMapV, &barrier_V, 0, 0, kv_head_id, batch_id);
+#endif
     }
 
     const float q_scale = Q_scale[q_scale_idx];
@@ -366,10 +494,18 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // wait for Q (phase 0: single Q load, barrier never reused)
     tcgen05::wait(&barrier_Q, 0);
 
+#ifndef SAGE_VARLEN
     const uint32_t num_iterations =
         div_ceil(mask_mode == MaskMode::kCausal ? min(kv_len, (cta_idx_q + 1) * CTA_Q) : kv_len, CTA_K);
+#endif
 
     const uint32_t q_idx = cta_idx_q * CTA_Q + row_id;
+#ifdef SAGE_VARLEN
+    // q_idx serves the O / lse store bound, which stays sequence-relative; only
+    // the causal mask wants the bottom-right shift, so the shifted row index is
+    // a second, signed variable (the shift can push it below zero).
+    const int32_t q_idx_mask = static_cast<int32_t>(q_idx) + seq_info.delta;
+#endif
 
     // mbarrier phase bits (all barriers complete exactly once per KV tile;
     // see bench/sm100_review/barrier_ledger.md)
@@ -407,7 +543,16 @@ __global__ void __launch_bounds__(NUM_THREADS)
         if constexpr (!is_last) {
             if (threadIdx.x == 0) {
                 tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
+#ifdef SAGE_VARLEN
+                // A tile that runs off the end of this sequence reads the next
+                // one's keys; the mask's kv_idx >= kv_len test clears them, and
+                // past total_tokens the tensor map's out-of-bounds fill takes
+                // over.
+                tcgen05::load_async_4D(
+                    sK, &tensorMapK, &barrier_K, 0, seq_info.offset_k + (iter + 1) * CTA_K, kv_head_id, 0);
+#else
                 tcgen05::load_async_4D(sK, &tensorMapK, &barrier_K, 0, (iter + 1) * CTA_K, kv_head_id, batch_id);
+#endif
             }
         }
 
@@ -443,6 +588,32 @@ __global__ void __launch_bounds__(NUM_THREADS)
                 }
                 float s = __int2float_rz(static_cast<int32_t>(RS_u32[jj])) * dequant_scale_j;
 
+#ifdef SAGE_VARLEN
+                // Bottom-right alignment can put masked elements in more than
+                // the peeled last tile (delta not a multiple of CTA_K), so the
+                // trigger is a runtime tile-index predicate; block-uniform,
+                // since iter and first_masked_tile both are. Signed throughout:
+                // the shifted row bound can be negative, and an unsigned
+                // compare would wrap it into "mask nothing" exactly where
+                // everything is masked. With delta == 0 the masked elements
+                // are the dense peeled-tile ones and every other tile runs the
+                // dense arithmetic, so the dense bit-equality holds. The
+                // prefetches above and below stay peeled on is_last.
+                if (static_cast<int32_t>(iter) >= first_masked_tile) {
+                    // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
+                    const int32_t kv_idx = static_cast<int32_t>(iter * CTA_K + j);
+                    bool          is_out_of_bounds;
+                    if constexpr (mask_mode == MaskMode::kCausal) {
+                        is_out_of_bounds = (kv_idx > q_idx_mask) || (kv_idx >= static_cast<int32_t>(kv_len));
+                    }
+                    else {
+                        is_out_of_bounds = (kv_idx >= static_cast<int32_t>(kv_len));
+                    }
+                    if (is_out_of_bounds) {
+                        s = -5000000.0f;
+                    }
+                }
+#else
                 if constexpr (is_last) {
                     // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
                     const uint32_t kv_idx = iter * CTA_K + j;
@@ -457,6 +628,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                         s = -5000000.0f;
                     }
                 }
+#endif
 
                 m_local   = max(m_local, s);
                 RS_f32[j] = s;
@@ -565,24 +737,65 @@ __global__ void __launch_bounds__(NUM_THREADS)
         if constexpr (!is_last) {
             if (threadIdx.x == 0) {
                 tcgen05::expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
+#ifdef SAGE_VARLEN
+                // Unlike K, V never crosses into the next sequence: the slab of
+                // sequence b spans blk_offset(b + 1) - blk_offset(b) >=
+                // ceil(kv_len / CTA_K) blocks (varlen.h, Property 1), and
+                // iter + 1 never reaches that many.
+                tcgen05::load_async_4D(
+                    sV, &tensorMapV, &barrier_V, (seq_info.blk_k_base + iter + 1) * CTA_K, 0, kv_head_id, 0);
+#else
                 tcgen05::load_async_4D(sV, &tensorMapV, &barrier_V, (iter + 1) * CTA_K, 0, kv_head_id, batch_id);
+#endif
             }
         }
     };
 
+#ifdef SAGE_VARLEN
+    // int32 like num_iterations; the zero-trip exit above guarantees >= 1 here
+    for (int32_t iter = 0; iter + 1 < num_iterations; iter++) {
+        process_tile(std::false_type{}, iter);
+    }
+#else
     for (uint32_t iter = 0; iter + 1 < num_iterations; iter++) {
         process_tile(std::false_type{}, iter);
     }
+#endif
     process_tile(std::true_type{}, num_iterations - 1);  // peeled: fused mask, no prefetch
 
     // -------------------------------------------------------------------------
     // Epilogue: O = O * v_scale / denom, cvt to fp16/bf16, direct global stores
     // (thread = row; MVP keeps the sm90-style register->global epilogue).
     // -------------------------------------------------------------------------
+#ifdef SAGE_VARLEN
+    // A row that admitted no key at all - bottom-right causal with kv shorter
+    // than qo - saw nothing but masked elements, and their P is not 0 but
+    // exp2(S_FP8_OFFSET) (the -5000000 sentinel and the row max cancel):
+    // without the override O would come out as a scaled average of the KV
+    // tile. flash-attention's answer for such a row is a zero output and an
+    // -inf lse. d_rcp = 0 zeroes O - safe because every value on the P/V chain
+    // is finite (the tensor map fills out-of-bounds int8 with 0 and the V slab
+    // is zero-padded), so there is no 0 * inf - and row_max = -inf makes the
+    // lse below -inf. The row is identified by its index: q_idx_mask already
+    // carries + delta, so "no admissible key" is exactly a negative value.
+    float d_rcp = math::ptx_rcp(denom);
+    if constexpr (mask_mode == MaskMode::kCausal) {
+        if (q_idx_mask < 0) {
+            d_rcp   = 0.0f;
+            row_max = -INFINITY;
+        }
+    }
+    // The sequence's first token replaces the batch stride; the packed tensor
+    // has no batch dimension at all.
+    const bool row_valid  = q_idx < qo_len;
+    DTypeOut*  O_lane_ptr = O + static_cast<int64_t>(seq_info.offset_q) * stride_seq_o
+                           + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
+#else
     const float d_rcp      = math::ptx_rcp(denom);
     const bool  row_valid  = q_idx < qo_len;
     DTypeOut*   O_lane_ptr = O + static_cast<int64_t>(batch_id) * stride_batch_o
                            + static_cast<int64_t>(head_id) * stride_h_o + static_cast<int64_t>(q_idx) * stride_seq_o;
+#endif
 
 #pragma unroll
     for (uint32_t c = 0; c < num_tiles_o; c++) {
@@ -617,8 +830,15 @@ __global__ void __launch_bounds__(NUM_THREADS)
         // one thread-local store per row (correct for any CTA_Q, unlike the
         // sm90 CTA_Q=64-only lane dance)
         if (row_valid) {
+#ifdef SAGE_VARLEN
+            // lse is [heads, total_tokens]: head-major, and the sequence's rows
+            // sit at its token offset.
+            Lse[static_cast<int64_t>(head_id) * lse_stride_h + seq_info.offset_q + q_idx] =
+                math::ptx_log2(denom) + row_max;
+#else
             Lse[static_cast<int64_t>(batch_id) * (static_cast<int64_t>(qo_len) * num_qo_heads)
                 + static_cast<int64_t>(head_id) * qo_len + q_idx] = math::ptx_log2(denom) + row_max;
+#endif
         }
     }
 

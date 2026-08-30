@@ -140,6 +140,11 @@ endif()
 set(SAGE_SRC_SM100
   csrc/qattn/qk_int_sv_f8_cuda_sm100.cu
   csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu)
+# Same pattern as sm90: the varlen TU joins the group (and its accel gencode
+# list); it names its own namespace internally.
+if(SAGE_BUILD_VARLEN)
+  list(APPEND SAGE_SRC_SM100 csrc/qattn/qk_int_sv_f8_cuda_sm100_varlen.cu)
+endif()
 # The sm89 template TUs are compiled twice (OBJECT libraries below): once as
 # sage::sm89 with the full fallback arch set, once as sage::sm120 with the
 # sm_12x-only set (minus the fp32+fp32 inst_buf variant sm120 never uses).

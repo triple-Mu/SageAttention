@@ -30,6 +30,9 @@ else:
 # (probe TU, include dir, expected `ptxas -v` entry-function count)
 PROBES = [
     pytest.param("bench/sm100_review/qk_int_sv_f8_cuda_sm100_probe.cu", "csrc/qattn", 4, id="qk_int_sv_f8"),
+    pytest.param(
+        "bench/sm100_review/qk_int_sv_f8_cuda_sm100_varlen_probe.cu", "csrc/qattn", 4, id="qk_int_sv_f8_varlen"
+    ),
     pytest.param("bench/sm100_review/tcgen05_probe.cu", "csrc", 1, id="tcgen05"),
 ]
 

@@ -326,23 +326,28 @@ def test_varlen_downgrades_smooth_v():
     assert varlen.need_value_mean is False
 
 
-def test_varlen_rejects_sm100():
+def test_varlen_accepts_sm100():
+    """The sm100 packed kernel landed: varlen resolves the backend exactly as
+    dense does (a build without the sm100 family still reports not-compiled)."""
     p = Plan(*PLAN_OP(10, 0, 128, "sm100", None, None, None, True))
-    assert "varlen" in p.error or "not in this build" in p.error
+    if p.error:
+        assert "not in this build" in p.error
+    else:
+        d = Plan(*PLAN_OP(10, 0, 128, "sm100", None, None, None, False))
+        assert p.backend == "sm100"
+        assert tuple(p) == tuple(d)
 
 
 def test_varlen_leaves_the_dense_decision_alone():
-    """Apart from smooth_v and sm100, varlen must resolve to exactly the dense
-    decision, error strings included: the varlen TU compiles the same kernel
-    body from the same *_impl.cuh."""
+    """Apart from smooth_v, varlen must resolve to exactly the dense decision,
+    error strings included: the varlen TU compiles the same kernel body from
+    the same *_impl.cuh."""
     for (cc, head_dim, gran, pv, sv, varlen), plan in list(PLAN.items()):
         if varlen or sv:
             continue
         other = PLAN.get((cc, head_dim, gran, pv, sv, True))
         if other is None:  # a key another test resolved on demand
             continue
-        if "sm100" in (plan.backend, other.backend):
-            continue  # varlen rejects sm100; test_varlen_rejects_sm100 covers it
         assert tuple(plan) == tuple(other), (cc, head_dim, gran, pv, sv)
 
 
