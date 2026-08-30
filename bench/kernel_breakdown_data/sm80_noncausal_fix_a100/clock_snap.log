@@ -1,0 +1,16 @@
+== fix_r3 pre ==
+210 MHz, 33, 45.22 W
+== fix_r3 post ==
+1410 MHz, 56, 82.98 W
+== base_r3 pre ==
+1410 MHz, 56, 86.18 W
+== base_r3 post ==
+1410 MHz, 63, 94.85 W
+== fix_r4 pre ==
+1410 MHz, 63, 95.36 W
+== fix_r4 post ==
+1410 MHz, 66, 102.92 W
+== base_r4 pre ==
+1410 MHz, 66, 95.28 W
+== base_r4 post ==
+1410 MHz, 67, 97.50 W
