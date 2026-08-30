@@ -6,7 +6,7 @@
 
 | 改动 | arch | 实测收益 | bench 口径 | 数据产物 |
 |---|---|---|---|---|
-| C1 WS kernel + auto 启发式(d128 非 causal ≥16k / causal ≥32k 自动走 WS) | sm100 | auto/old d128 geomean **+1.07%**,命中段逐形状 +0.6~+2.7%,其余段 =old;ws/cudnn 0.732(old/cudnn 0.738) | cdsl_bench_fwd 22 点 ×3 轮四方轮换(old/ws/auto/cudnn),B200 | computelab `logs-w4/bench/`,本机 scratchpad `w4run/` |
+| C1 WS kernel(G1 raw 域 softmax + lever B TMA epilogue,auto=d128 全开) | sm100 | ws/old 全表 **1.1308**(d128 **1.1518**,20/20 全正:s1024 段 1.18-1.37、s4096 1.13-1.15、≥16k 1.10-1.13);**ws/cudnn 0.738→0.835(d128 0.862)**;duration@16k −10.2%;d64 不进 auto(仍 0.93) | cdsl_bench_fwd 22 点 ×3 轮 + 四态归因 12 形状,B200 | computelab `logs-w11/`,本机 scratchpad `w11/` |
 | P2 quant dense/varlen 拆实例(per_warp + per_thread 家族) | sm100 | quant 组合 wall **+2.2~2.3%**(quant_q +1.4~1.8%、quant_k +2.4~3.2%) | quant_qk dense,b4h32 d128 seq{4k,16k,32k},min-of-30 ×3 轮交替,B200 | `logs-w4/p2/` |
 | 同上 | sm90 | per_warp Q **+4.6%**、per_thread Q +2.4~3.7%(per-block 家族拆分实测劣化已回退,见 §3) | 同口径,H200 | hyper01 `/workspace/p2-sm90/` |
 | 同上 | sm89 | 无回退(±0.4%,低于信号线) | kernel_breakdown b4h32 d128,L20 | computelab `logs-w4l/kbd/` |
@@ -14,7 +14,7 @@
 | P4 门限(sm100/110 4096→**24576**) | sm100 | 4-24k 段融合快 **13~31%**(0.69-0.87,全范围无交叉);bitcheck 12/12 等价 | 同上,B200 | `logs-w4/p4_*.json` |
 | C1 r4 collective-wait 交错 | sm100 | ws/old 0.9827→0.9890(**+0.64%**,非 causal 逐形状 ~+1%) | 同 C1 口径 | `logs-w4/bench/` |
 
-C1 迭代史:r1 两遍读 0.883 → r2 单遍驻留 0.947 → r3 2×x64 宽 ld + f32x2 0.983 → r4 交错 0.989(对 old);auto 启发式把正收益段固化为默认。C1 完整 WS 对 cudnn 的差距(0.73)未如 cutedsl 先验(1.07-1.18)收敛——warp 供给兑现(Active/sched 2.0→3.4)但 tcgen05.ld 暴露延迟未被 ptxas 调度吸收(r4 的 PTX 交错在 sm_100a 被复沉,6/8 站点串行),继续深挖需源级在 ld 与首个消费点间填独立工作(重开 bit-exact 论证)或接受现状。
+C1 迭代史:r1 两遍读 0.883 → r2 单遍驻留 0.947 → r3 宽 ld+f32x2 0.983 → r4 交错 0.989 → **G1 raw 域 softmax 1.131**(树形 max + LOG2_448 域折叠消 dequant + packed d_sum,链深 198→35 op/块;lever A 单变量坐实 +4.8-7.1% 劣化被 G1 重写吸收;lever B 写扇区 12×→1.5× 保留)。G1 走双级门禁:WS 路 246/2082 设计内 diff(denom 重结合)→ accuracy 最差 cos 0.999242/rel_l1 0.039 → 重 dump `golden-sm100-g1ws`(ok=2107),旧路 golden 不变;**对拍构建须 SAGEATTN_CMAKE_ARGS=-DSAGE_PRUNE_GENCODE=OFF**。剩余候选:G2 sKScale smem 预载(G1 使 L2 read +14%)、d64 WS 未立项。
 
 ## 2. 工程收益表
 
