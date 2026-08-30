@@ -76,11 +76,11 @@
 //   default                   - kernel + torch launcher (extension build)
 //   -DSAGE_SM100_DEVICE_ONLY  - kernel only, torch-free (ptxas probe TU)
 
+#include <cfloat>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <cfloat>
 #include <stdint.h>
 #include <type_traits>
 
@@ -1055,12 +1055,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 #pragma unroll
                 for (uint32_t jj = 0; jj < 32; jj += 2) {
                     float lo, hi;
-                    ws::f32x2_mul(lo,
-                                  hi,
-                                  __uint_as_float(RO_u32[jj]),
-                                  __uint_as_float(RO_u32[jj + 1]),
-                                  o_scale,
-                                  o_scale);
+                    ws::f32x2_mul(
+                        lo, hi, __uint_as_float(RO_u32[jj]), __uint_as_float(RO_u32[jj + 1]), o_scale, o_scale);
                     RO_u32[jj]     = __float_as_uint(lo);
                     RO_u32[jj + 1] = __float_as_uint(hi);
                 }
