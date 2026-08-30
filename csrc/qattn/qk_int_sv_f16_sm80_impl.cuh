@@ -206,11 +206,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
 
     // q_scale is read once, so the whole index can stay 64-bit. k_scale is read
     // once per iteration, so it is split into a 64-bit base pointer plus a
-    // 32-bit running offset. The offset's live range crosses every
-    // process_tile expansion, and at 255 registers ptxas rematerializes its
-    // lane term as an S2R from SR_TID inside the loop - on the per-iteration
-    // dequant_scale chain, the same pattern the sm89 kernel hit - so the
-    // plain non-causal instances fold it into the pointer below.
+    // 32-bit running offset.
     int64_t      q_scale_idx;
     const float* K_scale_base_ptr;
     uint32_t     k_scale_off;
@@ -517,17 +513,6 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                           CTA_K>(
         &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
     cp_async::commit_group();
-
-    // Fold the lane/warp term into the pointer for the plain non-causal
-    // instances only, mirroring the sm89 kernel: their KV loop is almost all
-    // kBulk tiles, where the extra S2R sits on the per-iteration dequant_scale
-    // chain. The causal and return_lse instances keep the split form - folding
-    // there reshuffles their register allocation for the worse (measured on
-    // sm89: causal gives half its win back, non-causal+lse spills 39 -> 90).
-    if constexpr (mask_mode != MaskMode::kCausal && !return_lse) {
-        K_scale_base_ptr += k_scale_off;
-        k_scale_off = 0;
-    }
 
     float q_scale = Q_scale[q_scale_idx];
 
