@@ -56,8 +56,8 @@ q_scale 块索引 clamp 防越界读),与 cutedsl 同策略。
 | mma_corr pipeline | 共享 2-stage ring,o0/o1 交替 | 每 O tile 专用 1-stage ×2 | S1-only 轮打破交替后共享 ring 的 slot=item%2 错位;专用 pipe 语义等价(账本 §1)且 phase 记账是纯标量 |
 | mma_s 尾部 dummy commit | L745-746(softmax 末段多等一拍) | 无 | 本实现 softmax 末段不等 mma_s,计数天然平衡(账本 §3);少两次 commit |
 | softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | 换成现 kernel 的逐元素序(:412-474 照抄) | M0-M2 bit-exact 硬闸;packed 化留给 M3 后再评估(需重开 golden 口径) |
-| softmax 寄存器策略 | 整行 128 f32 驻留 | **两遍 TMEM 读 + chunk0 驻留**(见 §3) | 192 预算 + bit-exact 序两者同时满足;代价每 tile 每线程多 3 次 32 列 tmem_ld(M2 用 ncu 看代价) |
-| vec 提前信号(max 后、exp2 前发) | L1104-1109 | 照抄(chunk0 驻留使 pass2 不再读 vec 别名列) | correction 的 O rescale 藏进 softmax 的 exp2 段,是重叠收益主源 |
+| softmax 寄存器策略 | 整行 128 f32 驻留 | 照抄:单遍读、整行驻留(见 §3;初版两遍读实测 0.887× 已回退,见 §6.1) | dequant 后行驻留 128 reg + 状态 ~30,ptxas 收在 189/192、零 spill;每 KV 块每线程 4 次 32 列 tmem_ld(两遍版是 7 次) |
+| vec 提前信号(max 后、exp2 前发) | L1104-1109 | 照抄(全部 S 读已完成,别名列 [0,2) 已死) | correction 的 O rescale 藏进 softmax 的 exp2 段,是重叠收益主源 |
 | k_scale smem 预载(sKScale) | L544-552(per-block gran) | 不搬,保持现 kernel 逐块 global 读 | 我们默认 per-thread gran(每 tile 4 标量);M2 若 long_scoreboard 热点再加 |
 | q_scale 粒度 | BLKQ=64/WARPQ=16 契约 | 现 kernel 的 BLKQ=128 契约,块索引改 2bx+tile + clamp | 量化侧零改动 |
 | epilogue | sO smem + TMA store(epilogue warp) | M0-M2:correction 直接寄存器->global(现 kernel :567-599 序) | bit-exact;M3 换 TMA store(corr_epi pipe 设计已入账本 §8) |
@@ -71,19 +71,21 @@ q_scale 块索引 clamp 防越界读),与 cutedsl 同策略。
 浮点运算序全部从 `qk_int_sv_f8_cuda_sm100.cu` 逐行拷贝并在代码里标注源行号
 (:412-474 softmax、:454-458 在线更新、:479-491 O correction、:567-599
 epilogue、:601-608 LSE)。**选拷贝不选抽共享 inline**:两 kernel 的线程结构不
-同(单遍 vs 两遍、行归属不同),抽取必然带参数化改写,做不到"旧 TU 预处理文
-本等价";拷贝 + 行号注释 + golden 双 gate 反而是可核对的。已验证:旧 TU 在
+同(行归属、barrier 驱动、exp2/pack 融合),抽取必然带参数化改写,做不到"旧
+TU 预处理文本等价";拷贝 + 行号注释 + golden 双 gate 反而是可核对的。已验证:旧 TU 在
 `-DSAGE_SM100_DEVICE_ONLY` 下预处理文本与 45aadd7 逐字节一致(env 开关全在
 host 侧),SASS 恒等由此保证。
 
 与旧 kernel 的三处结构差异,均为值恒等:
 
-1. **两遍 softmax**。旧 kernel 把整行 128 个 s 存寄存器;新 kernel pass1 求
-   max(chunk0 驻留寄存器,chunk1-3 读完即弃),pass2 重读 chunk1-3 重算
-   s_j。恒等理由:s_j = `__int2float_rz(TMEM 同一 s32) * dequant_scale_j`,
-   输入与运算完全相同,重算结果逐位一致;m_local 的 max 序、p 的 exp2 序、
-   d_sum 的单累加器升序、`denom *=/+=` 的次序全部保持。chunk0 驻留是因为
-   vec 存进 S 列 [0,2),pass2 不能再从 TMEM 读该 chunk(账本 H9)。
+1. **softmax exp2 与 pack 融合**。load/dequant/mask/max 循环与旧 kernel
+   :407-449 完全同构(单遍读、整行 RS_f32 驻留);差异只剩 exp2 段:旧
+   kernel 先整行 in-place exp2 再单独一轮 pack,新 kernel 每 4 列算完
+   p[0..3] 立即 `floatx4_to_e4m3x4` pack(压 RS_f32+RP 并存的峰值)。恒等
+   理由:p 的 exp2 表达式同输入同序,d_sum 单累加器升序不变,pack 是逐 4
+   元素独立转换,先后不影响任何值。
+   (历史:初版为压寄存器采用两遍 TMEM 读 + chunk0 驻留,B200 实测几何均值
+   0.887× 回退,归因 tcgen05.ld 流量翻倍暴露延迟,已改回单遍,见 §6.1。)
 2. **o_scale 经 TMEM 转手**。vec=(m_prev,row_max) 两个 f32 位保真进出
    TMEM,correction 里 `ptx_exp2(m_prev-row_max)` 与旧 kernel 同表达式同输
    入 → 同位。denom 同理(最终 vec),`ptx_rcp` 同位。
@@ -95,10 +97,16 @@ host 侧),SASS 恒等由此保证。
 
 | 区 | 预算 | ptxas 区内峰值(4 实例最大) | 余量 |
 |---|---|---|---|
-| softmax(warp 0-7) | 192 | R171 → 172 | 20 |
+| softmax(warp 0-7) | 192 | R188 → 189(两遍读旧版 172;整行驻留 +17) | 3 |
 | correction(warp 8-11) | 88 | R77 → 78 | 10 |
 | mma/load(warp 12-15) | 40 | 线性段混入冷块不可直读;40 下 0 spill,32 下 24B spill | ~2-6 |
 | 合计 | 2·192+88+40 = 512/线程列 ×128 = 64K | — | 恰满 |
+
+softmax 区细账(单遍驻留版):RS_f32 整行 128 + RP_u32 打包 32(pack 每出
+1 word 杀 4 个 RS_f32,联合活跃度自 max 点后单调降)+ 标量状态
+(row_max/denom/相位/4 个 barrier 地址/tmem_row/scale 组)~30,强制平台
+≈ 158,其余是 ptxas 调度自由度。cutedsl 同形(整行 f32 + 32 P word)同样
+收在 192(其账面 ~190)。
 
 偏离任务书的 192/192/96/32 的原因:zero-spill 门禁与 32-reg mma/load 区冲突
 (裸 mbarrier 记账 + 描述符循环不变量 ~38 live)。88/40 调剂后四实例
@@ -150,14 +158,37 @@ no_eligible 54%、SM throughput 44.8%。cutedsl 同结构上限:XU 62-67% SOL。
 | M2 性能采样 | bench 扫 s∈{512..16K};ncu 采关键 kernel | eligible ≥1.2、no_eligible <40%、SM throughput 55-65%;几何均值相对 128 线程基线的加速落在 1.5×+(cutedsl 包络 2.31×) |
 | M3 epilogue TMA store + 收尾 | corr_epi pipe + warp14 + sO 双缓冲(账本 §8);视 M2 profile 决定 k_scale smem 预载 | 重过 M1 gate(此步起允许放宽 bit-exact 为容差 gate,由主控拍板) |
 
-M2 若不达标的定位顺序(按本设计引入的新变量排):
-1. softmax 两遍读的代价:ncu `tcgen05 ld` 停顿/`long_scoreboard`;若显著,
-   回退到 cutedsl 的整行驻留(172→~190 reg,预算内但贴顶)。
-2. vec/corr 1-stage 串扰:`smsp__warp_issue_stalled_barrier` 分角色看;若
+### 6.1 M2 首轮实测:两遍读判负,已改单遍驻留
+
+B200 b4h32s16384 d128、cdsl_bench 22 点:ws/old 几何均值 **0.887**(22/22
+全慢)。ncu 归因:供给侧变好(Active/scheduler 1.99→3.43、Eligible
+0.65→0.88、Issued 0.50→0.54)但单 warp 变慢(Warp Cycles Per Issued
+Instruction 4.01→6.39),逐项 stall(cycles/issued-insn)里唯一大头是
+`long_scoreboard` 0.83→2.76(+1.93),`mio_throttle` 0.05→0.40 同涨;
+Memory Throughput 17.9→8.3,是延迟暴露不是带宽。与两遍 TMEM 读的判断吻合:
+每 KV 块每线程 7 次 32 列 tcgen05.ld(两遍 4+3)对 128 线程 kernel 的 4 次,
+流量 1.75×、暴露延迟链 7 条。
+
+修复 = 预案 1 落地:改回单遍读整行驻留(结构即 128 线程 kernel 的
+:407-449,寄存器账在 §4),每块 4 次 ld、每 ld 一 wait 的节奏不变——不碰
+A5 判负的「批量发射后集中 wait」模式。方案取舍:
+* A1 单遍驻留(选定):bit-exact 保持,消灭多余流量,零新机制;
+* A3 两遍保留 + fragment 级交错 ld:流量仍 1.75×,只藏延迟,且 2 条
+  outstanding ld 落在 A5 挂死(4 条 outstanding,根因未定位)的未证安全区;
+* A2 fragment 局部 max + 行级补偿:破 bit-exact 换寄存器,A1 的账算得过来,
+  不需要。
+
+预期信号(下轮上机):`long_scoreboard` 回落、ws/old 转正;golden 双 gate
+输出应与两遍版逐位一致(值恒等论证 §3)。
+
+M2 若仍不达标的定位顺序:
+1. vec/corr 1-stage 串扰:`smsp__warp_issue_stalled_barrier` 分角色看;若
    correction 卡 vec,考虑 vec 双缓冲(TMEM 有空列:d64 显然,d128 可借
    P 区错峰,需重开别名论证)。
-3. mma warp 发射间隙:`sm__pipe_tensor_op_cycles_active` 占空;若 QK/PV 间
+2. mma warp 发射间隙:`sm__pipe_tensor_op_cycles_active` 占空;若 QK/PV 间
    有大空洞,检查 s_empty 到达延迟(softmax 关键路径)。
+3. softmax 4 条串行 ld 链仍是热点:fragment 级双缓冲(2 outstanding)重开
+   前必须先复现并定位 A5 挂死(HARDWARE_CHECKLIST 规则)。
 
 ## 7. 风险与回退
 
@@ -169,6 +200,7 @@ M2 若不达标的定位顺序(按本设计引入的新变量排):
 | in-order UMMA 假设(H2) | P 被下一发 QK 踩,数值错但不挂 | 与 CUTLASS FMHA 同假设,风险极低;若疑,临时在 QK 前多等一拍 corr_full(牺牲重叠的诊断开关) |
 | 尾 CTA 白算拖平均 | 短序列加速比差 | 已知代价(cutedsl 同);不单独修,归入 M2 评估 |
 | 88 reg correction 将来加逻辑顶破 | 新增代码后 spill 复现 | 余量 10;M3 改 epilogue 时重跑 §5 门禁 |
+| 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | 单遍驻留后余量仅 3(§4);softmax 区任何改动都要重跑 §5 门禁,顶破时先看 exp2/pack 融合段可否再压,再考虑 correction 让 reg |
 
 挂死 triage(继承 quant-occupancy/sqsh 战场经验 + 本设计专项):
 

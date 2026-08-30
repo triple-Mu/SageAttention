@@ -157,9 +157,9 @@ load (elected thread): issue order `Q0, K0, Q1, V0, (K_i, V_i)*` for
 softmax_t (each of 128 threads; step j):
 ```
 [w] s_full#j
-pass 1: ld chunk0 (kept in regs) + chunks 1-3 -> m_local
+ld chunks 0-3 (one ld + wait::ld each) -> dequant+mask row kept in regs, m_local
 m/denom update; st vec=(m_prev,row_max) -> wait::st, fence, arrive vec_full#j
-pass 2: exp2+pack (chunk0 from regs, chunks 1-3 re-read); denom += d_sum
+exp2+pack from the retained row (no TMEM reads); denom += d_sum
 st P -> wait::st, fence, arrive s_empty#j
 [w] vec_empty#j
 ```
@@ -229,7 +229,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 
 | # | hazard | discharged by |
 |---|---|---|
-| H1 | QK_t(j+1) overwrites S_t while softmax_t still reads step j (both passes) | mma waits `s_empty#j` before PV_t(j), and QK_t(j+1) is issued after that wait in the elected thread's program order; softmax arrives only after its last `tcgen05.ld` of step j completed (`wait::ld` per chunk) and its P `wait::st` + `fence::before_thread_sync` |
+| H1 | QK_t(j+1) overwrites S_t while softmax_t still reads step j | mma waits `s_empty#j` before PV_t(j), and QK_t(j+1) is issued after that wait in the elected thread's program order; softmax arrives only after its last `tcgen05.ld` of step j completed (`wait::ld` per chunk) and its P `wait::st` + `fence::before_thread_sync` |
 | H2 | QK_t(j+1) overwrites P_t cols [32,64) while PV_t(j) still reads P_t | both are UMMA ops issued by the same elected thread into one in-order UMMA queue; PV_t(j) is issued first, so it consumes P before QK_t(j+1) writes (same argument the CUTLASS sm100 FMHA mainloop and the 128-thread kernel's TMEM_COL_P overlay rely on) |
 | **H3** | **QK_t(j+1) overwrites vec_t cols [0,2) before correction read vec_t(j)** | see section 6 |
 | H4 | TMA K/V load overwrites a ring slot still read by an MMA | load waits `kv_empty` of the previous lap; that barrier completes via `tcgen05.commit` issued after the slot's last reader (K_i: QK1(i); V_i: PV1(i)), and commit fires only when those MMAs **retired** |
@@ -237,7 +237,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j) |
 | H7 | correction reads O_t (rescale j / epilog) before PV_t(j-1) finished accumulating | `corr_full#(j-1)` completes when the PV chain retired (tcgen05.commit semantics) |
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
-| H9 | softmax pass 2 re-reads S cols [0,2) after its own vec store aliased them | avoided by construction: chunk 0 (cols [0,32)) is retained in registers across the vec store; pass 2 re-reads only chunks 1-3 (cols [32,128)), and the P store (cols [32,64)) happens after all re-reads |
+| H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
 | H10 | `tmem_dealloc` while any warp still touches TMEM | 384 dealloc arrivals, each after the thread's last TMEM op (+ fence); the final PV retired transitively before correction's epilog arrivals (H7); mma warp waits ph 0 then deallocs collectively |
 | H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale is written pre-`__syncthreads` and read by correction over the generic proxy — plain sync suffices. No hand-written smem feeds an MMA in this kernel (Q/K/V arrive via TMA, P via TMEM), so no `fence.proxy.async` is needed in the kernel body — the probe that does hand-fill smem (p0c) carries it |
 
