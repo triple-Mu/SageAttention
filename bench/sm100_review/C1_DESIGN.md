@@ -19,9 +19,10 @@ CTA 覆盖 Q 行 [256*bx, 256*bx+256) = tile0 + tile1(各 128 行)
   warp 0-3   softmax0   S0 拉取/在线 softmax/P0 打包        setmaxnreg 192
   warp 4-7   softmax1   同上,tile1                          setmaxnreg 192
   warp 8-11  correction O0/O1 rescale + 末段 epilogue 数学    setmaxnreg 88
+                        (r5 起末段写 sO staging,见 §6.6)
   warp 12    mma        单 elect 线程发全部 tcgen05.mma       setmaxnreg 40
-  warp 13    load       单 elect 线程发全部 TMA               (同 wg3)
-  warp 14    epilogue   M3 前空转(预留 TMA-store epilogue)
+  warp 13    load       单 elect 线程发全部 TMA load          (同 wg3)
+  warp 14    epilogue   TMA store sO(r5 lever B 落地)       (同 wg3)
   warp 15    empty
 
 TMEM(恒 alloc 512 列;lane = tile 内行号,两 tile 复用全部 128 lane):
@@ -30,8 +31,9 @@ TMEM(恒 alloc 512 列;lane = tile 内行号,两 tile 复用全部 128 lane):
   O0[256,256+HD) f32      O1[256+HD,256+2HD)    (d64 时 [384,512) 空置)
 
 smem(dynamic):sQ ×2 tile + K/V 共用 4-slot ring(item n -> slot n%4,
-  K_i=item 2i / V_i=item 2i+1),d128 共 96KB / d64 48KB;static:mbarrier
-  数组 bars[23] + tmem 槽 + sV_scale。
+  K_i=item 2i / V_i=item 2i+1)+ sO ×2 staging tile(r5,每 tile
+  head_dim/64 个 128 行 ×64 列 box,TMA 128B swizzle 布局),d128 共
+  160KB / d64 80KB;static:mbarrier 数组 bars[25] + tmem 槽 + sV_scale。
 
 数据流(每 KV 块 i,双 tile 交错;mma warp 的发射序):
   QK0(i) -> [PV1(i-1)] -> QK1(i) -> PV0(i)
@@ -58,9 +60,9 @@ q_scale 块索引 clamp 防越界读),与 cutedsl 同策略。
 | softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | 逐元素值序照抄现 kernel(:412-474);round 3 起 dequant mul 与 exp2 输入 fma 走 f32x2 packed 指令,per-lane IEEE 语义与标量逐位一致(§6.3),不是 cutedsl 那种改值域的 packed 化 | bit-exact 硬闸保持;cutedsl 式常量域改写仍留给 M3 后(需重开 golden 口径) |
 | softmax 寄存器策略 | 整行 128 f32 驻留 | 照抄:单遍读、整行驻留(见 §3;初版两遍读实测 0.887× 已回退,见 §6.1) | 行驻留 128 reg + 状态 ~30,ptxas 收在 170-173/192、零 spill(§6.3);每 KV 块每线程 2 次 64 列 tmem_ld(round 2 是 4 次 x32,两遍版 7 次) |
 | vec 提前信号(max 后、exp2 前发) | L1104-1109 | 照抄(全部 S 读已完成,别名列 [0,2) 已死) | correction 的 O rescale 藏进 softmax 的 exp2 段,是重叠收益主源 |
-| k_scale smem 预载(sKScale) | L544-552(per-block gran) | 不搬,保持现 kernel 逐块 global 读 | 我们默认 per-thread gran(每 tile 4 标量);M2 若 long_scoreboard 热点再加 |
+| k_scale smem 预载(sKScale) | L544-552(per-block gran) | 不搬;r5 lever A 改为寄存器预取(下块 k_scale 在本块 ld shadow 里 LDG,§6.6),smem 预载仍开放(§7 G2) | 我们默认 per-thread gran(每 tile 4 标量);cutedsl 注释记载 gmem 广播读曾被 ncu 判为 long_scoreboard 主因之一 |
 | q_scale 粒度 | BLKQ=64/WARPQ=16 契约 | 现 kernel 的 BLKQ=128 契约,块索引改 2bx+tile + clamp | 量化侧零改动 |
-| epilogue | sO smem + TMA store(epilogue warp) | M0-M2:correction 直接寄存器->global(现 kernel :567-599 序) | bit-exact;M3 换 TMA store(corr_epi pipe 设计已入账本 §8) |
+| epilogue | sO smem + TMA store(epilogue warp) | **r5 起对齐**:correction 写 sO(128B swizzle)+ fence.proxy.async + epi_full,warp 14 TMA store(账本 §8 as-built;数值经 TMA 逐字节搬运,bit-exact 保持) | M0-M2 曾直接寄存器->global(:567-599 序);r5 lever B 换搬运路径 |
 | LSE | 无 | 从现 kernel 搬(softmax 侧存,:601-608 序) | 功能奇偶性 |
 | PV_FROMSMEM SS twin | 无 | 不搬(TS only) | oracle 用旧 kernel(开关不设时)承担 |
 | USE_SEQ_GATE(S0/S1 MUFU 错拍闸) | 默认关(L119) | 不实现 | 蓝本自己默认关;翻开条件见蓝本注释 |
@@ -158,7 +160,7 @@ no_eligible 54%、SM throughput 44.8%。cutedsl 同结构上限:XU 62-67% SOL。
 | M0 点火(上机第一步) | p0a/p0b/p0c 三 probe PASS;ws kernel d128 non-causal s=512 单点不挂、输出有限 | probe 全 PASS;kernel 无 hang/trap |
 | M1 正确性 | `SAGEATTN_SM100_WS=1` 过 golden 双 gate:d64/d128 × causal × lse × per-warp/per-thread × GQA × 奇数长度(qo_len 非 256 倍数、kv 非 128 倍数、kv≤128 退化) | 与现 kernel 输出逐位一致(bit-exact 契约) |
 | M2 性能采样 | bench 扫 s∈{512..16K};ncu 采关键 kernel | eligible ≥1.2、no_eligible <40%、SM throughput 55-65%;几何均值相对 128 线程基线的加速落在 1.5×+(cutedsl 包络 2.31×) |
-| M3 epilogue TMA store + 收尾 | corr_epi pipe + warp14 + sO 双缓冲(账本 §8);视 M2 profile 决定 k_scale smem 预载 | 重过 M1 gate(此步起允许放宽 bit-exact 为容差 gate,由主控拍板) |
+| M3 epilogue TMA store + 收尾 | **r5 已实现**(§6.6 lever B:epi_full + warp14,单次使用无需双缓冲,账本 §8 as-built);k_scale 走了寄存器预取(lever A),smem 预载留 §7 G2 | 重过 M1 gate;实现为纯搬运路径替换,bit-exact 口径**不必放宽**(放宽留给 §7 G1) |
 
 ### 6.1 M2 首轮实测:两遍读判负,已改单遍驻留
 
@@ -361,6 +363,104 @@ d64 s32768:
 小负点;本轮只记录,源码阈值不动。
 
 ## 7. 风险与回退
+### 6.5 r4 上机小结(wave8,口径同 §6.2)
+
+- r4 两个 commit(WS 三态 + chunk 交错)上机后,主口径:**ws/cudnn 0.732**
+  (bench 几何均值);cutedsl 同结构先验 1.07-1.18(XU 62-67% SOL,
+  我们 ~50%)。剩余差距的结构对账在 §7。
+- ptxas 复沉已在 §6.4 记录:PTX 钉住的背靠背 ld 在 sm_100a 8 站点里 6 个
+  被沉回消费点后;r5 本地复核(5af2e06 基线重编)结论不变,逐站数据见
+  §6.6。
+
+### 6.6 round 5(wave9):ld shadow 预取 + epilogue TMA store(已实现,待上机)
+
+两个独立 commit,均过 §5 门禁(nvcc 13.3,4 实例 × sm_100a/sm_110a,全部
+0 spill / 0 stack / 入口 128 reg);区内峰值(SASS 寄存器号上界,r5 后):
+softmax 164-170(预算 192)、correction 71-77(88)、mma/load/epi 38(40)。
+
+1. **lever A:下块 k_scale 预取进 ld shadow**(commit 5e89994)。
+   - 动机:基线 SASS 里 k_scale LDG 落在 vec_empty wait 与 s_full wait 之
+     间(距 s_full wait 仅 1-3 条指令,首个消费 dequant FMUL 紧随其后);
+     softmax 是落后方时 s_full 直落,per-warp 顺序发射让首条 LDTM 卡在等
+     LDG 的 FMUL 后面——每 KV 块一次 LDG->LDTM 串行 round trip。改法:把块 iter+1 的 k_scale 原始字
+     在块 iter 的两条 tcgen05.ld 之后、wait::ld 之前 LDG 进寄存器;
+     q_scale 乘法留在消费步顶部(同输入同序 → 逐位一致;PTX 对账:全部
+     fp opcode 计数不变,ld.global.nc 28 = 28)。
+   - SASS 实测(sm_100a):ptxas 不保留 PTX 钉的 gap 位置,把预取 LDG 沉
+     到 exp2/pack 段中部——仍比基线早 ~220 条指令(hd128-pw:LDG@683,
+     s_full wait@907;基线 LDG@907 wait@910),LDG 延迟改为骑在 MUFU 段
+     + P store + 两个 barrier wait 上。「填充落在 ld 与 LDTM 消费之间」的
+     原目标**未达成**:LDTM 站点结构不变(6/8 沉没同 r4),故 lever A 的
+     收益机制是消除步首 LDG 暴露,不是 ld 交错。
+   - 预期信号:softmax 视角 `long_scoreboard`(步首段)回落;causal/短序列
+     (trip 小、LDG 占比高)改善大于长序列;`ws/old` 全形状不劣化。
+2. **lever B:epilogue 改 sO staging + warp14 TMA store**(commit 10b8cef,
+   M3 项落地)。
+   - 结构:correction 末段数学不变(:572-599 值序),目的地从直接
+     global 改为 sO(TMA 128B swizzle 布局,16B 单元 u 在行 r 的地址
+     r*128 + (u^(r%8))*16,STS.128 无 bank 冲突)→ 每线程
+     fence.proxy.async → arrive epi_full[t];warp 14 等 phase 0,每 64 列
+     box 一发 cp.async.bulk.tensor.4d S2G + commit_group,尾部
+     wait_group.read 0(smem 生命期,账本 H13)。行界保护从逐行
+     `q_idx < qo_len` 断言换成 tensor map dim1=qo_len 的 TMA store 裁剪,
+     可观察行为相同。数值:同乘同转换,TMA 逐字节搬运 → bit-exact 保持,
+     M1 golden 双 gate 口径不放宽。
+   - 指令账(SASS,per 实例):hd128 的 128 条/线程 STG.32(线程按行分布,
+     每条 warp 级 32 个 4B 散点 = 32 sector,写放大 8×)→ 32 条 STS.128 +
+     4 发 UTMASTG.4D/CTA;hd64 64 STG → 16 STS + 2 发。总静态指令
+     hd128-pt 4952→4840、hd128-pw 4312→4192。v_scale 读顺带并宽:
+     LDS 126→70 条(主体 LDS.64×112 → LDS.128×64)。
+   - smem 96→160KB(d128)/ 48→80KB(d64),<227KB;新 barrier
+     epi_full ×2(单相),账本 §1/§3/§5(H11-H13)/§8 已更新为 as-built。
+   - 预期信号:L2 写 sector 数(`lts__t_sectors_op_write`)显著回落;
+     correction 尾段 LSU 压力消失;CTA 收尾延迟(最后一发 PV 到 kernel 结
+     束)缩短——短序列(epilogue 占比大)改善大于长序列;`launch__*` 无变
+     化(occupancy 不受 smem 影响:本 kernel 恒 1 CTA/SM)。
+   - 风险:swizzle XOR 若与 tensor map 期望不符,输出按 16B 单元错排,
+     M1 gate 立刻可见(整改点只有 epilog 的地址式);TMA store 对
+     stride_seq_o*2 的 16B 对齐要求已由 head_dim∈{64,128} 保证。
+
+上机判据(两 lever 叠加):
+- M1:golden 双 gate 逐位一致(bit-exact 口径不变;lever B 的 swizzle 与
+  OOB 裁剪由 gate 终审,专置奇数长度用例覆盖尾 CTA);
+- M2:bench 22 点 ws/old 相对 r4 几何均值 >1,且无形状 <0.98;短序列与
+  causal 点位单独看(两 lever 的预期主受益面);
+- ncu(b4h32s16384 + 一个短序列点):`long_scoreboard` 步首分量回落
+  (lever A)、`lts__t_sectors_op_write` 回落(lever B)、duration 下降;
+- 压测口径不变(outstanding tcgen05.ld 仍为 2,未触 A5 边界)。
+
+## 7. 与 cutedsl 的执行结构对账(wave9,r4 之后的剩余差距)
+
+口径:我方 = r5 双 lever 后的 ws kernel,数据来自 cuobjdump(nvcc 13.3,
+sm_100a,4 实例);cutedsl 侧无法本地编译(JIT 需 B200 环境),计数从
+core_sm100.py 源结构推导,记为「推导」;其 profile 数据(XU 62-67% SOL、
+2.31×)沿用历史实测。逐项过完 §2 对照表后,执行结构的差异只剩下表;
+「cutedsl 有而我们没有」按预期收益排序:
+
+| # | 项 | cutedsl(推导) | 我们(cuobjdump 实测) | 预期收益/代价 |
+|---|---|---|---|---|
+| G1 | softmax 值域改写:raw 域 tree-max + P448 常量域 exp2 + 0.5 种子 4 路 packed 求和(L1094-1183) | 每块每线程:127 FMNMX 树(深 ~7)+ 1 FMUL(max 回 deq 域)+ 64 FFMA2(raw 直接进 exp2 arg)+ 128 MUFU + 64 FADD2 分 4 条独立链(深 16)+3 收束;**不物化 dequant 行**(I2F 128 两边都有,平项) | 每块每线程:64 FMUL2(整行 dequant)+ 64 FMNMX3 **串行链深 64** + 64 FFMA2 + 128 MUFU + **128 FADD 串行链深 128**(d_sum) | **最大项**。串行 ALU 关键路径 ~(64+128)×4 ≈ 770 cyc/块 vs cutedsl ~(7+16+3)×4 ≈ 100 cyc/块;另省 64 FMUL2 发射。代价:破 bit-exact(deq 域→raw 域、加法重结合),需主控重开 golden 口径(容差 gate);M3 后条款早已预留(§2 softmax 行) |
+| G2 | sKScale smem 预载(L107, L544-552;其注释记载 gmem 广播读是 ncu long_scoreboard 主因之一) | kernel 头一次性搬 ≤1024 块标量进 smem(4KB),softmax 每块 1 次 LDS | 每块每线程 1-4 次 LDG 广播(lever A 已把发射点前移 ~220 指令,暴露延迟基本盖住;L2 sector 浪费仍在:per-thread 粒度每 warp 每块 16B/32B sector) | lever A 后剩余收益 = 残余延迟窗口 + L2 流量;实现小(4KB static smem + 预载循环)。若上机 ncu 显示步首 long_scoreboard 已平,则收益趋零,不立项 |
+| G3 | 4×x32 tcgen05.ld 批量发射(4 outstanding;cute.copy 单发整行) | 每块 1 个 LDTM 等待窗口(4 条并飞) | 2×x64,r4/r5 SASS:6/8 站点 ld1 沉回消费点后 → 2 个串行窗口;in-flight 只在 pt-peeled 站点 | 每块省 ~1 个 LDTM round trip。被 A5 规则挡住(4+ outstanding 挂死根因未定位)+ ptxas 复沉不受源级控制(r4/r5 两轮实证);翻案条件:A5 根因定位,或 ptxas 调度修正 |
+| G4 | TMA descriptor prefetch(L432-436,prefetch_descriptor ×4) | load warp 起手预取 Q/K/V/O 四张 descriptor | 无;首次 UTMALDG/UTMASTG 冷取 descriptor | 每 CTA 一次性 ~百 ns 级;短序列 wave 多时略有感。实现一行/张,零风险,凑车顺手做 |
+| G5 | correction rescale 用 mul_packed_f32x2(L1237-1239) | 每 O tile 每块 64 FMUL2(d128) | 128 条标量 FMUL | 发射数减半,但 correction 藏在 softmax exp2 段后面不是关键路径(§2 vec 提前信号);per-lane IEEE 恒等,bit-exact 安全,属低风险小项 |
+| ~~G6~~ | ~~epilogue sO+TMA store 流水~~ | epi_stage=2 + corr_epi pipe | **r5 lever B 已对齐**(单次使用省掉 empty barrier) | 已关闭 |
+
+不构成差距的项(对账过程中排除):correction 与 softmax 的重叠深度
+(vec 在 max 后、exp2 前发,rescale 藏进 exp2 段;vec/corr 管线级数与信
+号位置逐行同构,§2)、mma warp 发射节奏(QK0|PV1|QK1|PV0 程序序照抄,
+且我们省 2 发尾部 dummy commit,§2)、每 tile barrier 次数(9 管线 1:1
+等价,账本 §1-§3)、q_scale 供给(均为每 tile 一读)、USE_SEQ_GATE(蓝
+本默认关)、软件 exp2(蓝本自己判负,EX2_EMU_PER4=0)、mma_corr 共享
+2-stage vs 专用 1-stage ×2(边界等价,账本 §1 偏差条)。
+
+结论:剩余 ~27 点(ws/cudnn 0.732 → cutedsl 包络对应 ~0.95+)的结构性
+来源集中在 G1(softmax 串行链与多余 dequant 发射)。G1 是「128 线程
+kernel 值序逐行拷贝」这一 bit-exact 硬闸的直接代价,继续压 XU/隐延迟的
+增量 lever(r3-r5)都绕不开它;建议下一会话主控先拍板 golden 口径切换
+(容差 gate),再立项 G1,顺路捎带 G4/G5。
+
+## 8. 风险与回退
 
 | 风险 | 迹象 | 预案 |
 |---|---|---|
@@ -369,7 +469,7 @@ d64 s32768:
 | TMA OOB 零填充假设(int8 fill=0) | 尾块 CTA 输出错 | M1 专置奇数长度用例;若假设破产,改 launcher 侧 pad 或 tile1 掩蔽加载 |
 | in-order UMMA 假设(H2) | P 被下一发 QK 踩,数值错但不挂 | 与 CUTLASS FMHA 同假设,风险极低;若疑,临时在 QK 前多等一拍 corr_full(牺牲重叠的诊断开关) |
 | 尾 CTA 白算拖平均 | 短序列加速比差 | 已知代价(cutedsl 同);不单独修,归入 M2 评估 |
-| 88 reg correction 将来加逻辑顶破 | 新增代码后 spill 复现 | 余量 10;M3 改 epilogue 时重跑 §5 门禁 |
+| 88 reg correction 将来加逻辑顶破 | 新增代码后 spill 复现 | r5 lever B(sO staging)后区内峰值 71-77,余量 11+,§5 门禁已重跑 |
 | 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | round 3 f32x2 后余量 19+(§6.3);softmax 区任何改动都要重跑 §5 门禁,顶破时先看 exp2/pack 融合段可否再压,再考虑 correction 让 reg |
 
 挂死 triage(继承 quant-occupancy/sqsh 战场经验 + 本设计专项):
