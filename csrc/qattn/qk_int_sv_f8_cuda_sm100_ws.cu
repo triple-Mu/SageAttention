@@ -939,9 +939,21 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 uint32_t RO_u32[32];
                 tcgen05::tmem_ld_32x32b_x32(RO_u32, tmem_o_row + c * 32);
                 tcgen05::tmem_ld_wait();
+                // G5 (cutedsl L1237-1239 same): adjacent columns share the
+                // splat o_scale, so the rescale packs as mul.rn.ftz.f32x2 -
+                // per lane bit-identical to the scalar mul it replaces (see
+                // the f32x2 helper comment), halving the FMUL issue count.
 #pragma unroll
-                for (uint32_t jj = 0; jj < 32; jj++) {
-                    RO_u32[jj] = __float_as_uint(__uint_as_float(RO_u32[jj]) * o_scale);
+                for (uint32_t jj = 0; jj < 32; jj += 2) {
+                    float lo, hi;
+                    ws::f32x2_mul(lo,
+                                  hi,
+                                  __uint_as_float(RO_u32[jj]),
+                                  __uint_as_float(RO_u32[jj + 1]),
+                                  o_scale,
+                                  o_scale);
+                    RO_u32[jj]     = __float_as_uint(lo);
+                    RO_u32[jj + 1] = __float_as_uint(hi);
                 }
                 tcgen05::tmem_st_32x32b_x32(tmem_o_row + c * 32, RO_u32);
             }
@@ -1037,10 +1049,15 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
         discard_vec(vf0, ve0, vec0_full_phase);
         discard_vec(vf1, ve1, vec1_full_phase);
+        // unroll 1: with the packed rescale body (G5) the frontend otherwise
+        // unrolls these runtime-trip loops ~4x (+45% static instructions for
+        // zero dynamic issues saved - the trip count is data-dependent)
+#pragma unroll 1
         for (uint32_t j = 1; j < trip0; j++) {
             rescale(vf0, ve0, vec0_full_phase, vec0_addr, cf0, ce0, corr0_full_phase, tmem_o0_row);
             rescale(vf1, ve1, vec1_full_phase, vec1_addr, cf1, ce1, corr1_full_phase, tmem_o1_row);
         }
+#pragma unroll 1
         for (uint32_t j = trip0; j < trip1; j++) {  // causal S1-only rounds
             rescale(vf1, ve1, vec1_full_phase, vec1_addr, cf1, ce1, corr1_full_phase, tmem_o1_row);
         }
