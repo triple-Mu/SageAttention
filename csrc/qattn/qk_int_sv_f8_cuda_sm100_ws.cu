@@ -1168,7 +1168,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 // ---------------------------------------------------------------------------
 // Host launcher: clone of qk_int_sv_f8_cuda_sm100.cu's fuse_v_scale launcher
 // (:767-902) with the ws kernel, 512 threads, grid.x covering 256 rows, and
-// the Q-double + KV-ring smem plan. Selected via SAGEATTN_SM100_WS there.
+// the Q-double + KV-ring smem plan. Selected there per call via the
+// SAGEATTN_SM100_WS switch (on / off / auto d128 long-seq heuristic).
 // ---------------------------------------------------------------------------
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,

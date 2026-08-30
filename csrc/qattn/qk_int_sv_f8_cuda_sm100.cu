@@ -625,10 +625,13 @@ constexpr bool kPVFromSmem = false;  // default: TS (P fed from TMEM)
 #endif
 
 // C1 warp-specialized kernel (qk_int_sv_f8_cuda_sm100_ws.cu), fuse_v_scale
-// variant only. Ships dark until hardware-validated: opt in per process with
-// SAGEATTN_SM100_WS (read once, same contract as SAGEATTN_SM100_TCGEN05 in
-// plan.cpp). Note the switch bypasses the PV_FROM_SMEM twin: the ws kernel is
-// TS-only, so run the SS oracle with the switch unset.
+// variant only. Selected per call by SAGEATTN_SM100_WS (env read once, same
+// contract as SAGEATTN_SM100_TCGEN05 in plan.cpp; only the mode is cached):
+//   unset / "auto"      heuristic below (default)
+//   "1" / "on"  (truthy) force the ws kernel
+//   "0" / "off" (other)  force the classic kernel
+// Note "on" bypasses the PV_FROM_SMEM twin: the ws kernel is TS-only, so run
+// the SS oracle with the switch off.
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
                                                            torch::Tensor key,
                                                            torch::Tensor value,
@@ -644,15 +647,44 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
 
 namespace {
 
-bool sm100_ws_enabled()
+enum class Sm100WsMode {
+    kAuto,
+    kOn,
+    kOff
+};
+
+Sm100WsMode sm100_ws_mode()
 {
-    static const bool enabled = [] {
+    static const Sm100WsMode mode = [] {
         const char* v = std::getenv("SAGEATTN_SM100_WS");
-        return v != nullptr
-               && (std::strcmp(v, "1") == 0 || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0
-                   || std::strcmp(v, "YES") == 0 || std::strcmp(v, "yes") == 0);
+        if (v == nullptr || std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+            return Sm100WsMode::kAuto;
+        }
+        if (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "ON") == 0
+            || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "YES") == 0
+            || std::strcmp(v, "yes") == 0) {
+            return Sm100WsMode::kOn;
+        }
+        return Sm100WsMode::kOff;  // "0"/"off"/anything else (keeps the old opt-in strictness)
     }();
-    return enabled;
+    return mode;
+}
+
+// Heuristic for kAuto, judged per call (qo_len is a runtime value). The ws
+// kernel wins only on head_dim 128 with long rows: r3 B200 sweep has it
+// 1.006-1.027x faster on 10/10 shapes at qo_len >= 16384, but slower at
+// s <= 4096 (grid.x = qo_len/256, half the classic kernel's, so small grids
+// underfill the 148-SM wave) and 8-9% slower on d64 (only 384 of the 512
+// TMEM columns used). 16384 is the measured all-positive lower bound (no
+// sample between 4096 and 16384; conservative).
+bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout)
+{
+    if (query.dim() != 4) {
+        return false;  // malformed input: let the classic parse report it
+    }
+    const int64_t head_dim = query.size(3);
+    const int64_t qo_len   = (tensor_layout == 0) ? query.size(1) : query.size(2);
+    return head_dim == 128 && qo_len >= 16384;
 }
 
 }  // namespace
@@ -670,7 +702,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                         float         sm_scale,
                                                         int           return_lse)
 {
-    if (sm100_ws_enabled()) {
+    const Sm100WsMode ws_mode = sm100_ws_mode();
+    if (ws_mode == Sm100WsMode::kOn || (ws_mode == Sm100WsMode::kAuto && sm100_ws_auto_pick(query, tensor_layout))) {
         return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(query,
                                                             key,
                                                             value,
