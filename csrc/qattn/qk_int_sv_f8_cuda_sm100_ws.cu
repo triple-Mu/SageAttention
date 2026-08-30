@@ -44,11 +44,12 @@
 // correction / epilogue is copied verbatim from qk_int_sv_f8_cuda_sm100.cu
 // (line references at each block). Copies are annotated instead of extracted
 // into a shared header so the existing kernel's TU keeps byte-identical
-// device text (SASS gate). The one structural change - softmax reads S in
-// two passes (max pass, then exp2 pass re-reading TMEM) with chunk 0 kept
-// in registers - recomputes identical values from identical inputs and
-// keeps the m/denom update order, so results stay bit-identical; the
-// rationale is in bench/sm100_review/C1_DESIGN.md.
+// device text (SASS gate). Softmax reads each S row once and keeps the
+// whole dequanted row in registers (the 128-thread kernel's own structure,
+// :407-449); an earlier two-pass variant (re-reading TMEM for the exp2
+// pass) doubled the tcgen05.ld traffic and lost 11% end to end - the
+// regression analysis and the register account are in
+// bench/sm100_review/C1_DESIGN.md.
 //
 // Pipeline/barrier design and the deadlock-freedom + TMEM alias-hazard
 // proofs live in bench/sm100_review/barrier_ledger.md (16-warp section).
@@ -493,20 +494,18 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         int vec_empty_phase = 0;
 
         // -------------------------------------------------------------------
-        // Per-KV-block softmax step. Two passes over the S row:
-        //   pass 1  max: chunk 0 (cols [0,32)) is loaded once and KEPT in
-        //           registers; chunks 1..3 are loaded transiently. Kept
-        //           because the vec store below aliases S cols [0,2), so
-        //           pass 2 must not re-read chunk 0 from TMEM.
-        //   pass 2  exp2 + e4m3 pack + d_sum: chunk 0 from registers,
-        //           chunks 1..3 re-read from TMEM (raw S is still there: P
-        //           lands at cols [32,64) only after all re-reads).
-        // Value identity with the single-pass 128-thread kernel: the dequant
-        // s_j is recomputed from the same TMEM s32 word with the same ops,
-        // and the max / p / d_sum sequences keep the same order (see file
-        // header). is_last folds the causal/OOB mask exactly like :431-444.
+        // Per-KV-block softmax step. One pass over the S row: each 32-col
+        // chunk is one tcgen05.ld + wait (the 128-thread kernel's cadence,
+        // NOT the batch-issue/collective-wait pattern that hung in the A5
+        // experiment), dequanted+masked into RS_f32 and folded into m_local;
+        // the whole row then stays in registers, so nothing touches TMEM
+        // between the vec store (aliases S cols [0,2)) and the P store.
+        // This is the load/max loop of the 128-thread kernel verbatim
+        // (:407-449); the exp2 / d_sum / pack sequences below keep its order
+        // too (see file header). is_last folds the causal/OOB mask exactly
+        // like :431-444.
         // -------------------------------------------------------------------
-        auto softmax_step = [&](auto is_last_t, uint32_t iter, uint32_t(&RS0_u32)[32]) {
+        auto softmax_step = [&](auto is_last_t, uint32_t iter) {
             constexpr bool is_last = decltype(is_last_t)::value;
 
             // K-scale(s) for this tile (mirrors :400-410)
@@ -550,22 +549,20 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             ws::wait_bar(bar_full, s_full_phase);
             s_full_phase ^= 1;
 
-            // ---- pass 1: row max (m_local update order matches :414-449) ----
+            // ---- load + dequant + mask + row max, whole row retained
+            //      (:407-449; m_local update order unchanged) ----
+            float RS_f32[CTA_K];
             float m_local = -5000000.0f;
-            tcgen05::tmem_ld_32x32b_x32(RS0_u32, tmem_row + 0);
-            tcgen05::tmem_ld_wait();
 #pragma unroll
-            for (uint32_t jj = 0; jj < 32; jj++) {
-                m_local = max(m_local, s_of(RS0_u32[jj], jj));
-            }
-#pragma unroll
-            for (uint32_t c = 1; c < num_tiles_s; c++) {
+            for (uint32_t c = 0; c < num_tiles_s; c++) {
                 uint32_t RS_u32[32];
                 tcgen05::tmem_ld_32x32b_x32(RS_u32, tmem_row + c * 32);
                 tcgen05::tmem_ld_wait();
 #pragma unroll
                 for (uint32_t jj = 0; jj < 32; jj++) {
-                    m_local = max(m_local, s_of(RS_u32[jj], c * 32 + jj));
+                    const float s       = s_of(RS_u32[jj], c * 32 + jj);
+                    m_local             = max(m_local, s);
+                    RS_f32[c * 32 + jj] = s;
                 }
             }
 
@@ -576,8 +573,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             denom *= o_scale;
 
             // ---- vec = (m_prev, row_max) -> correction, sent before the exp2
-            //      pass so the O rescale overlaps it. Slot held from the
-            //      previous step's tail acquire (virgin on step 0). ----
+            //      segment so the O rescale overlaps it. Slot held from the
+            //      previous step's tail acquire (virgin on step 0). All S
+            //      reads are done, so aliasing cols [0,2) is harmless. ----
             uint32_t vec_u32[2];
             vec_u32[0] = __float_as_uint(m_prev);
             vec_u32[1] = __float_as_uint(row_max);
@@ -586,38 +584,28 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_vfull);
 
-            // ---- pass 2: p = exp2(fma(s, scale, -row_max)), d_sum, e4m3 pack
-            //      (p / d_sum / pack value sequences match :459-474). The
-            //      chunk body takes the source as a reference-to-array so
-            //      both call sites keep their arrays in registers (a
-            //      runtime-selected pointer would spill them to local). ----
+            // ---- p = exp2(fma(s, scale, -row_max)), d_sum, e4m3 pack from
+            //      the retained row (p / d_sum / pack value sequences match
+            //      :459-474; the pack is fused per 4 columns so each RS_f32
+            //      quad dies as its RP word is born - liveness only falls
+            //      from here). ----
             const float neg_row_max = -row_max;
             float       d_sum       = 0.0f;
             uint32_t    RP_u32[CTA_K / 4];
-            auto        exp2_pack_chunk = [&](const uint32_t(&rs)[32], uint32_t c) {
 #pragma unroll
-                for (uint32_t w = 0; w < 8; w++) {
-                    float p[4];
+            for (uint32_t w = 0; w < CTA_K / 4; w++) {
+                float p[4];
 #pragma unroll
-                    for (uint32_t b = 0; b < 4; b++) {
-                        const uint32_t j = c * 32 + 4 * w + b;
-                        p[b]             = math::ptx_exp2(fmaf(s_of(rs[4 * w + b], j), local_sm_scale, neg_row_max));
-                        d_sum += p[b];
-                    }
-                    floatx4_to_e4m3x4(&RP_u32[c * 8 + w], &p[0], &p[2]);
+                for (uint32_t b = 0; b < 4; b++) {
+                    p[b] = math::ptx_exp2(fmaf(RS_f32[4 * w + b], local_sm_scale, neg_row_max));
+                    d_sum += p[b];
                 }
-            };
-            exp2_pack_chunk(RS0_u32, 0);  // cols [0,32) from the retained registers
-#pragma unroll
-            for (uint32_t c = 1; c < num_tiles_s; c++) {
-                uint32_t RS_u32[32];
-                tcgen05::tmem_ld_32x32b_x32(RS_u32, tmem_row + c * 32);
-                tcgen05::tmem_ld_wait();
-                exp2_pack_chunk(RS_u32, c);
+                floatx4_to_e4m3x4(&RP_u32[w], &p[0], &p[2]);
             }
             denom += d_sum;
 
-            // ---- P -> TMEM (TS A-operand layout, mirrors :493-499), then
+            // ---- P -> TMEM (TS A-operand layout, mirrors :493-499; cols
+            //      [32,64) alias S but the row is already in registers), then
             //      release the S tile: this single arrival tells the mma warp
             //      both "S drained" (next QK may overwrite) and "P ready"
             //      (PV may read). ----
@@ -631,11 +619,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             vec_empty_phase ^= 1;
         };
 
-        uint32_t RS0_u32[32];
         for (uint32_t iter = 0; iter + 1 < trip; iter++) {
-            softmax_step(std::false_type{}, iter, RS0_u32);
+            softmax_step(std::false_type{}, iter);
         }
-        softmax_step(std::true_type{}, trip - 1, RS0_u32);  // peeled: fused causal/OOB mask
+        softmax_step(std::true_type{}, trip - 1);  // peeled: fused causal/OOB mask
 
         // ---- final vec = (denom, row_max): correction derives the epilogue
         //      d_rcp from denom (bit-identical: f32 round-trips TMEM exactly).
