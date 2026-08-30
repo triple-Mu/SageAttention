@@ -1,0 +1,1283 @@
+{
+ "meta": {
+  "tag": "fuseall",
+  "gpu": "NVIDIA L20",
+  "cc": [
+   8,
+   9
+  ],
+  "l2_bytes": 100663296,
+  "sm_count": 92,
+  "torch": "2.13.0a0+9186a08b2c.nv26.07",
+  "compiled_archs": [
+   80,
+   89
+  ],
+  "backend": "sm89",
+  "v_layout": "mma_k16",
+  "pad_multiple": 64,
+  "scale_max": 2.25,
+  "heads": 32,
+  "head_dim": 128,
+  "layout": "HND",
+  "argv": [
+   "bench/p4_vfuse_sweep.py",
+   "--tag",
+   "fuseall",
+   "--out",
+   "/workspace/SageAttention_refactor/l20p4/out/p4s_fuseall.json",
+   "--bitcheck"
+  ],
+  "time_utc": "2026-08-30T124823Z"
+ },
+ "rows": [
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 4096,
+   "path": "composite",
+   "iters": 200,
+   "wall_us": 45.097,
+   "wall_us_all": [
+    45.174,
+    45.097,
+    45.087,
+    45.087,
+    45.112
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 44.463
+   },
+   "kernel_us_sum": 44.463,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 4096,
+   "path": "separate",
+   "iters": 200,
+   "wall_us": 51.191,
+   "wall_us_all": [
+    51.203,
+    51.274,
+    51.181,
+    51.183,
+    51.191
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 36.9,
+    "MeanScaleKernel": 15.414
+   },
+   "kernel_us_sum": 52.314,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 6144,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 64.036,
+   "wall_us_all": [
+    64.121,
+    64.033,
+    64.058,
+    64.035,
+    64.036
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 63.304
+   },
+   "kernel_us_sum": 63.304,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 6144,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 153.071,
+   "wall_us_all": [
+    152.931,
+    153.112,
+    153.041,
+    153.071,
+    153.128
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 123.369,
+    "MeanScaleKernel": 28.681
+   },
+   "kernel_us_sum": 152.05,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 8192,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 86.038,
+   "wall_us_all": [
+    87.087,
+    86.038,
+    85.816,
+    85.795,
+    86.332
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 84.973
+   },
+   "kernel_us_sum": 84.973,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 8192,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 272.82,
+   "wall_us_all": [
+    272.572,
+    272.82,
+    272.715,
+    273.068,
+    272.837
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 185.643,
+    "MeanScaleKernel": 85.976
+   },
+   "kernel_us_sum": 271.619,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 12288,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 377.029,
+   "wall_us_all": [
+    376.618,
+    380.264,
+    376.367,
+    379.947,
+    377.029
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 380.598
+   },
+   "kernel_us_sum": 380.598,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 12288,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 475.402,
+   "wall_us_all": [
+    475.402,
+    475.786,
+    475.347,
+    475.318,
+    475.47
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 283.885,
+    "MeanScaleKernel": 189.043
+   },
+   "kernel_us_sum": 472.928,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 16384,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 696.28,
+   "wall_us_all": [
+    696.28,
+    698.106,
+    695.052,
+    697.153,
+    696.011
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 695.412
+   },
+   "kernel_us_sum": 695.412,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 16384,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 667.391,
+   "wall_us_all": [
+    667.055,
+    667.391,
+    667.055,
+    667.391,
+    667.512
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 383.176,
+    "MeanScaleKernel": 281.746
+   },
+   "kernel_us_sum": 664.922,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 24576,
+   "path": "composite",
+   "iters": 30,
+   "wall_us": 1313.99,
+   "wall_us_all": [
+    1311.809,
+    1315.617,
+    1309.292,
+    1313.99,
+    1314.701
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 1319.084
+   },
+   "kernel_us_sum": 1319.084,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 32,
+   "b": 1,
+   "kv": 24576,
+   "path": "separate",
+   "iters": 30,
+   "wall_us": 1035.724,
+   "wall_us_all": [
+    1035.044,
+    1035.724,
+    1035.605,
+    1035.797,
+    1035.97
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 568.422,
+    "MeanScaleKernel": 465.339
+   },
+   "kernel_us_sum": 1033.76,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 4096,
+   "path": "composite",
+   "iters": 200,
+   "wall_us": 83.864,
+   "wall_us_all": [
+    83.952,
+    83.864,
+    83.755,
+    83.81,
+    84.542
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 84.287
+   },
+   "kernel_us_sum": 84.287,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 4096,
+   "path": "separate",
+   "iters": 200,
+   "wall_us": 270.227,
+   "wall_us_all": [
+    270.227,
+    270.295,
+    270.125,
+    270.167,
+    270.24
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 186.398,
+    "MeanScaleKernel": 83.002
+   },
+   "kernel_us_sum": 269.4,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 6144,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 339.946,
+   "wall_us_all": [
+    340.915,
+    339.074,
+    340.303,
+    339.247,
+    339.946
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 340.085
+   },
+   "kernel_us_sum": 340.085,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 6144,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 482.878,
+   "wall_us_all": [
+    484.348,
+    482.978,
+    482.804,
+    482.875,
+    482.878
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 283.013,
+    "MeanScaleKernel": 198.326
+   },
+   "kernel_us_sum": 481.339,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 8192,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 483.884,
+   "wall_us_all": [
+    483.884,
+    484.624,
+    483.647,
+    483.917,
+    483.224
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 485.591
+   },
+   "kernel_us_sum": 485.591,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 8192,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 659.317,
+   "wall_us_all": [
+    660.085,
+    659.22,
+    659.44,
+    659.317,
+    658.902
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 378.569,
+    "MeanScaleKernel": 278.851
+   },
+   "kernel_us_sum": 657.421,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 12288,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 871.9,
+   "wall_us_all": [
+    872.474,
+    871.9,
+    870.932,
+    873.318,
+    871.654
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 873.312
+   },
+   "kernel_us_sum": 873.312,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 12288,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 1025.681,
+   "wall_us_all": [
+    1034.14,
+    1026.237,
+    1025.625,
+    1025.676,
+    1025.681
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 569.389,
+    "MeanScaleKernel": 454.223
+   },
+   "kernel_us_sum": 1023.613,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 16384,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 1380.85,
+   "wall_us_all": [
+    1380.85,
+    1381.584,
+    1380.552,
+    1379.379,
+    1382.387
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 1382.147
+   },
+   "kernel_us_sum": 1382.147,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 16384,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 1394.752,
+   "wall_us_all": [
+    1394.791,
+    1393.188,
+    1395.986,
+    1394.752,
+    1394.699
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 766.04,
+    "MeanScaleKernel": 625.413
+   },
+   "kernel_us_sum": 1391.454,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 24576,
+   "path": "composite",
+   "iters": 30,
+   "wall_us": 2677.891,
+   "wall_us_all": [
+    2676.42,
+    2673.811,
+    2678.92,
+    2677.891,
+    2689.917
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 2681.763
+   },
+   "kernel_us_sum": 2681.763,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 64,
+   "b": 2,
+   "kv": 24576,
+   "path": "separate",
+   "iters": 30,
+   "wall_us": 2117.387,
+   "wall_us_all": [
+    2116.595,
+    2118.254,
+    2116.723,
+    2117.858,
+    2117.387
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 1164.393,
+    "MeanScaleKernel": 949.491
+   },
+   "kernel_us_sum": 2113.884,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 4096,
+   "path": "composite",
+   "iters": 200,
+   "wall_us": 408.394,
+   "wall_us_all": [
+    411.299,
+    408.157,
+    408.466,
+    408.065,
+    408.394
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 409.69
+   },
+   "kernel_us_sum": 409.69,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 4096,
+   "path": "separate",
+   "iters": 200,
+   "wall_us": 667.735,
+   "wall_us_all": [
+    667.716,
+    667.664,
+    667.956,
+    667.813,
+    667.735
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 389.027,
+    "MeanScaleKernel": 276.652
+   },
+   "kernel_us_sum": 665.679,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 6144,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 614.927,
+   "wall_us_all": [
+    615.593,
+    614.978,
+    614.927,
+    614.464,
+    614.809
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 616.095
+   },
+   "kernel_us_sum": 616.095,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 6144,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 1035.354,
+   "wall_us_all": [
+    1035.217,
+    1035.354,
+    1035.844,
+    1035.078,
+    1035.36
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 579.297,
+    "MeanScaleKernel": 453.178
+   },
+   "kernel_us_sum": 1032.474,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 8192,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 875.069,
+   "wall_us_all": [
+    874.776,
+    875.069,
+    874.976,
+    875.59,
+    875.787
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 881.371
+   },
+   "kernel_us_sum": 881.371,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 8192,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 1372.199,
+   "wall_us_all": [
+    1373.161,
+    1372.132,
+    1372.012,
+    1372.199,
+    1372.43
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 768.373,
+    "MeanScaleKernel": 600.293
+   },
+   "kernel_us_sum": 1368.665,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 12288,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 1716.746,
+   "wall_us_all": [
+    1716.198,
+    1719.621,
+    1714.874,
+    1719.232,
+    1716.746
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 1716.644
+   },
+   "kernel_us_sum": 1716.644,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 12288,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 2118.094,
+   "wall_us_all": [
+    2116.237,
+    2118.094,
+    2118.443,
+    2118.286,
+    2116.49
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 1165.289,
+    "MeanScaleKernel": 947.189
+   },
+   "kernel_us_sum": 2112.479,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 16384,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 2962.357,
+   "wall_us_all": [
+    2963.9,
+    2968.882,
+    2961.519,
+    2955.958,
+    2962.357
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 2964.069
+   },
+   "kernel_us_sum": 2964.069,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 16384,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 2858.82,
+   "wall_us_all": [
+    2859.63,
+    2858.82,
+    2858.31,
+    2860.623,
+    2857.742
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 1569.518,
+    "MeanScaleKernel": 1283.824
+   },
+   "kernel_us_sum": 2853.342,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 24576,
+   "path": "composite",
+   "iters": 30,
+   "wall_us": 5484.056,
+   "wall_us_all": [
+    5479.68,
+    5479.276,
+    5484.056,
+    5493.854,
+    5492.211
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 5501.908
+   },
+   "kernel_us_sum": 5501.908,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 128,
+   "b": 4,
+   "kv": 24576,
+   "path": "separate",
+   "iters": 30,
+   "wall_us": 4248.571,
+   "wall_us_all": [
+    4251.035,
+    4247.05,
+    4251.092,
+    4248.571,
+    4247.969
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 2348.663,
+    "MeanScaleKernel": 1898.643
+   },
+   "kernel_us_sum": 4247.306,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 4096,
+   "path": "composite",
+   "iters": 200,
+   "wall_us": 787.754,
+   "wall_us_all": [
+    798.648,
+    787.872,
+    787.754,
+    787.657,
+    787.729
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 788.628
+   },
+   "kernel_us_sum": 788.628,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 4096,
+   "path": "separate",
+   "iters": 200,
+   "wall_us": 1365.017,
+   "wall_us_all": [
+    1365.017,
+    1364.185,
+    1365.39,
+    1365.042,
+    1364.71
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 777.492,
+    "MeanScaleKernel": 586.596
+   },
+   "kernel_us_sum": 1364.088,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 6144,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 1197.073,
+   "wall_us_all": [
+    1200.389,
+    1196.666,
+    1196.647,
+    1197.404,
+    1197.073
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 1199.423
+   },
+   "kernel_us_sum": 1199.423,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 6144,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 2070.734,
+   "wall_us_all": [
+    2072.883,
+    2073.222,
+    2070.734,
+    2054.679,
+    2054.075
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 1169.282,
+    "MeanScaleKernel": 885.286
+   },
+   "kernel_us_sum": 2054.568,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 8192,
+   "path": "composite",
+   "iters": 100,
+   "wall_us": 1686.189,
+   "wall_us_all": [
+    1687.582,
+    1686.189,
+    1685.381,
+    1687.473,
+    1684.88
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 1687.4
+   },
+   "kernel_us_sum": 1687.4,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 8192,
+   "path": "separate",
+   "iters": 100,
+   "wall_us": 2824.849,
+   "wall_us_all": [
+    2824.831,
+    2826.132,
+    2824.849,
+    2824.315,
+    2825.533
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 1573.871,
+    "MeanScaleKernel": 1249.585
+   },
+   "kernel_us_sum": 2823.456,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 12288,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 3349.403,
+   "wall_us_all": [
+    3359.413,
+    3347.901,
+    3344.138,
+    3349.403,
+    3351.176
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 3350.718
+   },
+   "kernel_us_sum": 3350.718,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 12288,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 4214.933,
+   "wall_us_all": [
+    4217.433,
+    4216.477,
+    4214.054,
+    4214.113,
+    4214.933
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 2372.043,
+    "MeanScaleKernel": 1835.607
+   },
+   "kernel_us_sum": 4207.65,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 16384,
+   "path": "composite",
+   "iters": 50,
+   "wall_us": 6174.481,
+   "wall_us_all": [
+    6179.203,
+    6179.843,
+    6174.481,
+    6163.909,
+    6165.608
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 6186.575
+   },
+   "kernel_us_sum": 6186.575,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 16384,
+   "path": "separate",
+   "iters": 50,
+   "wall_us": 5626.532,
+   "wall_us_all": [
+    5623.305,
+    5629.05,
+    5626.532,
+    5625.565,
+    5630.197
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 3160.75,
+    "MeanScaleKernel": 2449.156
+   },
+   "kernel_us_sum": 5609.905,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 24576,
+   "path": "composite",
+   "iters": 30,
+   "wall_us": 11324.317,
+   "wall_us_all": [
+    11346.586,
+    11324.317,
+    11267.439,
+    11301.181,
+    11328.802
+   ],
+   "kernel_us": {
+    "TransposeQuantFp8Kernel": 11336.114
+   },
+   "kernel_us_sum": 11336.114,
+   "kernels_seen": [
+    "void TransposeQuantFp8Kernel<16u, 64u, false, true, __half>(__half const*, signed char*, float*, float*, float, unsigned int, long, unsigned int, long, long, long, long, long, long, long, long, int const*, unsigned int)"
+   ],
+   "fused_dispatch": true,
+   "bitcheck": {
+    "fp8_equal": true,
+    "scale_equal": true,
+    "trivial": false
+   }
+  },
+  {
+   "bh": 256,
+   "b": 8,
+   "kv": 24576,
+   "path": "separate",
+   "iters": 30,
+   "wall_us": 8683.391,
+   "wall_us_all": [
+    8683.391,
+    8683.553,
+    8682.558,
+    8683.653,
+    8681.358
+   ],
+   "kernel_us": {
+    "TransposePadPermuteKernel": 4720.008,
+    "MeanScaleKernel": 3965.098
+   },
+   "kernel_us_sum": 8685.107,
+   "kernels_seen": [
+    "void MeanScaleKernel<64u, false, __half>(__half*, signed char*, float*, float*, float, unsigned int, long, long, long, long, long, long, long, long, long, long, int const*, unsigned int)",
+    "void TransposePadPermuteKernel<128u, 64u, true, true, __half>(__half*, __half*, unsigned int, long, unsigned int, long, long, unsigned int, long, int const*, unsigned int)"
+   ]
+  }
+ ]
+}

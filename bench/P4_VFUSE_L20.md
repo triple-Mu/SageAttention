@@ -10,6 +10,9 @@ L2;L20 L2 = 96 MB(`prop.L2_cache_size` 实测),门限是否该抬,本轮回答�
 **结论:L20 上融合路径一直赢到 12288(-20%),16384 才翻负(+3%);
 4096 门限在 sm89 上把 6144-12288 段 1.7-1.25 倍的 V 前处理加速留在了桌上。**
 
+(follow-up 2026-08-30:b·h 敏感性已补,四档拐点一致;门限已按 arch 分化
+落地,sm89 = 12288,见 §5。)
+
 ## 1 口径
 
 - 机器:ComputeLab L20 单卡独占(job 4023344,ipp1-1820),
@@ -75,6 +78,73 @@ cache 内,0.32 的深谷就是这么来的),3072-8192 回落到 ~770-870 GB/s
 | 原始 JSON(两个构建) | [microbench/vfuse_l20/p4_fix.json](microbench/vfuse_l20/p4_fix.json)、[p4_fuseall.json](microbench/vfuse_l20/p4_fuseall.json) |
 | accuracy 数值 | [microbench/vfuse_l20/acc_sweep.csv](microbench/vfuse_l20/acc_sweep.csv)(附录 A) |
 | 远端树与构建日志 | computelab `/home/scratch.sonlin_wwfo/workspace/nvidia/SageAttention_refactor/l20w3/` |
+
+## 5 b·h 敏感性扫描与门限落地(2026-08-30)
+
+§3 留的敏感性缺口本轮补齐,并把门限按 arch 分化落进产品代码。
+
+### 5.1 口径
+
+- 机器:ComputeLab L20 单卡独占(job 4025375,ipp1-1818),同 §1 环境
+  (torch 2.13.0a0+nv26.07,CUDA 13.3);树 = `wave7/p4-vfuse-threshold`
+  分支,CMake `SAGE_CUDA_ARCHS=8.9`。
+- 形状:h32 d128 HND fp16,b ∈ {1,2,4,8} 给出 b·h ∈ {32,64,128,256},
+  kv_padded ∈ {4096,6144,8192,12288,16384,24576};V 参数取 sm89 默认
+  plan(mma_k16 / pad 64 / scale_max 2.25 / smooth_v=False)。
+- 脚本:[p4_vfuse_sweep.py](p4_vfuse_sweep.py)(p4_vfuse.py 的
+  arch 参数化版,V 参数从 `torch.ops.sageattention.plan` 取);方法同
+  §1——分离走低层 op,>门限的融合数字用两个 return 全 sed 成 2^60 的
+  fuseall 单 TU 重编构建;profiler per-kernel device µs 为主口径,
+  CUDA event wall 交叉核对(两口径每格点方向一致,比值差 ≤0.01)。
+- 构建间交叉:分离路两构建全格点、融合路 ≤8192(同代码路径)双侧差
+  均 <3%;落地后 final 构建的融合 ≤12288 与 fuseall 差 ≤1.5%。
+
+### 5.2 结果(融合/分离,kernel device µs 之比,<1 融合更快)
+
+| b·h | 4096 | 6144 | 8192 | 12288 | 16384 | 24576 |
+|---|---|---|---|---|---|---|
+| 32(b1) | 0.85 | 0.42 | 0.31 | 0.81 | 1.05 | 1.28 |
+| 64(b2) | 0.31 | 0.71 | 0.74 | 0.85 | 0.99 | 1.27 |
+| 128(b4) | 0.62 | 0.60 | 0.64 | 0.81 | 1.04 | 1.30 |
+| 256(b8) | 0.58 | 0.58 | 0.60 | 0.80 | 1.10 | 1.31 |
+
+- 四档拐点一致:12288 全赢(0.80-0.85),16384 翻负(1.04-1.10;
+  b·h=64 的 0.99 与两构建 ≤3% 的测量噪声同量级,不当获胜算),24576
+  全负(1.27-1.31)。b·h=128 行与 §2(b4h32)逐点吻合(±0.01),
+  两轮互为复现。小尺寸档(b·h≤64 且 kv=4096,绝对量 44-270 µs)比值
+  在 0.31-0.85 间跳动,launch 占比高,不影响 ≥ 拐点段的判断。
+- **定值:sm89 = 12288**——每档「最后获胜格点」的保守下界
+  (b·h=64 名义到 16384,其余三档都是 12288)。
+- 绝对值与原始行在 [microbench/vfuse_l20/p4s_fuseall.json](microbench/vfuse_l20/p4s_fuseall.json)
+  (fuseall 构建)、[p4s_prod.json](microbench/vfuse_l20/p4s_prod.json)
+  (门限 8192 的中间构建,用于交叉)、[p4s_final.json](microbench/vfuse_l20/p4s_final.json)
+  (落地构建,b·h∈{64,256} 分发自检)。
+
+### 5.3 两路 bit 等价(golden 不需重 dump)
+
+fuseall 构建上全格点(4 档 × 6 kv = 24 个非平凡组合)同输入跑
+composite(融合)与强制分离两路,`v_fp8` 按字节、`v_scale` 按 fp32
+逐位比较:**全部相等**;final 构建 ≤12288 的 12 个非平凡格点同样全等。
+与 `test_ops.py::test_quant_v_fp8_matches_two_kernel_path`(kv≤4096)
+的既有结论一致,换路不改变任何输出位,golden 无需重 dump。
+
+### 5.4 落地与门禁
+
+- 代码:`csrc/sageattn/quant_cuda.cu` 的 `kFusedVQuantMaxTokens` 常量
+  改为 `fused_v_quant_max_tokens(device)`:cc 8.9 → 12288,其余 arch
+  维持 4096(sm120 为实测原值,sm90/sm100 未扫描,注释已标)。dense 与
+  varlen 两个 composite 都走该函数。
+- 门禁(L20,final 构建):`compare_reference.py --check`(golden-sm89,
+  legacy baseline dump)**ok=2004 diff=0** missing=0,equiv 25/25;
+  `pytest test/ -q` 434 passed / 264 skipped / 0 failed(cc8.9-only
+  构建,sm80 家族用例 skip)。分发自检:composite ≤12288 只见
+  `TransposeQuantFp8Kernel`,≥16384 只见分离双 kernel。
+- e2e 预期不变:按 §3 的 kernel_breakdown 折算,6-12k 段拿回约 1-2%。
+- B200(sm100,linear/pad128)与 sm120 复扫用同一脚本
+  `bench/p4_vfuse_sweep.py`(--bitcheck 顺带出等价性),fused>门限
+  需按脚本 docstring 重编 fuseall 变体。
+- 远端产物:computelab `/home/scratch.sonlin_wwfo/workspace/nvidia/SageAttention_refactor/l20p4/`
+  (tree/so/out:构建日志、golden/pytest 日志、三份 sweep JSON)。
 
 ## 附录 A:sm89 accuracy 实测数值(HARDWARE_CHECKLIST 待办)
 
