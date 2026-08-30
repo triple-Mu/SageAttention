@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Device-only ptxas gate TU for qk_int_sv_f8_cuda_sm100.cu (torch-free):
+// Device-only ptxas gate TU for qk_int_sv_f8_sm100_impl.cuh (torch-free):
 // explicitly instantiates the MVP kernel for HEAD_DIM {64,128} x both PV
 // paths (TS from TMEM / SS twin from smem) so every asm string, descriptor
 // and TMEM access is machine-checked by ptxas at sm_100a and sm_110a.
@@ -31,10 +31,10 @@
 //   (repeat with arch=compute_110a,code=sm_110a)
 //
 // The explicit instantiations below must track the kernel's namespace and
-// parameter list in csrc/qattn/qk_int_sv_f8_cuda_sm100.cu by hand.
+// parameter list in csrc/qattn/qk_int_sv_f8_sm100_impl.cuh by hand.
 
 #define SAGE_SM100_DEVICE_ONLY 1
-#include "qk_int_sv_f8_cuda_sm100.cu"
+#include "qk_int_sv_f8_sm100_impl.cuh"
 
 namespace sage {
 namespace sm100 {

@@ -1,6 +1,6 @@
-# sm100 varlen 支持设计(只设计,未实现)
+# sm100 varlen 支持设计(M1 已落地,M2 起未实现)
 
-基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准。
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾。
 
 ## 0. 结论
 
@@ -60,6 +60,14 @@ sm100 kernel 体当前直接住在 csrc/qattn/qk_int_sv_f8_cuda_sm100.cu(不像 
 sm90 先例证明纯移动保 SASS 逐字节不变(sm90_impl.cuh:19-31)。注意 WS 文件头(_ws.cu:44-46)明确为保 SASS gate 而选择注释复刻不提取——那是针对跨 kernel 共享 helper 的决定,不否定同一 kernel 体的纯移动拆分;两条硬规则照 memory 执行:共享 body 加 `#ifdef` 时不提局部变量、gate 失败时按单 TU 二分。
 
 `SAGE_SM100_DEVICE_ONLY`(ptxas probe 模式,qk_int_sv_f8_cuda_sm100.cu:66-99)随 kernel 体一起进 impl header,probe TU 不受影响。
+
+**M1 已完成**(分支 wave10/sm100-varlen-m1,2026-08-30)。拆分后布局:
+
+- `csrc/qattn/qk_int_sv_f8_sm100_impl.cuh`(新):文件头注释 + include 块(含 `SAGE_SM100_DEVICE_ONLY` 双支)+ `SAGEATTN_ARCH_NS` 默认 `sm100` + kernel 模板,全部自原 TU 逐字节移入;`SAGE_VARLEN` 只在注释里预留,kernel 体本 commit 零改动。
+- `csrc/qattn/qk_int_sv_f8_cuda_sm100.cu`:只剩 host launcher 区(kPVFromSmem、SAGEATTN_SM100_WS 路由、fuse_v_scale launcher),include impl header;文件名不变,CMakeLists 零改动。
+- `bench/sm100_review/qk_int_sv_f8_cuda_sm100_probe.cu`:include 改指 impl header(原先 include 整个 .cu)。
+
+gate 实录:sm_100a+sm_110a 双 gencode 单 TU(同路径 build dir 全新重配)拆分前后 `cuobjdump -sass/-res-usage/-elf` 逐字节全同;test_ptxas_gate 4 例过;全 arch(8.6;8.9;9.0;10.0;12.0)构建绿。
 
 ### 3.2 kernel 内 8 处 `#ifdef SAGE_VARLEN` 改动点
 
@@ -147,7 +155,7 @@ Phase A 落地后 varlen 入口 plan 恒走旧 kernel,`SAGEATTN_SM100_WS` 只影
 
 | 里程碑 | 内容 | gate | 场地 | 会话 |
 |---|---|---|---|---|
-| M1 | impl header 拆分(纯移动) | dense sm100 TU 的 sm_100a/sm_110a SASS 逐字节等同(gensass 流程,memory「验证基建」);全 arch 构建绿 | 本机(nvcc 13.3 可编 sm_100a,无需硬件) | 1 |
+| M1(已完成 2026-08-30) | impl header 拆分(纯移动) | dense sm100 TU 的 sm_100a/sm_110a SASS 逐字节等同(gensass 流程,memory「验证基建」);全 arch 构建绿 | 本机(nvcc 13.3 可编 sm_100a,无需硬件) | 1 |
 | M2 | varlen TU(§3.2 八处)+ launcher/头/plan/dispatch/CMake/Python(§3.3)+ test_varlen_sm100.py 编写 | 本机全量编译;ptxas 无 spill 告警(test_ptxas_gate 模式);pytest 非 GPU 部分绿(plan 表、错误串) | 本机 | 1-2 |
 | M3 | B200 correctness | `pytest test/test_varlen_sm100.py test/test_varlen.py -q` 全绿。test_varlen_sm100.py 套 sm90 文件的 gate 组(HARDWARE_CHECKLIST :103-108 口径):等长 batch 对 dense sm100 kernel `torch.equal`(golden 即 dense 同 kernel 体,无需新 golden dir)、ragged 非 causal 逐段对 dense、CAUSAL_RAGGED 四组 bottom-right、空 KV 段、dead row O==0/lse==-inf、opcheck、双 gran × 双 hd × causal | ComputeLab b200x4(--sqsh pytorch_26.07-py3,完毕 cancel) | 与 M4 合计 1-2 |
 | M4 | bench + 文档 | `bench/bench_varlen.py`(packed vs padded dense,equal/ragged .25/.1 三 profile × 5 shape × causal)+ 同机 fallback 对照(TCGEN05 off → sm89 backend);口径按 BENCH_PROTOCOL(独占、双向交替、geomean>0.5%、方向一致);ncu 过滤 `-k regex:qk_int8_sv_f8_attn_kernel_sm100`;更新 HARDWARE_CHECKLIST/HANDOFF | 同 M3 分配 | — |
