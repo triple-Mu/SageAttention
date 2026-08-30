@@ -36,16 +36,28 @@ def test_quant_seq_stride_over_2p24_rejected():
 def test_attn_v_seq_stride_over_2p24_rejected():
     # sm80 requires fully contiguous q/k (their seq stride can never overflow)
     # but v is only lastdim-contiguous — its stride_seq_v carries the bound.
+    # backend="sm80" pins the same launcher on any device.
     q = torch.randint(-1, 2, (1, 1, 64, 64), dtype=torch.int8, device="cuda")
     k = q.clone()
     big = 1 << 25
     v = _strided((1, 1, 64, 64), (64 * big, 64 * big, big, 1))
-    o = torch.empty((1, 1, 64, 64), dtype=torch.float16, device="cuda")
     qs = torch.rand(1, 1, 16, dtype=torch.float32, device="cuda")
     ks = torch.rand(1, 1, 4, dtype=torch.float32, device="cuda")
     with pytest.raises(RuntimeError, match="2\\^24"):
-        torch.ops.sageattention.qattn_sm80_qk_int8_sv_f16_accum_f32_attn(
-            q, k, v, o, qs, ks, "HND", False, "per_thread", 0.125, False
+        torch.ops.sageattention.fwd(
+            q,
+            k,
+            v,
+            qs,
+            ks,
+            tensor_layout="HND",
+            qk_quant_gran="per_thread",
+            pv_accum_dtype="fp32",
+            v_layout="seq",
+            is_causal=False,
+            sm_scale=0.125,
+            return_lse=False,
+            backend="sm80",
         )
 
 

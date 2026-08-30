@@ -196,55 +196,24 @@ def test_opcheck_fwd_plan_driven(backend, head_dim, layout):
     )
 
 
-# ------------------------------------------------------ per-arch qattn ops
-
-
-def _qattn_args(head_dim=64, pv="fp32", layout="HND", b=2, h=4, seq=256, gran="per_warp"):
-    q, k, v, q_scale, k_scale, _, _ = _fwd_args(
-        layout, head_dim, pv, gran, b=b, h=h, qo_len=seq, kv_len=seq
-    )
-    qshape, _ = _qk_shapes(layout, b, h, h, seq, seq, head_dim)
-    out = torch.empty(qshape, device=DEV, dtype=torch.float16)
-    return q, k, v, out, q_scale, k_scale
-
-
 @requires_backend("sm80")
-@pytest.mark.parametrize(
-    "op_name,pv",
-    [
-        ("qattn_sm80_qk_int8_sv_f16_accum_f32_attn", "fp32"),
-        ("qattn_sm80_qk_int8_sv_f16_accum_f16_attn", "fp16"),
-        ("qattn_sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf", "fp16+fp32"),
-    ],
-)
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_opcheck_qattn_sm80_base(op_name, pv, return_lse):
-    q, k, v, out, q_scale, k_scale = _qattn_args(head_dim=64, pv=pv)
-    op = getattr(OPS, op_name).default
-    opcheck(op, (q, k, v, out, q_scale, k_scale, "HND", False, "per_warp", 0.125, return_lse))
-
-
-@requires_backend("sm80")
-@pytest.mark.parametrize("layout", ["HND", "NHD"])
-def test_opcheck_qattn_sm80_fuse_v_mean(layout):
-    b, h, seq, head_dim = 2, 4, 256, 64
-    q, k, v, out, q_scale, k_scale = _qattn_args(
-        head_dim=head_dim, pv="fp16", layout=layout, b=b, h=h, seq=seq
+def test_opcheck_fwd_backend_override(return_lse):
+    """backend= pins the kernel family instead of the cc-based selection; sm80
+    is the one family every supported device can run."""
+    args = _fwd_args("HND", 64, "fp32", "per_warp")
+    kwargs = dict(
+        tensor_layout="HND",
+        qk_quant_gran="per_warp",
+        pv_accum_dtype="fp32",
+        v_layout="seq",
+        is_causal=False,
+        sm_scale=0.125,
+        return_lse=return_lse,
+        out_dtype=torch.float16,
+        backend="sm80",
     )
-    v_mean = torch.randn((b, h, head_dim), device=DEV, dtype=torch.float16)
-    opcheck(
-        OPS.qattn_sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.default,
-        (q, k, v, out, q_scale, k_scale, v_mean, layout, False, "per_warp", 0.125, True),
-    )
-
-
-@requires_backend("sm80")
-def test_opcheck_qattn_sm80_per_thread():
-    q, k, v, out, q_scale, k_scale = _qattn_args(head_dim=128, pv="fp32", gran="per_thread")
-    opcheck(
-        OPS.qattn_sm80_qk_int8_sv_f16_accum_f32_attn.default,
-        (q, k, v, out, q_scale, k_scale, "HND", True, "per_thread", 0.08838834764831845, True),
-    )
+    opcheck(OPS.fwd.default, args, kwargs)
 
 
 # ------------------------------------------------------- quantization ops
@@ -619,22 +588,3 @@ def test_sageattn_zero_v_channel_fp8(smooth_v, head_dim):
     assert not out.isnan().any()
     assert (out[..., ZERO_CH] == 0).all()
     assert out[..., LIVE_CH].any()  # the rest of the output must survive
-
-
-# ------------------------------------------------------------- fake coverage
-
-
-def test_qattn_ops_list_covers_dispatcher():
-    """`ops._QATTN_OPS` is hand-written; a qattn kernel added on the C++ side
-    but not listed there would silently ship without a fake kernel and break
-    torch.compile. Cross-check it against what the dispatcher actually has
-    (the reverse does not hold: the list spans every arch, this build only
-    carries some of them)."""
-    from sageattention.ops import _QATTN_OPS
-
-    # private API, but the only way to enumerate registrations by key
-    registered = torch._C._dispatch_get_registrations_for_dispatch_key("CUDA")
-    prefix = "sageattention::qattn_"
-    dispatched = {name[len("sageattention::") :] for name in registered if name.startswith(prefix)}
-    assert dispatched, "build carries no qattn CUDA registrations"
-    assert dispatched <= set(_QATTN_OPS), sorted(dispatched - set(_QATTN_OPS))
