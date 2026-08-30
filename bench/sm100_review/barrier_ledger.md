@@ -249,7 +249,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
 | H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
 | H10 | `tmem_dealloc` while any warp still touches TMEM | 384 dealloc arrivals, each after the thread's last TMEM op (+ fence); the final PV retired transitively before correction's epilog arrivals (H7); mma warp waits ph 0 then deallocs collectively |
-| H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale is written pre-`__syncthreads` and read by correction over the generic proxy — plain sync suffices. The one generic->async edge in the kernel body is correction's sO staging feeding the bulk-store engine: every thread issues `fence.proxy.async.shared::cta` after its STS and before its epi_full arrival, and the epilogue warp's TMA store is ordered behind the barrier wait (SS-twin lesson applied) |
+| H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale / sK_scale are written pre-`__syncthreads` and read by correction / softmax over the generic proxy — plain sync suffices (sK_scale: section 9). The one generic->async edge in the kernel body is correction's sO staging feeding the bulk-store engine: every thread issues `fence.proxy.async.shared::cta` after its STS and before its epi_full arrival, and the epilogue warp's TMA store is ordered behind the barrier wait (SS-twin lesson applied) |
 | H12 | epilogue TMA store reads sO[t] before all 128 correction threads staged it | epi_full[t] completes only after 128 arrivals, each preceded by that thread's STS + `fence.proxy.async` |
 | H13 | CTA exit reclaims smem while a bulk store still reads sO | epilogue warp ends with `cp.async.bulk.wait_group.read 0` (the CUTLASS `tma_store_wait<0>` tail); global visibility of the stores is the kernel-completion fence's job |
 
@@ -345,3 +345,19 @@ ever re-acquires it) and no sO double-buffer pressure for the same reason.
 The old per-row `q_idx < qo_len` store guard is replaced by the tensor
 map's dim1 = qo_len bound: the TMA store clips OOB rows (tail CTA's tile 1
 stores nothing).
+
+## 9. sK_scale preload (G2, as built) — zero new barriers
+
+Producer: every thread of the CTA, before the kernel-start `__syncthreads`
+(the sV_scale/A3 pattern), copies the (batch, kv-head) K_scale row prefix
+(`min(num_ctas_k, 1024) * kNumKScales` f32 words) into static smem.
+Consumers: the softmax warpgroups, LDS only, strictly after that
+`__syncthreads`. The buffer is written exactly once and never re-acquired
+(read-only for the CTA lifetime), so there is no full/empty pair, no phase,
+and no ring — the ledger's count check (section 3) and liveness argument
+(section 7) are untouched. The beyond-capacity fallback (blocks >= 1024)
+reads gmem directly and synchronizes with nothing, like the old path.
+Deliberately NOT tied to the kv ring's stage semantics: `kv_empty(K_i)`
+fires when QK(i) retires, which can precede softmax's read of block i's
+scale — a per-slot k_scale copy could be overwritten one ring lap early
+(checked and rejected; the one-shot prefix copy has no such lifetime).

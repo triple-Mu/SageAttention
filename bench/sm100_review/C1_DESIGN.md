@@ -142,7 +142,7 @@ nvcc -std=c++17 -O3 -cubin -Xptxas -v -arch=sm_100a -I csrc  -o /tmp/p0c.cubin b
 
 | TU | 入口 reg | spill/stack | 备注 |
 |---|---|---|---|
-| ws probe ×4 实例(sm_100a & sm_110a) | 128 | 0 / 0 | smem static 1024B |
+| ws probe ×4 实例(sm_100a & sm_110a) | 128 | 0 / 0 | smem static:G2 后 17408B(per-thread gran,16KB sK_scale)/ 5120B(per-warp);G2 前 1024B |
 | p0a_setmaxnreg | 128 | 0 / 0 | 无 C7508;区内近满载校验和 |
 | p0b_tmem512 | 14 | 0 / 0 | 512 列 alloc/dealloc + 384 到达握手 |
 | p0c_umma_pipeline | 48 | 0 / 0 | i8 QK 链 8 轮 phase 翻转 + 全量比对 |
@@ -447,7 +447,7 @@ core_sm100.py 源结构推导,记为「推导」;其 profile 数据(XU 62-67% SO
 | # | 项 | cutedsl(推导) | 我们(cuobjdump 实测) | 预期收益/代价 |
 |---|---|---|---|---|
 | ~~G1~~ | ~~softmax 值域改写:raw 域 tree-max + P448 常量域 exp2 + 0.5 种子 4 路 packed 求和(L1094-1183)~~ | 每块每线程:127 FMNMX 树(深 ~7)+ 1 FMUL(max 回 deq 域)+ 64 FFMA2(raw 直接进 exp2 arg)+ 128 MUFU + 64 FADD2 分 4 条独立链(深 16)+3 收束;**不物化 dequant 行**(I2F 128 两边都有,平项) | **wave10 已落地**(§9;实测 SASS 链深 198-200 → 35-36) | 已关闭(实现与数值分析、上机判据全在 §9;0.5 种子折 denom 一项未搬,denom 乘加结构保持旧序,省的是 1 条标量 FADD,不值得再动值序) |
-| G2 | sKScale smem 预载(L107, L544-552;其注释记载 gmem 广播读是 ncu long_scoreboard 主因之一) | kernel 头一次性搬 ≤1024 块标量进 smem(4KB),softmax 每块 1 次 LDS | 每块每线程 1-4 次 LDG 广播(lever A 已把发射点前移 ~220 指令,暴露延迟基本盖住;L2 sector 浪费仍在:per-thread 粒度每 warp 每块 16B/32B sector) | lever A 后剩余收益 = 残余延迟窗口 + L2 流量;实现小(4KB static smem + 预载循环)。若上机 ncu 显示步首 long_scoreboard 已平,则收益趋零,不立项 |
+| ~~G2~~ | ~~sKScale smem 预载(L107, L544-552;其注释记载 gmem 广播读是 ncu long_scoreboard 主因之一)~~ | kernel 头一次性搬 ≤1024 块标量进 smem(4KB),softmax 每块 1 次 LDS | 每块每线程 1-4 次 LDG 广播(lever A 已把发射点前移 ~220 指令,暴露延迟基本盖住;L2 sector 浪费仍在:per-thread 粒度每 warp 每块 16B/32B sector) | **wave12 已实现,待上机验收(§10)**;立项依据 = wave11 ncu:per-issue stall 仍以 long_scoreboard 为主 + G1 per-class 预乘使 L2 read +14%(§9.6) |
 | G3 | 4×x32 tcgen05.ld 批量发射(4 outstanding;cute.copy 单发整行) | 每块 1 个 LDTM 等待窗口(4 条并飞) | 2×x64,r4/r5 SASS:6/8 站点 ld1 沉回消费点后 → 2 个串行窗口;in-flight 只在 pt-peeled 站点 | 每块省 ~1 个 LDTM round trip。被 A5 规则挡住(4+ outstanding 挂死根因未定位)+ ptxas 复沉不受源级控制(r4/r5 两轮实证);翻案条件:A5 根因定位,或 ptxas 调度修正 |
 | ~~G4~~ | ~~TMA descriptor prefetch(L432-436,prefetch_descriptor ×4)~~ | load warp 起手预取 Q/K/V/O 四张 descriptor | **wave10 已落地**(load warp 预取 Q/K/V、epilogue warp 预取 O;SASS UTMACCTL.PF ×4 站点;bit-exact) | 已关闭 |
 | ~~G5~~ | ~~correction rescale 用 mul_packed_f32x2(L1237-1239)~~ | 每 O tile 每块 64 FMUL2(d128) | **wave10 已落地**(per-lane IEEE 恒等,bit-exact;correction trip 循环钉 unroll 1,否则前端把 runtime-trip 循环展开 ~4×,静态指令 +45%) | 已关闭 |
@@ -465,8 +465,8 @@ core_sm100.py 源结构推导,记为「推导」;其 profile 数据(XU 62-67% SO
 来源集中在 G1(softmax 串行链与多余 dequant 发射)。G1 是「128 线程
 kernel 值序逐行拷贝」这一 bit-exact 硬闸的直接代价,继续压 XU/隐延迟的
 增量 lever(r3-r5)都绕不开它。**wave10 已按既定政策(精度换性能,双级
-门禁)落地 G1 并顺路捎带 G4/G5,见 §9**;G2 视上机 ncu 步首
-long_scoreboard 再议,G3 维持 A5 红线不动。
+门禁)落地 G1 并顺路捎带 G4/G5,见 §9**;G2 已凭 wave11 ncu 证据立项并
+于 wave12 实现(§10,待上机验收),G3 维持 A5 红线不动。
 
 ## 8. 风险与回退
 
@@ -661,3 +661,91 @@ qo_len cut,改为 **head_dim==128 即走 WS**,d64 维持不进。重建后 auto
 4.67→5.24、cyc/issued 8.73→9.55)按既定口径跨版本不可比(每块指令数
 大幅下降,分母缩水);LDTM 结构未动,L2 write sectors 与 r5 持平
 (lever B 保留),L2 read +14%(per-class k_scale 预乘的读放大,非判据)。
+
+## 10. G2:k_scale 经 smem 预载(wave12 实现;上机待验收)
+
+立项依据(§9.6 wave11 ncu):per-issue stall 仍以 long_scoreboard 为主,
+且 G1 的 per-class k_scale 预乘让 L2 read +14%——放大器正是 softmax 每块
+每线程的 k_scale 广播 LDG(per-thread 粒度 4 标量,每 32B sector 只用
+4B)。G2 把这条读路径整体搬进 smem,照抄 cutedsl sKScale 结构
+(core_sm100.py L107/L544-552):
+
+* **预载**:kernel 头、`__syncthreads()` 之前,全 CTA 512 线程平铺搬运
+  该 (batch, kv_head) 的 K_scale 行前缀 `min(num_ctas_k, 1024) *
+  kNumKScales` 个 f32 进 static smem(A3/v_scale 同款发布方式,零新增
+  barrier;账本 barrier_ledger.md §9)。行是 [block][class] 平铺
+  (`k_scale_advance_offset == kNumKScales`),所以就是一段连续 prefix
+  copy,warp 内 128B 全 coalesced;循环 trip 编译期定(per-thread 8 轮 /
+  per-warp 2 轮,越界谓词关断)。
+* **消费**:softmax step 的 lever A 发射点(两条 LDTM 之后、collective
+  wait 之前)从 `sK_scale` 读下一块的 scale——SASS 实测 per-thread 粒度
+  折成 1 条 `@!P0 LDS.128`(4 class 一次取齐),per-warp 1 条 LDS;
+  block 0 的循环外预载同样变 LDS。
+* **容量外回退**:`iter+1 >= 1024`(kv_len > 131072,超出全部 bench 形
+  状)走原 gmem 读,warpgroup-uniform 分支,ptxas 谓词化为 4 条
+  `@P0 LDG`(谓词关断时不访存,只占发射槽)。
+* **不走 ring 的原因**(设想中的"复用 load_kv stage 语义"已核并否决):
+  `kv_empty(K_i)` 在 QK(i) retire 即触发,而 softmax 对块 i scale 的读
+  可以晚于此——per-slot 副本会被提前一圈覆盖(账本 §9)。一次性 prefix
+  copy 无此生命周期问题,也不给 load warp 加活。
+
+与 A2 红线的区分:A2(HARDWARE_CHECKLIST:890-932,挂死根因未定位,禁
+止重开)是 128 线程 kernel 上的**寄存器双缓冲**——每 tile 顶部向寄存器
+发下一 tile 的 LDG,改变跨步调度。G2 不改任何发射调度:lever A 的发射
+点原样保留,只换数据源(gmem→smem),同步只靠既有 `__syncthreads`,
+与 A3(v_scale smem 预载,实机 diff=0 + 1.0124×)同构。
+
+### 10.1 smem 预算
+
+| 项 | per-thread gran | per-warp gran |
+|---|---|---|
+| sK_scale(static) | 1024 块 × 4 class × 4B = 16KB | 1024 × 4B = 4KB |
+| static 合计(ptxas 报) | 17408B | 5120B |
+| dyn(不变,lever B 后) | d128 160KB / d64 80KB | 同左 |
+| dyn + static 上限校验 | d128 177.0KB ≤ 227KB(static_assert 已并入)| ≤ 165KB |
+
+1 CTA/SM 由寄存器文件钉死(512 线程 × 128 reg),smem 余量本就闲置,
+16KB 不影响 occupancy。
+
+### 10.2 bit-exact 论证(对 golden-sm100-g1ws 应 diff=0)
+
+1. 值恒等:`sK_scale[i]` 是 K_scale 行第 i 个 f32 的逐字节拷贝
+   (LDG→STS→LDS,无任何转换);消费下标 `(iter+1)*advance+cls` 与旧
+   LDG 完全一致,且 `iter+1 < trip ≤ num_ctas_k` 保证读到的都是预载覆
+   盖区(`iter+1 < 1024` 时)。
+2. 运算序恒等:`dequant_scale = q_scale * k_scale_pref[cls]` 及其下游
+   一行未动;lever A 的装载位置未动(纯数据源替换)。
+3. 回退路径 = 旧路径本身(同地址 LDG)。
+4. 同步:生产全部在 `__syncthreads` 前,消费全部在其后,此后只读——
+   无竞态窗口。
+   → 输出逐位不变,golden-sm100-g1ws 闸应 `diff=0`(这是硬判据,非
+   accuracy 口径)。
+
+### 10.3 本地门禁(已过;复现命令同 §5)
+
+| 项 | 结果 |
+|---|---|
+| ptxas ×4 实例 × sm_100a/sm_110a(nvcc 13.3) | 入口 128 reg,0 spill / 0 stack |
+| USETMAXREG 标记 | 0xc0/0x58/0x28 各 4,与 G1 后一致 |
+| SASS 分区寄存器上界 | softmax 段 maxR 177(≤191,与基线持平)、correction 76(≤87)、mma/load 段自身 ≤39;函数尾部高号寄存器块与基线同为 softmax/correction 的 out-of-line mbarrier spin(布局伪影,基线即有) |
+| softmax 段 k_scale LDG 消失 | 热路径:per-thread 由 4 条 LDG.E 变 1 条 `@!P0 LDS.128`,per-warp 1 LDG→1 LDS;残留 LDG.E 仅 q_scale 单次 + `@P0` 回退(谓词恒假于 kv≤131072) |
+| 入口段预载 | per-thread +8 / per-warp +2 条谓词 LDG(+配对 STS),`VIMNMX/USEL 0x400` 为容量 clamp;入口 maxR 75 不变 |
+| host TU | torch 2.13/CUDA 13.2 头 -O0 全量编过 |
+
+实现途中的一个坑(已修,记档):预载的行基址算式与 softmax 分支里回退
+用的 `K_scale_base_ptr` 被 nvcc CSE 合并,值的出生点提前到 entry 段
+(128 reg 上限),ptxas 把 64-bit 基址跨 setmaxnreg 边界搬上 stack
+(12B spill,且 2 条 LDL 落在热循环顶)。修法:softmax 分支内对
+`qo_per_kv_head` 过一条空 `asm volatile`,把回退地址算式钉回 softmax
+段(改动前的活跃区间),spill 归零。
+
+### 10.4 上机判据(下一会话,B200)
+
+| 项 | 判据 |
+|---|---|
+| golden(`SAGEATTN_SM100_WS=1`,golden-sm100-g1ws) | `diff=0`(§10.2 是逐位论证,不放宽) |
+| golden(WS=0,golden-sm100) | `diff=0`(旧 kernel TU 未动,应逐字节不变) |
+| 压测 | ws_stress 2×8000 零挂死;**另加一个 kv_len > 131072 的 case**(如 s=139264=1088 块)实跑回退分支 |
+| bench 22 点 vs G1(97c5b2b) | 几何均值 >1.005 才算收益成立(>0.5% 口径);无形状 <0.995 |
+| ncu(b4h32s16384c0,对齐 §9.6 口径) | L2 read sectors 回落到 r5 量级(消掉 +14%);步首 long_scoreboard 占比下降为方向性佐证(跨版本比值口径注意 §9.6 的分母陷阱) |
+| 回退 | 任一硬闸失败即整 commit revert(单 commit,无交叉依赖) |
