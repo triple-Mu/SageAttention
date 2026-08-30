@@ -1,47 +1,42 @@
-# SageAttention 交接文档(2026-08-30)
+# SageAttention 交接文档(2026-08-30,收尾会话后)
 
-新会话读本文件即可接续全部工作。分支 `feat/varlen`(未 push),线性历史含两轮重构 + varlen + 全部优化/修复,工作树应干净。产出原则:最少字,砍表达不砍信息。
+新会话读本文件即可接续。分支 `feat/varlen`(未 push),线性历史 = 两轮重构 + varlen + 全部优化/修复 + 本轮收尾(整理净 −1191 行、C1 WS kernel、P2/P4 落袋);工作树应干净。本轮完整账目(收益表、判负、挂账)在 `bench/FINAL_PASS_REPORT.md`,先读它。
 
 ## 1. 机器与环境
 
-| 机器 | 连接 | GPU | 环境启动 | 工作目录 |
+| 机器 | 连接 | GPU | 环境 | 工作目录(清理后) |
 |---|---|---|---|---|
-| 本机 | — | RTX 3080Ti Laptop(sm_86, 16GB) | `/home/ubuntu/miniconda3/envs/torch/bin/python`(torch 2.13.0+cu132,nvcc 13.3;**别用 .venv**);cmake 用 pip 版 | 本仓库;editable install 已就绪 |
-| hyper01(H200×8, sm_90) | `ssh hyper01 "docker exec sglang-diffusion-triplemu bash -c '<cmd>'"` | 141GB/卡;**卡有他人任务,现场 nvidia-smi 挑空卡** | `source /workspace/.sglang/bin/activate` | `/workspace/SageAttention`(=重构前 0a5d2e4 已构建,当 baseline);`/workspace/SageAttention-{final,kbd,varlen,...}`(历史树);sm90 golden:`/workspace/sage-golden-sm90`(1488 case) |
-| pro-5k(RTX PRO 6000×8, sm_120) | `ssh pro-5k "docker exec sglang-diffusion-triplemu-inference bash -c '<cmd>'"` | 72GB/卡,常空闲,用 GPU 0 | `source /workspace/sgl-env/bin/activate` | `/workspace/SageAttention-refactor/{baseline,new*,golden-sm120}` |
-| ComputeLab(L20 sm_89 / B200 sm_100) | `ssh computelab-sc`,**登陆节点是 csh,非交互命令必须 `bash -c` 包裹** | B200 183GB / L20 46GB,Slurm+Pyxis | `python3 /home/scratch.sonlin_wwfo/workspace/nvidia/scripts/clab.py -p {b200x4,l20x1} alloc [--gpus 1] --queue-timeout 3600`;容器 `--sqsh /home/scratch.sonlin_wwfo/workspace/nvidia/enroot/images/pytorch_26.07-py3.sqsh`;`exec -- bash -c '...'`;**state 按 profile 存,多任务并发必须显式 `--job-id`;完毕必 `cancel`(当前队列已空)** | `/home/sonlin/scratch/workspace/nvidia/SageAttention_refactor/{baseline,new*,golden-sm100,sm89/}` |
+| 本机 | — | RTX 3080Ti Laptop(sm_86) | `/home/ubuntu/miniconda3/envs/torch/bin/python`(torch 2.13.0+cu132,nvcc 13.3;**别用 .venv**);cmake/ninja 用同 env 的 | 本仓库,editable install 就绪;**本机 golden:`~/sage-golden-local/{full,full2}`**(1493/1541) |
+| hyper01(H200×8, sm_90) | `ssh hyper01 "docker exec sglang-diffusion-triplemu bash -c '<cmd>'"` | **卡有他人任务,现场挑空卡**;功耗 cap,亚 1% 信号必须 ncu 锁基频仲裁 | `source /workspace/.sglang/bin/activate` | `/workspace/{sage-w3,sage-w4}`(a264fc0 / 终验树);golden `/workspace/sage-golden-sm90`;证据 `/workspace/{sm90-7a64fc0,p2-sm90,sage-evidence-archive}`;待裁决 `SageAttention-rowsum` |
+| pro-5k(PRO 6000×8, sm_120) | `ssh pro-5k "docker exec sglang-diffusion-triplemu-inference bash -c '<cmd>'"` | 常空,GPU 0 | `source /workspace/sgl-env/bin/activate` | `/workspace/SageAttention-refactor/{baseline,golden-sm120,archive/}`;**注意 `/workspace/SageAttention` 有 4 个未 push commit(v2g 工作),别动** |
+| ComputeLab(L20/B200/A100) | `ssh computelab-sc`,csh 登陆节点,**非交互命令必 bash -c 包裹,多步写脚本 scp 执行** | Slurm+Pyxis | `clab.py -p {b200x4,l20x1,a100x1} --sqsh .../pytorch_26.07-py3.sqsh alloc`;**--sqsh 第一条命令就要带(默认 cu130 镜像编不了 sm_100a);多任务显式 --job-id;完毕必 cancel** | 容器把 `/home/scratch.sonlin_wwfo/workspace/nvidia` 挂为 `/workspace`;树 `SageAttention_refactor/{baseline,sage-w4,golden-sm100,sm89/,scripts/,logs*}` |
 
-传代码:`tar --exclude={.git,build,dist,assets,example,refs,cmake-build-debug,'sageattention-patches*','*.egg-info',__pycache__,'*.so',.idea,.claude} -czf - . | ssh <机> "docker exec -i <容器> tar -xzf - -C <目录>"`。远端构建:`TORCH_CUDA_ARCH_LIST=<arch> python setup.py build_ext --inplace` + `PYTHONPATH` 跑(别污染 venv);容器内 torch 2.13.0a0+nv26.07/nvcc 13.3。
+传代码:`git archive HEAD --prefix=<name>/ | gzip` 后 scp/管道解包(别 tar 工作树)。远端构建:`TORCH_CUDA_ARCH_LIST=<arch> python setup.py build_ext --inplace` + PYTHONPATH 跑。
 
-## 2. 验证工具与门禁(每次改 kernel 后的口径)
+## 2. 验证门禁(改动后的口径)
 
-- **bit-exact 对拍**:`python tools/compare_reference.py --check --golden-dir <G>`;本机 G=scratchpad 的 `cmp/full`(1493)与 `cmp/full2`(1541),远端各机 golden 见上表;baseline 侧 `--dump --backend legacy`。equiv 段(fwd 全等/pad 等价/varlen_vs_dense)只在 new 侧跑。
-- pytest 基线:本机 **552 passed / 154 skipped**;compile 用例含 fullgraph 0 break + cudagraph。
-- SASS 门禁:改 kernel 前抓 baseline(scratchpad 各 `gensass` 类脚本;`bench/kernel_breakdown.py` 亦可),**fresh build 对 fresh build**(增量构建 sm90 会出不同 SASS);**ninja deps 有过空记录导致改共享头不重编→SASS 假阴性,必须核对目标 TU 真的重编了**。
-- bench 口径:`cutedsl_sage/BENCH_PROTOCOL.md`(cutedsl-sage-sm90 分支)——同卡独占、双向交替、全表几何均值、>0.5% 信号、方向一致性;H200 有功耗 cap 用 min-of-N。
-- **sm100 特有通则:golden 全绿不够,改动必须补单形状 8000 次定点压测**(A5 是 golden 全过、压测才挂死)。
-- 构建 OOM:本机并发 × NVCC 线程 ≤16(4×4);打 wheel 前 `rm -rf build/lib*`(stale 产物会混入)。
-- CUDA 支持矩阵(实测,commit c56bed3):sm80≥12.0、sm89≥12.4、sm90≥12.5、sm120≥12.8、sm100/110≥13.1;torch 2.13 自身要 nvcc≥12.4。
+- **双级门禁**:等价改动走 bitwise golden diff=0;精度换性能改动走 accuracy gate(cos>0.99/rel_l1<0.06 对 SDPA fp32)+ BENCH_PROTOCOL 双闸,验收后重 dump golden。
+- **bit-exact 对拍**:`python tools/compare_reference.py --check --golden-dir <G>`(别用 -m);attn 段走 `fwd(backend="smXX")` 跨家族覆盖;旧 golden 里退役 case 由 RETIRED_CASE_MARKERS 计 skip(本机 +320、H200/B200 +198,预期内)。
+- pytest 本机基线:**544 passed / 278 skipped**(批 1 删 qattn 用例、P7 加 124 个 varlen 用例)。
+- SASS 门禁:`tools/sass_diff.sh`(fresh vs fresh);kernel 数变化时用 scratchpad 的 `sass_subset_cmp.py` 口径;共享 body 别在条件编译里提局部变量;ninja 空 deps 假阴性要核对目标 TU 真重编;**mtime 保留式还原(copy2)后必须 touch 再重建**。
+- sm100 通则:golden 全绿不够,必须 `bench/sm100_review/ws_stress.py`(SWEEP + 8000×2 定点);ncu 必须 `-k "regex:qk_int8_sv_f8_attn_kernel_sm100"` 过滤(张量初始化也是 launch);per-issue stall 比值跨版本不可比,绝对判据用 duration。
+- bench 口径:BENCH_PROTOCOL(独占、双向交替、几何均值>0.5%、方向一致);工具 `scripts/cdsl_bench_fwd.py`(集群)、`bench/sm100_review/ws_{stress,prof}.py`、`bench/p4_vfuse_sweep.py`(均已入仓)。
+- 构建 OOM:本机并发×NVCC 线程 ≤16;wheel 前 `rm -rf build/lib*`。
 
-## 3. 已完成与结论
+## 3. 本轮新增语义(必读)
 
-- **重构**(CMake 单 `_C.abi3.so`、torch.ops 统一 dispatch、0 graph break、cudagraph、int64 分层契约):五 arch 对 0a5d2e4 bitwise 全 diff=0(sm86 1493/sm89-L20 2004/sm90 1488×2/sm100 2280×2/sm120 2578)。
-- **varlen**(packed+cu_seqlens,FA 语义 bottom-right causal,`sageattn_varlen`/`fwd_varlen`,sm100 设计内拒绝):四 arch 实机全绿;等长逐位=dense,ragged 对补齐 dense 1.4-2.1×;闭式偏移代数(csrc/sageattn/varlen.h)无前缀和张量,cudagraph/fake 安全;quant kernel dense/varlen 共享(残余税实测 ±0.05%,**裁决维持混合不拆实例**)。
-- **优化落袋**:sm100 TMEM 右尺寸化 hd64 1.53× + **A1 P叠S区 d128 1.577×**(对 cudnn 0.47→0.76×)+ v_scale 预载;V transpose+量化融合(短 seq e2e −5~18%,门限 padded 4096 只在 sm120 扫过);segment_mean kernel(varlen 等长 0.93-0.99);fp8 V memset 消除;quant 寄存器悬崖修复(sm90/100);S2R 指针预折(sm89+sm80 非 causal);sm8x sub_mean pack;sm80 B 批(causal +3-5%)。
-- **判负封路**(全有实测,别重试):sm90 全部方向(WS 四件套/降 reg/H6/行和 mma 化/cluster/软件流水/exp2 仿真——现行 911 TFLOPS 即上限);C-1 三 arch(非 occupancy 受限);sm100 的 B1 KV ring(净零,且 ncu 下有挂死隐患)与 C2 S 双缓冲(0.65×);A2 k_scale 预载与 A5 TMEM 批量读(sm100 挂死回退,根因未定位);D 宏三个(默认 OFF 留档);C-8 sm120 v2。证据:`test/HARDWARE_CHECKLIST.md`(总账本)、`profile/*/REPORT.md`(cutedsl 分支)、`bench/*_REPORT.md`。
-- **kernel breakdown 实验**:`bench/KERNEL_BREAKDOWN_REPORT.md` + 原始数据 `bench/kernel_breakdown_data/`;工具 `bench/kernel_breakdown.py`(两侧自适应/角色映射/独占检查)。
-- NaN 三兄弟修复(dense V 尾部/zero-amax/fa3 descale);修饰符与命名统一 + test_style 机检。
+- `fwd` 有 keyword-only `backend=None` 覆写(resolve 的 req_backend 透传);显式 backend 撞未编 SASS 会得到干净 TORCH_CHECK(plan.cpp `backend_serves`)。
+- **`SAGEATTN_SM100_WS` 三态**:未设=auto(d128 且 qo_len≥16384 非 causal / ≥32768 causal 自动走 WS kernel)、`1`=强制 WS、`0`=强制旧(跑旧路 golden/SS oracle 必须显式 0)。
+- V 融合门限 per-arch:sm89=12288、sm100/110=24576、其余 4096(quant_cuda.cu `fused_v_quant_max_tokens`);两路 bit 等价,换路不动 golden。
+- quant kernel:per_warp/per_thread 家族 dense/varlen 双实例;per-block 家族 dense 仍走 kVarlen=true 实例(H200 判据,见 FINAL_PASS_REPORT §3)。
+- `SAGE_PRUNE_GENCODE`(默认 OFF):GO 建议在案(build CPU −36%/体积 −38%),转正待用户拍板。
 
-## 4. 未做 / 可挖(按价值)
+## 4. 已完成 / 判负 / 挂账
 
-1. **C1:sm100 完整 warp specialization + 双 Q tile(重写级,唯一大空间)**——现 0.76× cudnn,cutedsl 1.07-1.18×;立项理由已重定:每 scheduler 仅 2 active/0.6 eligible warp、54% cycle 无指令可发(不是 barrier,实测仅 3.3%);目标 = warp 供给 2→8;先验 `setmaxnreg` 在 sm100a 可编;参考存档分支 `cdsl-p3-b1/c2` 的 barrier ledger 与 cutedsl `core_sm100.py`(16 warp 特化结构);封路:128 线程地基上加深预取、TMEM 腾挪。
-2. `fp32+fp16` 默认退役决策:L20/PRO6000 已证同速更不准,**等 4090 跑一次 `bench/microbench/mma_rate.cu`**(消费级 Ada 2× 速率是变数)。
-3. V 融合门限(4096)只在 sm120 扫过,L20/B200 重扫;sm89 残余 ~1.5% 非 causal 差距 L20 复测(bench/SM80_NONCAUSAL_FIX_REPORT.md)。
-4. B2 V 自然布局(MN-major 消 transpose_pad,e2e 1-8%,desc parity 要重写);A4 packed f32x2 softmax(sm100,需推导 per_thread 4-class rowmax)。
-5. 二期:sm100 varlen、FA3 persistent scheduler(偏斜 batch R9);sm89/120 softmax/mma 重叠(先读三份判负报告)。
-6. 工程:`feat/varlen` push/PR;删 `qattn_smXX_*` 过渡 op(条件已达成,对拍脚本需改走 fwd,单独立项);sm89/sm120 缺 kernel 级 packed varlen 用例;`test_accuracy` 参数化后的 fp8 卡数值未采;本机 /data 有 ~90GB CUDA 镜像可 `docker rmi`。
+全部见 `bench/FINAL_PASS_REPORT.md`(收益表、判负表、挂账清单)与 `test/HARDWARE_CHECKLIST.md`(总账本)。C1 设计与迭代史:`bench/sm100_review/C1_DESIGN.md`。历史两轮重构与 varlen 的结论不变(五 arch bitwise 全 diff=0、varlen 语义与 cudagraph 安全)。
 
-## 5. 其他速查
+## 5. 速查
 
-- memory 目录(`~/.claude/projects/-home-ubuntu-workspace-github-llm-SageAttention/memory/`)有全部教训索引;协作纪律:多会话并发时 worktree 隔离、改动一成形就 commit(clean worktree 有被误清风险)、共享 kernel 源文件改动先协调。
-- `sageattention3_blackwell` 不打进 wheel(pyproject include 已收紧)但保留目录;`native_quant_op.py` 保留不入库;`.idea/`、`refs/`、`sageattention-patches*` 不入库。
+- memory 目录(`~/.claude/projects/-home-ubuntu-workspace-github-llm-SageAttention/memory/`)有全部教训索引;协作纪律:多会话 worktree 隔离、改动一成形就 commit、共享 kernel 文件先协调、**给 subagent 的 worktree 初始 HEAD 可能指错,第一步 reset --hard 到指定 SHA**。
+- `sageattention3_blackwell` 不入 wheel;`native_quant_op.py`、`.idea/`、`refs/`、`sageattention-patches*` 不入库(git add -A 会误收,用显式路径)。
+- feat/varlen 未 push;push/PR 待用户确认。
