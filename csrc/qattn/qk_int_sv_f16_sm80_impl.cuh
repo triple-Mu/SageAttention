@@ -717,7 +717,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                      num_tiles_v,
                                      swizzle_mode_V,
                                      V_SMEM_STRIDE / PACK_SIZE_V,
-                                     4>(smem_V, RS_f16, RO, denom, V_smem_offset_mma);
+                                     4>(smem_V, RS_f16, RO, V_smem_offset_mma);
         }
         else {
             compute_fp16_sv_permuted_inst_buf<num_warps_q,
@@ -727,7 +727,7 @@ __global__ void qk_int_sv_f16_attn_kernel(const int8_t* __restrict__ Q,
                                               num_tiles_v,
                                               swizzle_mode_V,
                                               V_SMEM_STRIDE / PACK_SIZE_V,
-                                              4>(smem_V, RS_f16, RO, denom, V_smem_offset_mma);
+                                              4>(smem_V, RS_f16, RO, V_smem_offset_mma);
         }
 
         __syncthreads();

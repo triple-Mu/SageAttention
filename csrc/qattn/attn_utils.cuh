@@ -573,7 +573,6 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mode, stride>& smem_V,
                                                          T            RS_f16[][num_tiles_k][RS_width],
                                                          DTypeSVAccum RO[][num_tiles_v][8],
-                                                         float        denom[][2],
                                                          uint32_t&    offset_V)
 {
     static_assert(sizeof(T) == 4);
@@ -618,7 +617,6 @@ template<uint32_t    num_warps_q,
 __device__ __forceinline__ void compute_fp16_sv_permuted_inst_buf(const smem_t<swizzle_mode, stride>& smem_V,
                                                                   T            RS_f16[][num_tiles_k][RS_width],
                                                                   DTypeSVAccum RO[][num_tiles_v][8],
-                                                                  float        denom[][2],
                                                                   uint32_t&    offset_V)
 {
     static_assert(sizeof(T) == 4);
@@ -759,8 +757,7 @@ template<uint32_t    num_warps_q,
          typename DTypeSVAccum>
 __device__ __forceinline__ void compute_fp8_sv(const smem_t<swizzle_mode, stride>& smem_V,
                                                uint32_t                            RS_f8[][num_tiles_k / 2][4],
-                                               DTypeSVAccum                        RO[][num_tiles_v][8],
-                                               float                               denom[][2])
+                                               DTypeSVAccum                        RO[][num_tiles_v][8])
 {
     uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
@@ -799,8 +796,7 @@ template<uint32_t    num_warps_q,
          typename DTypeSVAccum>
 __device__ __forceinline__ void compute_fp8_sv_inst_buf(const smem_t<swizzle_mode, stride>& smem_V,
                                                         uint32_t                            RS_f8[][num_tiles_k / 2][4],
-                                                        DTypeSVAccum                        RO[][num_tiles_v][8],
-                                                        float                               denom[][2])
+                                                        DTypeSVAccum                        RO[][num_tiles_v][8])
 {
     uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
@@ -881,8 +877,7 @@ template<uint32_t    num_warps_q,
          typename DTypeSVAccum>
 __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accum(const smem_t<swizzle_mode, stride>& smem_V,
                                                                    uint32_t     RS_f8[][num_tiles_k / 2][4],
-                                                                   DTypeSVAccum RO[][num_tiles_v][8],
-                                                                   float        denom[][2])
+                                                                   DTypeSVAccum RO[][num_tiles_v][8])
 {
     uint32_t smem_V_row_base = get_lane_id_2d() % 8 + (get_lane_id_2d() / 16) * 8;
     // uint32_t smem_V_col_base = get_warp_idx_k<num_warps_q, num_warps_k>() * ((16 * num_tiles_k) / 16) +
