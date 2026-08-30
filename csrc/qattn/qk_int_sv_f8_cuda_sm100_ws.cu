@@ -523,7 +523,26 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     // epilogue warp. Used once per tile per CTA (no double-buffer pressure).
     constexpr uint32_t SMEM_O_BOX_BYTES = CTA_Q * 64 * sizeof(DTypeOut);  // 128B rows
     constexpr uint32_t SMEM_O_BYTES     = (head_dim / 64) * SMEM_O_BOX_BYTES;  // per tile
-    static_assert(2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES + 2 * SMEM_O_BYTES <= 227 * 1024,
+    // K-scale smem preload (G2; blueprint sKScale, cutedsl L107/L544-552). A
+    // KV block's k-scale classes are contiguous in gmem (k_scale_advance_offset
+    // == kNumKScales), so the (batch, kv-head) K_scale row is a flat
+    // [block][class] f32 array and the smem buffer below is a verbatim prefix
+    // copy of it, staged once by the whole CTA before the __syncthreads and
+    // read-only afterwards. Softmax reads each block's scale(s) from smem
+    // (LDS) instead of re-issuing per-thread gmem broadcast loads (wave11
+    // ncu: 32B sector per 4B scalar, x128 threads x kNumKScales per block =
+    // the +14% L2 read of the G1 per-class premultiply). Blocks beyond the
+    // capacity (kv_len > kKScaleSmemBlocks*CTA_K = 131072, past every bench
+    // shape) fall back to the old gmem read through a warpgroup-uniform
+    // branch.
+    constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
+    constexpr uint32_t kNumKScales            = (K_GRAN == QuantGranularity::kPerThread) ? 4 : 1;
+    constexpr uint32_t kKScaleSmemBlocks      = 1024;  // cutedsl KSCALE_MAX
+    // dynamic + static smem share the per-CTA budget; sK_scale is the only
+    // static consumer that scales (16KB per-thread gran / 4KB per-warp)
+    static_assert(2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES + 2 * SMEM_O_BYTES
+                          + kKScaleSmemBlocks * kNumKScales * sizeof(float)
+                      <= 227 * 1024,
                   "smem budget exceeded");
 
     // --- smem descriptors + MMA instruction descriptors (same as the
@@ -582,6 +601,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     __shared__ __align__(8) uint64_t bars[kNumBars];
     __shared__ __align__(4) uint32_t tmem_addr_slot;
     __shared__ __align__(16) float sV_scale[fuse_v_scale ? head_dim : 1];
+    __shared__ __align__(16) float sK_scale[kKScaleSmemBlocks * kNumKScales];
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -610,6 +630,26 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                                             + static_cast<int64_t>(blockIdx.z) * (gridDim.y / qo_per_kv_head) * head_dim
                                             + static_cast<int64_t>(blockIdx.y / qo_per_kv_head) * head_dim;
             sV_scale[threadIdx.x] = V_scale_base_ptr[threadIdx.x];
+        }
+    }
+
+    // --- stage the k_scale row prefix in smem (G2; published by the same
+    //     __syncthreads, the A3/v_scale pattern). Flat coalesced copy, all 16
+    //     warps chip in; the trip count is compile-time so the guarded loads
+    //     issue concurrently (predicated off past the row length). ---
+    {
+        const uint32_t num_ctas_k    = div_ceil(kv_len, CTA_K);
+        const uint32_t preload_words = min(num_ctas_k, kKScaleSmemBlocks) * kNumKScales;
+        const float*   k_scale_row =
+            K_scale
+            + (static_cast<int64_t>(blockIdx.z) * (gridDim.y / qo_per_kv_head) + blockIdx.y / qo_per_kv_head)
+                  * (static_cast<int64_t>(num_ctas_k) * kNumKScales);
+#pragma unroll
+        for (uint32_t it = 0; it < div_ceil(kKScaleSmemBlocks * kNumKScales, NUM_THREADS); it++) {
+            const uint32_t i = threadIdx.x + it * NUM_THREADS;
+            if (i < preload_words) {
+                sK_scale[i] = k_scale_row[i];
+            }
         }
     }
 
@@ -683,35 +723,42 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                           + (lane_row / 32) * 8 + (lane_row % 8);
         }
 
+        // Fallback-only gmem base (G2: blocks >= kKScaleSmemBlocks; the hot
+        // path reads sK_scale). The empty volatile asm pins this address math
+        // HERE, in the softmax setmaxnreg region: without it nvcc CSEs the
+        // divisions/products with the entry-region preload copy of the same
+        // expression and ptxas carries the 64-bit base across the region
+        // boundary on the stack (measured: 12B spill, reloaded by 2 LDL at
+        // the hot loop top).
+        uint32_t kscale_qo_per = qo_per_kv_head;
+        asm volatile("" : "+r"(kscale_qo_per));
         const float* K_scale_base_ptr;
         if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
             const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
-            K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * num_ctas_k
-                               + static_cast<int64_t>(head_id / qo_per_kv_head) * num_ctas_k;
+            K_scale_base_ptr = K_scale + static_cast<int64_t>(batch_id) * (num_qo_heads / kscale_qo_per) * num_ctas_k
+                               + static_cast<int64_t>(head_id / kscale_qo_per) * num_ctas_k;
         }
         else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
             const uint32_t num_ctas_k = div_ceil(kv_len, CTA_K);
             K_scale_base_ptr          = K_scale
-                               + static_cast<int64_t>(batch_id) * (num_qo_heads / qo_per_kv_head) * (num_ctas_k * 4)
-                               + static_cast<int64_t>(head_id / qo_per_kv_head) * (num_ctas_k * 4);
+                               + static_cast<int64_t>(batch_id) * (num_qo_heads / kscale_qo_per) * (num_ctas_k * 4)
+                               + static_cast<int64_t>(head_id / kscale_qo_per) * (num_ctas_k * 4);
         }
-        constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
-        constexpr uint32_t kNumKScales           = (K_GRAN == QuantGranularity::kPerThread) ? 4 : 1;
-
         const float q_scale = Q_scale[q_scale_idx];
 
-        // K-scale software prefetch (r5 lever A). The raw k-scale word(s) of
-        // block iter+1 are loaded inside step iter's tcgen05.ld shadow (below);
-        // without it the loop-top LDG serializes ahead of the first LDTM
-        // whenever the s_full wait falls through immediately (softmax is the
-        // laggard), because in-order issue blocks the LDTM behind the
-        // dequant-scale FMUL that consumes the LDG. Pure load motion: the
-        // q_scale multiply stays at the top of the consuming step, so the
-        // float op sequence is unchanged (bit-exact contract intact).
+        // K-scale software prefetch (r5 lever A structure, G2 source). The
+        // k-scale word(s) of block iter+1 are loaded inside step iter's
+        // tcgen05.ld shadow (below) from the smem prefix copy staged at
+        // kernel start - LDS instead of the old per-thread gmem broadcast
+        // LDG. Pure load motion + transport change: the values are the same
+        // f32 bytes and the q_scale multiply stays at the top of the
+        // consuming step, so the float op sequence is unchanged (bit-exact
+        // contract intact). K_scale_base_ptr stays live only for the
+        // beyond-capacity gmem fallback inside the step.
         float k_scale_pref[kNumKScales];
 #pragma unroll
         for (uint32_t cls = 0; cls < kNumKScales; cls++) {
-            k_scale_pref[cls] = K_scale_base_ptr[cls];  // block 0
+            k_scale_pref[cls] = sK_scale[cls];  // block 0 (always in the prefix)
         }
 
         // --- flash-attention state (mirrors :287-288) ---
@@ -787,16 +834,26 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             for (uint32_t c = 0; c < CTA_K / 64; c++) {
                 ws::tmem_ld_32x32b_x64(&RS_row[c * 64], tmem_row + c * 64);
             }
-            // r5 lever A: fill the ld shadow with the next block's k-scale
-            // prefetch - S-independent loads issued after both LDTMs, before
-            // the collective wait, so the LDG round trip rides the TMEM-load
-            // latency instead of preceding the next step's first LDTM. The
-            // peeled step has no successor (and its gap already holds the
-            // hoisted mask ISETP chain, the one site r4 found in-flight).
+            // r5 lever A site, G2 source: the next block's k-scale word(s)
+            // still load inside the tcgen05.ld shadow (after both LDTMs,
+            // before the collective wait), but from the smem prefix copy
+            // (LDS) - the per-block per-thread broadcast LDG and its L2
+            // round trip are gone (the wave11 ncu +14% L2 read sat entirely
+            // on that path). Blocks past the smem capacity (kv_len >
+            // kKScaleSmemBlocks*CTA_K) keep the old gmem read; the branch is
+            // warpgroup-uniform and never taken on covered shapes.
             if constexpr (!is_last) {
+                if (iter + 1 < kKScaleSmemBlocks) {
 #pragma unroll
-                for (uint32_t cls = 0; cls < kNumKScales; cls++) {
-                    k_scale_pref[cls] = K_scale_base_ptr[(iter + 1) * k_scale_advance_offset + cls];
+                    for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+                        k_scale_pref[cls] = sK_scale[(iter + 1) * k_scale_advance_offset + cls];
+                    }
+                }
+                else {
+#pragma unroll
+                    for (uint32_t cls = 0; cls < kNumKScales; cls++) {
+                        k_scale_pref[cls] = K_scale_base_ptr[(iter + 1) * k_scale_advance_offset + cls];
+                    }
                 }
             }
             tcgen05::tmem_ld_wait();
