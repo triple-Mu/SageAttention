@@ -57,7 +57,7 @@ q_scale 块索引 clamp 防越界读),与 cutedsl 同策略。
 | setmaxnreg | 192/192/96/32(L169-172) | **192/192/88/40** | 实测:correction 区 ptxas 上限 77-78 reg(88 下余 10);裸 mbarrier 版 mma/load 需 ~38,32 时 ptxas 把溢出压栈(24B spill)。总和仍恰 64K,kernel 内 static_assert 锁死 |
 | mma_corr pipeline | 共享 2-stage ring,o0/o1 交替 | 每 O tile 专用 1-stage ×2 | S1-only 轮打破交替后共享 ring 的 slot=item%2 错位;专用 pipe 语义等价(账本 §1)且 phase 记账是纯标量 |
 | mma_s 尾部 dummy commit | L745-746(softmax 末段多等一拍) | 无 | 本实现 softmax 末段不等 mma_s,计数天然平衡(账本 §3);少两次 commit |
-| softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | 逐元素值序照抄现 kernel(:412-474);round 3 起 dequant mul 与 exp2 输入 fma 走 f32x2 packed 指令,per-lane IEEE 语义与标量逐位一致(§6.3),不是 cutedsl 那种改值域的 packed 化 | bit-exact 硬闸保持;cutedsl 式常量域改写仍留给 M3 后(需重开 golden 口径) |
+| softmax 数学 | raw 域 tree-max + packed FMA/exp2 + 0.5 种子 packed 求和 + P448 常量域 | **G1 已对齐**(wave10,§9):raw 域 tree max + 域折叠 fma + d_sum 4 链;row_max/vec/o_scale 仍与旧 kernel 逐位一致,P/denom 变位 | golden 口径自 G1 起切换为 accuracy gate(§9);M0-r5 的 bit-exact 硬闸条款仅存于历史章节 |
 | softmax 寄存器策略 | 整行 128 f32 驻留 | 照抄:单遍读、整行驻留(见 §3;初版两遍读实测 0.887× 已回退,见 §6.1) | 行驻留 128 reg + 状态 ~30,ptxas 收在 170-173/192、零 spill(§6.3);每 KV 块每线程 2 次 64 列 tmem_ld(round 2 是 4 次 x32,两遍版 7 次) |
 | vec 提前信号(max 后、exp2 前发) | L1104-1109 | 照抄(全部 S 读已完成,别名列 [0,2) 已死) | correction 的 O rescale 藏进 softmax 的 exp2 段,是重叠收益主源 |
 | k_scale smem 预载(sKScale) | L544-552(per-block gran) | 不搬;r5 lever A 改为寄存器预取(下块 k_scale 在本块 ld shadow 里 LDG,§6.6),smem 预载仍开放(§7 G2) | 我们默认 per-thread gran(每 tile 4 标量);cutedsl 注释记载 gmem 广播读曾被 ncu 判为 long_scoreboard 主因之一 |
@@ -439,11 +439,11 @@ core_sm100.py 源结构推导,记为「推导」;其 profile 数据(XU 62-67% SO
 
 | # | 项 | cutedsl(推导) | 我们(cuobjdump 实测) | 预期收益/代价 |
 |---|---|---|---|---|
-| G1 | softmax 值域改写:raw 域 tree-max + P448 常量域 exp2 + 0.5 种子 4 路 packed 求和(L1094-1183) | 每块每线程:127 FMNMX 树(深 ~7)+ 1 FMUL(max 回 deq 域)+ 64 FFMA2(raw 直接进 exp2 arg)+ 128 MUFU + 64 FADD2 分 4 条独立链(深 16)+3 收束;**不物化 dequant 行**(I2F 128 两边都有,平项) | 每块每线程:64 FMUL2(整行 dequant)+ 64 FMNMX3 **串行链深 64** + 64 FFMA2 + 128 MUFU + **128 FADD 串行链深 128**(d_sum) | **最大项**。串行 ALU 关键路径 ~(64+128)×4 ≈ 770 cyc/块 vs cutedsl ~(7+16+3)×4 ≈ 100 cyc/块;另省 64 FMUL2 发射。代价:破 bit-exact(deq 域→raw 域、加法重结合),需主控重开 golden 口径(容差 gate);M3 后条款早已预留(§2 softmax 行) |
+| ~~G1~~ | ~~softmax 值域改写:raw 域 tree-max + P448 常量域 exp2 + 0.5 种子 4 路 packed 求和(L1094-1183)~~ | 每块每线程:127 FMNMX 树(深 ~7)+ 1 FMUL(max 回 deq 域)+ 64 FFMA2(raw 直接进 exp2 arg)+ 128 MUFU + 64 FADD2 分 4 条独立链(深 16)+3 收束;**不物化 dequant 行**(I2F 128 两边都有,平项) | **wave10 已落地**(§9;实测 SASS 链深 198-200 → 35-36) | 已关闭(实现与数值分析、上机判据全在 §9;0.5 种子折 denom 一项未搬,denom 乘加结构保持旧序,省的是 1 条标量 FADD,不值得再动值序) |
 | G2 | sKScale smem 预载(L107, L544-552;其注释记载 gmem 广播读是 ncu long_scoreboard 主因之一) | kernel 头一次性搬 ≤1024 块标量进 smem(4KB),softmax 每块 1 次 LDS | 每块每线程 1-4 次 LDG 广播(lever A 已把发射点前移 ~220 指令,暴露延迟基本盖住;L2 sector 浪费仍在:per-thread 粒度每 warp 每块 16B/32B sector) | lever A 后剩余收益 = 残余延迟窗口 + L2 流量;实现小(4KB static smem + 预载循环)。若上机 ncu 显示步首 long_scoreboard 已平,则收益趋零,不立项 |
 | G3 | 4×x32 tcgen05.ld 批量发射(4 outstanding;cute.copy 单发整行) | 每块 1 个 LDTM 等待窗口(4 条并飞) | 2×x64,r4/r5 SASS:6/8 站点 ld1 沉回消费点后 → 2 个串行窗口;in-flight 只在 pt-peeled 站点 | 每块省 ~1 个 LDTM round trip。被 A5 规则挡住(4+ outstanding 挂死根因未定位)+ ptxas 复沉不受源级控制(r4/r5 两轮实证);翻案条件:A5 根因定位,或 ptxas 调度修正 |
-| G4 | TMA descriptor prefetch(L432-436,prefetch_descriptor ×4) | load warp 起手预取 Q/K/V/O 四张 descriptor | 无;首次 UTMALDG/UTMASTG 冷取 descriptor | 每 CTA 一次性 ~百 ns 级;短序列 wave 多时略有感。实现一行/张,零风险,凑车顺手做 |
-| G5 | correction rescale 用 mul_packed_f32x2(L1237-1239) | 每 O tile 每块 64 FMUL2(d128) | 128 条标量 FMUL | 发射数减半,但 correction 藏在 softmax exp2 段后面不是关键路径(§2 vec 提前信号);per-lane IEEE 恒等,bit-exact 安全,属低风险小项 |
+| ~~G4~~ | ~~TMA descriptor prefetch(L432-436,prefetch_descriptor ×4)~~ | load warp 起手预取 Q/K/V/O 四张 descriptor | **wave10 已落地**(load warp 预取 Q/K/V、epilogue warp 预取 O;SASS UTMACCTL.PF ×4 站点;bit-exact) | 已关闭 |
+| ~~G5~~ | ~~correction rescale 用 mul_packed_f32x2(L1237-1239)~~ | 每 O tile 每块 64 FMUL2(d128) | **wave10 已落地**(per-lane IEEE 恒等,bit-exact;correction trip 循环钉 unroll 1,否则前端把 runtime-trip 循环展开 ~4×,静态指令 +45%) | 已关闭 |
 | ~~G6~~ | ~~epilogue sO+TMA store 流水~~ | epi_stage=2 + corr_epi pipe | **r5 lever B 已对齐**(单次使用省掉 empty barrier) | 已关闭 |
 
 不构成差距的项(对账过程中排除):correction 与 softmax 的重叠深度
@@ -457,8 +457,9 @@ core_sm100.py 源结构推导,记为「推导」;其 profile 数据(XU 62-67% SO
 结论:剩余 ~27 点(ws/cudnn 0.732 → cutedsl 包络对应 ~0.95+)的结构性
 来源集中在 G1(softmax 串行链与多余 dequant 发射)。G1 是「128 线程
 kernel 值序逐行拷贝」这一 bit-exact 硬闸的直接代价,继续压 XU/隐延迟的
-增量 lever(r3-r5)都绕不开它;建议下一会话主控先拍板 golden 口径切换
-(容差 gate),再立项 G1,顺路捎带 G4/G5。
+增量 lever(r3-r5)都绕不开它。**wave10 已按既定政策(精度换性能,双级
+门禁)落地 G1 并顺路捎带 G4/G5,见 §9**;G2 视上机 ncu 步首
+long_scoreboard 再议,G3 维持 A5 红线不动。
 
 ## 8. 风险与回退
 
@@ -470,7 +471,7 @@ kernel 值序逐行拷贝」这一 bit-exact 硬闸的直接代价,继续压 XU/
 | in-order UMMA 假设(H2) | P 被下一发 QK 踩,数值错但不挂 | 与 CUTLASS FMHA 同假设,风险极低;若疑,临时在 QK 前多等一拍 corr_full(牺牲重叠的诊断开关) |
 | 尾 CTA 白算拖平均 | 短序列加速比差 | 已知代价(cutedsl 同);不单独修,归入 M2 评估 |
 | 88 reg correction 将来加逻辑顶破 | 新增代码后 spill 复现 | r5 lever B(sO staging)后区内峰值 71-77,余量 11+,§5 门禁已重跑 |
-| 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | round 3 f32x2 后余量 19+(§6.3);softmax 区任何改动都要重跑 §5 门禁,顶破时先看 exp2/pack 融合段可否再压,再考虑 correction 让 reg |
+| 192 reg softmax 将来加逻辑顶破 | 新增代码后 spill 复现 | G1 后区内峰值 sm_100a 167-177(余 15-25)、sm_110a 188-189(余 3,packed 拆标量后 4 条 d_sum 链的活跃度全暴露);softmax 区任何改动都要重跑 §5 门禁,顶破时先把 d_sum 4 链降 2 链(深 16→32,省 4 寄存器),再考虑 correction 让 reg |
 
 挂死 triage(继承 quant-occupancy/sqsh 战场经验 + 本设计专项):
 
@@ -484,3 +485,117 @@ kernel 值序逐行拷贝」这一 bit-exact 硬闸的直接代价,继续压 XU/
    白算)、按 trip 退化(kv≤128 走 §3 的 T=1 轨迹)缩小到最小挂死形态。
 4. 若 A2/A5 型未定位挂死复现(k_scale 预载/TMEM 批量读的前科),规则不变:
    不重开,绕开该结构。
+
+## 9. G1:softmax 值域改写(wave10,已实现,待上机)
+
+精度换性能改动(既定政策,双级门禁):golden bitwise gate 预期破,验收口径
+= accuracy gate + bench 双闸,上机验收后重 dump golden(流程见 §9.5)。
+三个 commit:G4 descriptor prefetch、G5 rescale packed mul(两者各自
+bit-exact,独立可存活)、G1 本体。
+
+### 9.1 设计
+
+softmax step 不再物化 dequant 行,S 行全程呆在 raw 整数域(f32 表示,
+I2F 原位覆盖,寄存器结构不变):
+
+1. **块 rowmax = raw 域平衡 FMNMX 树**,每 k_scale class 一次乘法回 deq 域。
+   per-warp:单棵 128 元素树 + 1 FMUL;per-thread:4 棵 32 元素树(class c
+   拥有列 {8k+2c, 8k+2c+1})+ 4 FMUL + 3 FMNMX 合并。乘法舍入单调
+   (x≤y ⟹ rnd(x·d)≤rnd(y·d), d≥0),所以「类内先 max 再乘」与旧「逐元素
+   乘完再串行 max」**逐位同值**;补一个 -5e6 floor 复刻旧 m_local 初值语义
+   (兼收 zero-amax class 全 mask 时 d·(-inf)=NaN 的角落:fmaxf 丢 NaN 操作
+   数)。=> row_max、vec、o_scale、correction 的 rescale 因子与旧 kernel
+   在**所有**输入下逐位一致(9.3 的 sim 断言覆盖全部 corner)。
+2. **exp2 输入域折叠**:a = fma(raw, c_raw, -row_max),
+   c_raw = sm_scale·log2e·q_scale·k_scale 每块每 class 预乘一次;-row_max
+   本来就带着 S_FP8_OFFSET(row_max = c·m - 8.807 ⟹ -row_max =
+   8.807 - c·m,即 cutedsl neg_off = LOG2_448 - c·m 的同款常量域)。逐元素
+   dequant FMUL2(64 条/块)整段消失;P 只动在舍入位置上——旧
+   rnd(raw·d) 后 fma,新 rnd(c·d) 后 fma,arg 差 ≤1 ulp 量级。mask 改在
+   raw 域写 -inf(peeled step 专属);c_raw 在 peeled step 加 FLT_MIN
+   clamp,防 zero-amax(dequant=0)块里 -inf·0=NaN——活 lane 的
+   |raw|·FLT_MIN ≤ 2e-32 进 fma 加数即消失,clamp 只在 c_raw=0(全行乘积
+   本来就 underflow)时才改值。
+3. **d_sum 分链**:4 条独立 packed f32x2 累加链(quad w 喂链对 w&1,深
+   16)+ 3 条 packed 收束 + 1 标量收束,替换 128 深串行 FADD;纯重结合。
+   denom 的乘加结构(denom·o_scale 与 += d_sum 两步)保持旧序;cutedsl
+   的 0.5 种子 trick 只省 1 条标量 FADD,不搬。
+
+改位清单(golden bitwise 破的全部来源):P 的舍入位置(上面 2)、denom
+重结合(上面 3)、两个只在病理输入下可见的语义差——mask 哨兵 -5e6→-inf
+(旧哨兵在全行 deq 域 logits < -5e6 时会当 floor 用)与 LSE 随 denom 动。
+row_max/vec/o_scale 不在清单里(逐位保持)。
+
+### 9.2 SASS/资源(nvcc 13.3;基线 = r5+G4+G5)
+
+| 指标(每 softmax body,sm_100a) | 旧 | G1 |
+|---|---|---|
+| 关键链深(FMNMX/FADD 依赖链,float op 数) | 198-200(64 FMNMX3 串行 + 128 FADD 串行) | **35-36**(树 ~9 级 + FADD2 深 ~19) |
+| dequant FMUL2 | 64 | 0(FMUL 4-9 条:per-class 标量预乘) |
+| rowmax | 64 FMNMX3 串行 | ~87 FMNMX/FMNMX3 平衡树 |
+| d_sum | 128 FADD 串行 | 67 FADD2 |
+| MUFU.EX2 | 128+1 | 128+1(XU 不动) |
+
+估算口径(§7 G1 行的推导落实):~200×4 ≈ 800 cyc/块 → ~36×4 ≈ 145
+cyc/块,消掉的正是基线画像里压在 XU 天花板之下的串行 ALU 链;每块另省
+64 FMUL2 + 61 FADD 发射。总静态指令(G5 后→G1):hd64-pt 4288→4168、
+hd64-pw 3528→3424、hd128-pw 4072→3968、hd128-pt 4656→4528。
+
+门禁(4 实例 × sm_100a/sm_110a):全部 0 spill / 0 stack / 入口 128 reg。
+softmax 区峰值:sm_100a 167-177(基线 162-169,+8 ≈ 4 条 packed 累加链),
+sm_110a 188-189(packed 拆标量,余量 3,§8 风险表已更新)。correction
+(G5)与 mma/load 区不变。
+
+### 9.3 数值分析(bench/sm100_review/g1_softmax_sim.py,numpy 位级仿真)
+
+口径:int32 S → 新旧两条 softmax 路径(fma 用 f64 乘加一次下转模拟,
+exp2/rcp 用 libm f32 站位 MUFU 近似,e4m3 转换按 cvt.rn.satfinite 精确
+实现;两条路径同一套模型,A/B 本身精确)→ e4m3 P → PV(f32)→ epilogue;
+参考 = fp64 SDPA(量化前浮点 Q/K/V)。场景:randn(±causal)、大动态范围、
+全常数行、outlier 块、zero-amax 块(含 masked peel 的 NaN 角落)、全行
+logits < -5e6(旧哨兵 floor 角落)、kv=17 短块;每场景 × per-warp/
+per-thread,128 行 × 32 块 × 128 列。
+
+| 指标 | 结果 |
+|---|---|
+| row_max 位一致(新 vs 旧) | 18/18 组合全部成立(硬断言) |
+| P 的 f32 级变位率 | 0-12.6%(变位幅度典型 ≤7.5e-7 相对,病理场景 ≤1.8e-3) |
+| **P 的 e4m3 改写率** | **0 / 8360448 live 元素**(3-bit 尾数吞掉 arg 的 ulp 级差) |
+| denom 相对移动 | 典型 ≤3e-7,病理 ≤1.6e-3 |
+| O:新 vs 旧 | rel_l1 典型 ≤2e-6,最坏 8.5e-4(neg_5e6);cos ≥ 0.99999976 |
+| O:新/旧 vs fp64 参考 | 逐场景到小数第 6 位相同(量化误差主导);randn cos 0.9993 / rel_l1 0.037-0.038,与 test_accuracy.py 记录的 fp8-PV 后端实测(0.99926/0.039)吻合 |
+| accuracy gate 预检 | 除 neg_5e6 外全过(cos>0.995, rel_l1≤0.046);neg_5e6 新旧**同样**不过(l1 0.087/0.120,int8 attention 表示域外,非 G1 劣化) |
+| LSE(新 vs 旧) | 典型 ≤2e-6,病理 ≤3.9e-3(test_accuracy 的 LSE 闸是 rtol 2e-2) |
+
+### 9.4 预期收益与信号
+
+- bench:softmax 是 §6 基线画像的双卡之一(tensor/XU 串行 + occupancy);
+  G1 拆掉 XU 天花板下的串行 ALU 链,预期 d128 长序列 ws/old 在 r5 基础上
+  继续抬升,短序列(softmax 占比更高)弹性更大。cutedsl 同结构包络
+  ws/cudnn ~0.95+(§7)。
+- ncu(绝对判据 duration;-k 过滤 kernel 名):`smsp__pipe_fma_cycles_active`
+  回落(dequant FMUL2 消失),XU(MUFU)占空比向 62-67% SOL 靠拢,
+  softmax 视角 selected/not-selected 结构改善;`long_scoreboard` 与 G1 无关
+  (LDTM 结构未动),不作为本轮判据。
+- G4:短序列/多 wave 形状的首块延迟略降(每 CTA 一次性 ~百 ns);G5:
+  correction 发射数减半,非关键路径,预期中性偏正。
+
+### 9.5 上机验收(下一会话,与 r5 结果合流)
+
+1. **正确性(accuracy gate)**:`SAGEATTN_SM100_WS=1` 跑
+   `pytest test/test_accuracy.py`(COS_MIN 0.99 / REL_L1_MAX 0.06 / LSE
+   rtol 2e-2)+ `test/test_ops.py` 功能项;`SAGEATTN_SM100_WS=0` 全量
+   golden `--check` 必须仍 diff=0(证明旧 kernel TU 逐字节未动,§5 的
+   SASS 恒等已在本地核过)。
+2. **ws=1 golden 差异确认**:对 r5 期 golden 跑 `--check`,预期 attn 段
+   diff(P/denom 变位),quant 段 diff=0;差异形态若超出 9.3 的包络
+   (如出现 NaN/Inf 或 cos<0.99)即回退。
+3. **bench 双闸**:cdsl_bench 22 点 + §6.5 的 ws_auto_sweep 口径,判据
+   = 相对 r5 几何均值 >1 且无形状 <0.98;auto 拐点是否下调按 §6.5 规则
+   另记。
+4. **压测**:`bench/sm100_review/ws_stress.py` 2×8000 连续发射零挂死
+   (outstanding tcgen05.ld 仍为 2,未触 A5 边界;G1 未动 LDTM 结构)。
+5. **重 dump golden**:全部通过后,`SAGEATTN_SM100_WS=1` 环境
+   `tools/compare_reference.py --dump --golden-dir <新目录>` 固化 G1 后
+   基线(双路口径不变:0 与 1 各一份);HARDWARE_CHECKLIST 记录切换点
+   commit,此后 ws 路的 bitwise gate 以新 golden 为准。
