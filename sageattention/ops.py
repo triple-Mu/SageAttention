@@ -45,6 +45,10 @@ def _fwd_fake(
 ):
     out = torch.empty(query.shape, dtype=out_dtype, device=query.device)
     if not return_lse:
+        # lse-not-requested contract: on the CUDA side (csrc/sageattn/
+        # fwd_cuda.cu) the launchers signal it with an empty CPU float tensor
+        # placeholder, which fwd_cuda maps to nullopt -> None here; keep the
+        # two sides in sync.
         return out, None
     seq_dim, nh_dim = _seq_nh_dims(tensor_layout)
     qo_len, num_qo_heads = query.size(seq_dim), query.size(nh_dim)

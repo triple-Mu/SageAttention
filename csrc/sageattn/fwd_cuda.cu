@@ -148,6 +148,11 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> fwd_cuda(const at::Tensor&    
     const float sm_scale_f32   = static_cast<float>(sm_scale);
     const int   return_lse_int = return_lse ? 1 : 0;
 
+    // Launcher lse contract: an empty CPU float tensor means "lse was not
+    // requested" (torch::empty({0}) in launch_utils.cuh); every launcher
+    // returns that placeholder when return_lse is false, and it is dropped
+    // below in favor of std::nullopt. The fake kernel mirrors the nullopt as
+    // None (sageattention/ops.py, _fwd_fake); keep the two sides in sync.
     at::Tensor lse;
     switch (plan.backend) {
 #if SAGEATTN_BUILD_SM80
