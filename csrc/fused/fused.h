@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include <torch/types.h>
 
 #include "quant_utils.cuh"
@@ -24,15 +26,15 @@
 // trailing QuantVarlen; a default-constructed one (null cu_seqlens) is the
 // dense behaviour, unchanged.
 
-void quant_per_block_int8_cuda(
-    torch::Tensor input, torch::Tensor output, torch::Tensor scale, float sm_scale, int block_size, int tensor_layout);
-
-void quant_per_block_int8_cuda(torch::Tensor      input,
-                               torch::Tensor      output,
-                               torch::Tensor      scale,
-                               int                block_size,
-                               int                tensor_layout,
-                               const QuantVarlen& varlen = {});
+// A present sm_scale folds the softmax scale into the quantized values (the
+// has_sm_scale kernel instantiation, Q's path); absent quantizes as-is.
+void quant_per_block_int8_cuda(torch::Tensor        input,
+                               torch::Tensor        output,
+                               torch::Tensor        scale,
+                               int                  block_size,
+                               int                  tensor_layout,
+                               const QuantVarlen&   varlen   = {},
+                               std::optional<float> sm_scale = std::nullopt);
 
 void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor      input,
                                              torch::Tensor      mean,

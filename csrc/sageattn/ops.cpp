@@ -64,12 +64,10 @@ void quant_per_block_int8(const at::Tensor&                input,
                     "(the fused sub-mean path has no sm_scale)");
         quant_per_block_int8_fuse_sub_mean_cuda(input, *mean, output, scale, static_cast<int>(block_size), layout_int);
     }
-    else if (sm_scale.has_value()) {
-        quant_per_block_int8_cuda(
-            input, output, scale, static_cast<float>(*sm_scale), static_cast<int>(block_size), layout_int);
-    }
     else {
-        quant_per_block_int8_cuda(input, output, scale, static_cast<int>(block_size), layout_int);
+        const std::optional<float> sm_scale_f =
+            sm_scale.has_value() ? std::optional<float>(static_cast<float>(*sm_scale)) : std::nullopt;
+        quant_per_block_int8_cuda(input, output, scale, static_cast<int>(block_size), layout_int, {}, sm_scale_f);
     }
 }
 

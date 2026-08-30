@@ -922,61 +922,13 @@ __global__ void TransposeQuantFp8Kernel(const T* __restrict__ input,
     }
 }
 
-void quant_per_block_int8_cuda(
-    torch::Tensor input, torch::Tensor output, torch::Tensor scale, float sm_scale, int block_size, int tensor_layout)
-{
-    const c10::cuda::CUDAGuard device_guard(input.device());
-
-    QuantLayout layout = parse_quant_layout(input, output, scale, tensor_layout);
-    SAGEATTN_QUANT_LAYOUT_LOCALS(layout);
-
-    auto input_dtype = input.scalar_type();
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-                CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));
-
-                dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
-
-                constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
-
-                dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
-
-                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, true, false, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
-                                                 nullptr,
-                                                 output.data_ptr<int8_t>(),
-                                                 reinterpret_cast<float*>(scale.data_ptr()),
-                                                 sm_scale,
-                                                 num_tokens,
-                                                 stride_batch_input,
-                                                 stride_seq_input,
-                                                 stride_h_input,
-                                                 0,
-                                                 0,
-                                                 stride_batch_output,
-                                                 stride_seq_output,
-                                                 stride_h_output,
-                                                 scale.stride(0),
-                                                 scale.stride(1),
-                                                 nullptr,
-                                                 0);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        });
-    });
-}
-
-void quant_per_block_int8_cuda(torch::Tensor      input,
-                               torch::Tensor      output,
-                               torch::Tensor      scale,
-                               int                block_size,
-                               int                tensor_layout,
-                               const QuantVarlen& varlen)
+void quant_per_block_int8_cuda(torch::Tensor        input,
+                               torch::Tensor        output,
+                               torch::Tensor        scale,
+                               int                  block_size,
+                               int                  tensor_layout,
+                               const QuantVarlen&   varlen,
+                               std::optional<float> sm_scale)
 {
     const c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -990,46 +942,60 @@ void quant_per_block_int8_cuda(torch::Tensor      input,
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-        DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                if (is_varlen) {
-                    CHECK_SHAPE(scale, num_heads, sage::blk_total(input.size(0), batch_size, CTA_TOKENS));
-                }
-                else {
-                    CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-                    CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));
-                }
+// The checks, launch geometry and argument list the two sm_scale flavours
+// share; only the has_sm_scale template argument and the sm_scale value
+// differ (the kernel ignores sm_scale when has_sm_scale is false).
+#define SAGEATTN_QUANT_PER_BLOCK_BODY(HAS_SM_SCALE, SM_SCALE)                                                          \
+    if (is_varlen) {                                                                                                   \
+        CHECK_SHAPE(scale, num_heads, sage::blk_total(input.size(0), batch_size, CTA_TOKENS));                         \
+    }                                                                                                                  \
+    else {                                                                                                             \
+        CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));                               \
+        CHECK_SHAPE(scale, batch_size, num_heads, at::ceil_div<int64_t>(num_tokens, CTA_TOKENS));                      \
+    }                                                                                                                  \
+    dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);                                   \
+    constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;                                   \
+    dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);                                                     \
+    QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, c_type>                            \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),                                      \
+                                     nullptr,                                                                          \
+                                     output.data_ptr<int8_t>(),                                                        \
+                                     reinterpret_cast<float*>(scale.data_ptr()),                                       \
+                                     SM_SCALE,                                                                         \
+                                     num_tokens,                                                                       \
+                                     stride_batch_input,                                                               \
+                                     stride_seq_input,                                                                 \
+                                     stride_h_input,                                                                   \
+                                     0,                                                                                \
+                                     0,                                                                                \
+                                     stride_batch_output,                                                              \
+                                     stride_seq_output,                                                                \
+                                     stride_h_output,                                                                  \
+                                     stride_batch_scale,                                                               \
+                                     stride_h_scale,                                                                   \
+                                     varlen.cu_seqlens,                                                                \
+                                     block_size);                                                                      \
+    C10_CUDA_KERNEL_LAUNCH_CHECK()
 
-                dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);
-
-                constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;
-
-                dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
-
-                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, false, c_type>
-                    <<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
-                                                 nullptr,
-                                                 output.data_ptr<int8_t>(),
-                                                 reinterpret_cast<float*>(scale.data_ptr()),
-                                                 0.0f,
-                                                 num_tokens,
-                                                 stride_batch_input,
-                                                 stride_seq_input,
-                                                 stride_h_input,
-                                                 0,
-                                                 0,
-                                                 stride_batch_output,
-                                                 stride_seq_output,
-                                                 stride_h_output,
-                                                 stride_batch_scale,
-                                                 stride_h_scale,
-                                                 varlen.cu_seqlens,
-                                                 block_size);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // Two dispatch nests rather than one branch inside the innermost body:
+    // kernels land in the cubin in (reverse) first-instantiation order, so
+    // this keeps the pre-merge order - every has_sm_scale=true instance
+    // before every false one - and with it byte-identical SASS.
+    if (sm_scale.has_value()) {
+        DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+            DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
+                DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, { SAGEATTN_QUANT_PER_BLOCK_BODY(true, *sm_scale); });
             });
         });
-    });
+    }
+    else {
+        DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+            DISPATCH_BLOCK_SIZE(block_size, CTA_TOKENS, {
+                DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, { SAGEATTN_QUANT_PER_BLOCK_BODY(false, 0.0f); });
+            });
+        });
+    }
+#undef SAGEATTN_QUANT_PER_BLOCK_BODY
 }
 
 void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor      input,
