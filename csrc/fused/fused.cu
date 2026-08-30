@@ -974,10 +974,13 @@ void quant_per_block_int8_cuda(torch::Tensor        input,
     dim3 grid(at::ceil_div<int64_t>(num_tokens, CTA_TOKENS), num_heads, batch_size);                                   \
     constexpr int num_pack_per_thread = (CTA_TOKENS * (HEAD_DIM / 8) + 1023) / 1024;                                   \
     dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);                                                     \
-    auto* kernel = is_varlen ? QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, true,   \
-                                               c_type> :                                                               \
-                               QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, false,  \
-                                               c_type>;                                                                \
+    /* The per-block family stays on the kVarlen=true instance even for dense  \
+       calls: on sm_90 ptxas rebuilds the split-off dense instance's pack      \
+       guards into serial branch regions and halves the LDG parallelism        \
+       (plain blk128 measured 21% slower on H200; hyper01:/workspace/p2-sm90). \
+       The kVarlen instance is byte-identical to the pre-split kernel. */      \
+    auto* kernel =                                                             \
+        QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, HAS_SM_SCALE, false, true, c_type>;                \
     kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),                                    \
                                      nullptr,                                                                          \
                                      output.data_ptr<int8_t>(),                                                        \
@@ -1067,9 +1070,11 @@ void quant_per_block_int8_fuse_sub_mean_cuda(torch::Tensor      input,
 
                 dim3 block(CTA_TOKENS * (HEAD_DIM / 8) / num_pack_per_thread);
 
+                // Per-block family: dense stays on the kVarlen=true instance (see
+                // the H200 note in SAGEATTN_QUANT_PER_BLOCK_BODY; sub_mean blk128
+                // measured 3.4% slower at s32768 when split).
                 auto* kernel =
-                    is_varlen ? QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, true, c_type> :
-                                QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, false, c_type>;
+                    QuantInt8Kernel<HEAD_DIM, CTA_TOKENS, num_pack_per_thread, false, true, true, c_type>;
                 kernel<<<grid, block, 0, stream>>>(reinterpret_cast<c_type*>(input.data_ptr()),
                                                  reinterpret_cast<c_type*>(mean.data_ptr()),
                                                  output.data_ptr<int8_t>(),

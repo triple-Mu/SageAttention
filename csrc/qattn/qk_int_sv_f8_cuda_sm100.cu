@@ -671,20 +671,21 @@ Sm100WsMode sm100_ws_mode()
 }
 
 // Heuristic for kAuto, judged per call (qo_len is a runtime value). The ws
-// kernel wins only on head_dim 128 with long rows: r3 B200 sweep has it
-// 1.006-1.027x faster on 10/10 shapes at qo_len >= 16384, but slower at
+// kernel wins only on head_dim 128 with long rows: r3/r4 B200 sweeps have it
+// 1.006-1.027x faster at qo_len >= 16384 non-causal, but slower at
 // s <= 4096 (grid.x = qo_len/256, half the classic kernel's, so small grids
 // underfill the 148-SM wave) and 8-9% slower on d64 (only 384 of the 512
-// TMEM columns used). 16384 is the measured all-positive lower bound (no
-// sample between 4096 and 16384; conservative).
-bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout)
+// TMEM columns used). Causal crosses over later (auto/old 0.987-0.991 at
+// s16384, >= 1.006 at s32768; r4 bench, logs-w4), hence the higher causal
+// cut. Both are the measured all-positive lower bounds of their sweeps.
+bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout, int is_causal)
 {
     if (query.dim() != 4) {
         return false;  // malformed input: let the classic parse report it
     }
     const int64_t head_dim = query.size(3);
     const int64_t qo_len   = (tensor_layout == 0) ? query.size(1) : query.size(2);
-    return head_dim == 128 && qo_len >= 16384;
+    return head_dim == 128 && qo_len >= (is_causal ? 32768 : 16384);
 }
 
 }  // namespace
@@ -703,7 +704,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                                                         int           return_lse)
 {
     const Sm100WsMode ws_mode = sm100_ws_mode();
-    if (ws_mode == Sm100WsMode::kOn || (ws_mode == Sm100WsMode::kAuto && sm100_ws_auto_pick(query, tensor_layout))) {
+    if (ws_mode == Sm100WsMode::kOn
+        || (ws_mode == Sm100WsMode::kAuto && sm100_ws_auto_pick(query, tensor_layout, is_causal))) {
         return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(query,
                                                             key,
                                                             value,

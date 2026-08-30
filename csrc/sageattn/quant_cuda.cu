@@ -57,6 +57,12 @@ inline int64_t fused_v_quant_max_tokens(c10::DeviceIndex device)
     if (cc == CC{8, 9}) {
         return 12288;
     }
+    if (cc.major == 10 || cc.major == 11) {
+        // B200 sweep (bench/p4_vfuse_sweep.py, logs-w4): fused wins the whole
+        // 4096..24576 range (0.69-0.87x) with no crossover in sight; 24576 is
+        // the measured lower bound. sm110 inherits the sm100 value.
+        return 24576;
+    }
     return 4096;
 }
 
