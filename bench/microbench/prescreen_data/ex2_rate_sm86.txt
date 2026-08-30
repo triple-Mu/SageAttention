@@ -1,0 +1,29 @@
+# bench/microbench/ex2_rate.cu @ sm_86, nvcc 13.3, GPU idle (0 compute apps)
+# nvcc -O3 -std=c++17 -arch=sm_86 ex2_rate.cu
+device: NVIDIA GeForce RTX 3080 Ti Laptop GPU (sm_86, 58 SMs, 1.40 GHz boost)
+ffma_f32  :    1.180 ms    9898.7 Ginstr/s  122.34 instr/SM/clk  122.34 elem/SM/clk
+ex2_f32   :    9.028 ms    1293.5 Ginstr/s   15.99 instr/SM/clk   15.99 elem/SM/clk
+ex2_f16x2 :   18.054 ms     646.8 Ginstr/s    7.99 instr/SM/clk   15.99 elem/SM/clk
+cvt_f16x2 :    2.296 ms    5086.2 Ginstr/s   62.86 instr/SM/clk  125.72 elem/SM/clk
+
+# SASS lowering of ex2.approx.f16x2 (one PTX op, timed loop body), all archs:
+#   sm_86 / sm_89 / sm_90a / sm_100a: 2x MUFU.EX2.F16 (per-half) + 1x PRMT repack
+#   -> no packed f16 MUFU exists on any target arch; element rate parity with
+#      ex2.approx.f32 is structural, not a tuning artifact.
+# opcode counts per arch (whole benchmark binary):
+== sm86 ==
+    128 F2FP.PACK
+    128 MUFU.EX2
+    256 MUFU.EX2.F16
+== sm89 ==
+    128 F2FP.F16.F32.PACK
+    128 MUFU.EX2
+    256 MUFU.EX2.F16
+== sm90a ==
+    128 F2FP.F16.F32.PACK
+    128 MUFU.EX2
+    256 MUFU.EX2.F16
+== sm100a ==
+    512 F2FP.F16.F32.PACK
+    512 MUFU.EX2
+   1024 MUFU.EX2.F16
