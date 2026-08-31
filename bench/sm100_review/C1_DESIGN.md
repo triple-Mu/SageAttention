@@ -961,7 +961,7 @@ w7a 全绿)+ varlen A0(红,SM100_VARLEN_DESIGN §6.4.5)⇒ f591296 原样
 即 65d30f7 态);ballot(65d30f7)与 varlen fence(f3e617b)保留;
 sm100 varlen 按 §6.4.5 撤出 plan 等 A3。
 
-## 12. A′:RESCALE_THRESHOLD 惰性 max(wave17 实现;上机待验收)
+## 12. A′:RESCALE_THRESHOLD 惰性 max(wave17 实现;wave18 B200 判负,建议 revert)
 
 BEYOND_CUDNN_PLAN §4.5 的精度换性能项(既定政策,双级门禁):块 max 对
 running max 的抬升不超过阈值 T(log2 域)就不更新 row_max,o_scale 精确
@@ -1075,3 +1075,61 @@ perf 预期:ballot 命中率 32 块 trip(=s4096)0.13→1.00、128 块
 | ncu(b4h32s16384c0) | duration 下降为准;佐证:correction 视角 issued inst 崩落(rescale 全跳)、softmax 视角 long_scoreboard(TMEM 口争用)回落 |
 | 重 dump golden | 全过后 WS=1 固化到新轨 `golden-sm100-lazymax`(WS=0 轨仍为 golden-sm100);HARDWARE_CHECKLIST 记切换点 commit,此后 ws 路 bitwise gate 以新轨为准 |
 | 回退 | 任一硬闸失败即 kernel 单 commit revert(sim/doc 不连坐) |
+
+### 12.5 wave18 上机实测(B200;bench 闸判负,建议 revert 80934f2)
+
+口径:tree sage-w8 = 72017e5(A′ T=4 + A3 varlen 修复 + ballot;
+`TORCH_CUDA_ARCH_LIST=10.0a` + PRUNE=OFF)vs ballot 态基线 sage-w7a =
+65d30f7(80934f2 的父树 2903e45 与它的 dense ws TU 逐字节同,差异仅
+varlen `#ifdef` 内的 fence 与 python 门控)。B200 单卡独占
+umbriel-b200-018(JID 4033168,pytorch_26.07-py3,torch 2.13.0a0 nv26.07 /
+CUDA 13.3 / cudnn 9.24,driver 595.58.03)。原始数据:集群
+`SageAttention_refactor/logs-w18/`(bench 汇总以
+`bench_gate_corrected.txt` 为准,`bench_gate.txt` 是跑批当场一版列名错位
+的旧表)。
+
+| 项 | 判据(12.4) | 实测 |
+|---|---|---|
+| golden WS=0(golden-sm100) | diff=0 | `ok=2082 diff=0 missing=0`(skipped=198 RETIRED、extra=25 varlen equiv,均预期)→ 过 |
+| golden WS=1(golden-sm100-g1ws) | 预期 diff,圈在 ws 路,无 NaN/Inf | `ok=1849 diff=258 missing=0 extra=0`;分布 attn 198(hd128/hd64 各 99)+ e2e 60(hd64/96/128 各 20),quant 与非 sm100 家族 0 —— 恰为 WS=1 强制路由(kOn 不分 head_dim)的全部 case;finite 扫描(s1024..32768 × causal 双态 + zero-amax)全 ok → 形态符合 |
+| accuracy gate(WS=1) | pytest 全过,cos>0.99 / rel_l1<0.06 | 54 passed / 8 skipped;hd128 最差 cos 0.999213 / rel_l1 0.039575(nc per_warp qo4096),causal 0.99937/0.0376,s16384 长 trip 0.999229/0.0392;与 12.2 sim 同带(randn 附加 rel_l1 ≈ +0.0006)→ 过 |
+| varlen 回归(A3+lazy 组合树) | pytest 绿 | varlen 三文件 207 passed / 97 skipped;全套 test/ 436 passed / 395 skipped;ragged isolate a2b 臂 1×3000 零挂死(wave16 基线 10/10 在 80 launch 内击中)→ 过 |
+| bench 22 点 vs ballot 态 | geomean >1.005 且无形状 <0.995 | **geomean 0.9967,min 0.9767(d64 nc s16384),6/22 形状 <0.995,仅 5/22 >1.0 → FAIL** |
+| 压测 | 零挂死 | SWEEP + s32768 8000×2(658 s)、s139264 300×2(379 s)、a2b 3000、事后 dense 控制臂:全零挂死 → 过 |
+| ncu(b4h32 c0,lazy vs ballot 同场) | duration 下降为准;correction issued 崩落佐证 | duration 持平偏负:s4096 992.8 vs 991.7 µs(+0.11%)、s16384 13.80 vs 13.77 ms(+0.22%;wave16 ballot 锚 13.71,场漂 +0.4%);`smsp__inst_executed` lazy 反而 +0.40% / +0.29% —— **correction issued 无崩落** |
+| 重 dump golden | 全过后执行 | 未执行(bench 闸 fail);ws 路 bitwise 轨维持 `golden-sm100-g1ws`,无 `golden-sm100-lazymax` |
+
+分段(时间比几何均值,>1 = 分子侧快;lazy = w8 WS=1,ballot = w7a WS=1):
+
+| 段 | lazy/ballot | lazy/old | lazy/cudnn | ballot/cudnn(同场) |
+|---|---|---|---|---|
+| 全 22 点 | 0.9967 | 1.2058 | 0.8751 | 0.8780 |
+| d128(20) | 0.9986 | 1.2328 | 0.9060 | 0.9072 |
+| s≥32768(8) | 0.9970 | 1.2200 | 1.0345 | 1.0376 |
+| 其中 causal(4) | 0.9985 | 1.2474 | 1.0603 | 1.0619 |
+| s=16384(5) | 0.9943 | 1.1567 | 0.8760 | 0.8811 |
+| s=4096(5) | 0.9960 | 1.1574 | 0.7233 | 0.7262 |
+| s=1024(4) | 1.0001 | 1.3058 | 0.7934 | 0.7933 |
+| d64(2) | 0.9783 | 0.9662 | 0.6187 | 0.6324 |
+
+**谷地未兑现**:主攻的两处(§12 导言)nc s4096 d128 对 1.0039、nc s16384
+d128 对 0.9993 —— 预期 +1~3%,实际 +0.4% / −0.1%;s=16384(5) 段反而
+−0.57%。最大回退在 d64(−2.0 / −2.3%,round 间散布 ≤0.08%,是信号不是
+噪声)与 nc 长序列(s131072 −0.6%)。注:本场 cudnn 相对 wave16 偏快
+~1-2%(w16 谷地 0.746/0.896 对应本场 ballot/cudnn 0.7262/0.8811),
+lazy/ballot 同场对比不受影响。
+
+**归因**:ncu 显示 correction issued 无崩落(inst_executed 反而涨),即
+bench 协议张量上 A′ 的边际命中集近乎空集——否则 correction 指令数应显著
+下降。与刻度分布一致的读法:协议的 q/k_scale 是 randn(相邻块 max 在
+log2 域跨多个 binade),抬 max 的块普遍越过 T=4,不抬 max 的块 ballot 本
+就命中;12.2 sim 的命中率模型建立在真实 quant 刻度(ls 紧凑)上,协议张
+量不满足其前提。同一杆秤下 A′ 只显出 softmax max 更新点 select 链的纯成
+本(FMNMX→FADD+FSETP+FSEL,12.3),softmax 占比最高的 d64 最重。精度侧
+sim 模型经 accuracy gate 实证(误差带吻合),perf 侧的「ballot 命中率 ×
+分段收益」乘数外推被证伪。若要重启,先在真实 quant 刻度的 e2e 口径直接
+计量 duration,并解决 d64 / nc 长序列的回退。
+
+**判定**:12.4 的 bench 硬闸失败 ⇒ 按预设回退路径,**80934f2 单 commit
+revert**;c398bb5(sim)与 §12 文档保留,本节即判负记录。golden 轨不切
+换,后续 ws 路 bitwise gate 仍对 `golden-sm100-g1ws`。
