@@ -1357,3 +1357,153 @@ lse=false,mask 两态,即 auto 路径的默认 gran)。复现:对
 4. ncu(s16384 c1):vec_full 自旋 19.7/3.4 是否回平(参照 ws 的
    14.7/7.9);softmax mio 11% 的去向;kv_empty[1] 5.3% 的去向;顺带
    W=1 c1 斜率复测(13.6.1 的遗留归因)。
+
+## 14. wave22:vec_full 交付时机修复——int-domain row max + issue wall(实现完成,本地门禁全过;上机待验收)
+
+攻坚对象:§13.5 的遗留 —— c0 稳态里 correction 自旋 vec_full 21.3%
+(s4096/s16384 同值,persistent 只吃序幕没动它)。改动两件套,均落在
+softmax 步内,barrier 计数/phase/事件序零变化(账本只改措辞),
+**golden 双轨 diff=0 硬判据**(值序逐位不动的论证见 14.4)。
+
+### 14.1 自旋链定位:21.3% 是 SASS 调度伪影,不是管线本性
+
+源码结构(G1 后)本来就是任务书候选 (a):vec=(m_prev,row_max) 的
+store+arrive 在 row_max 定案点、exp2/pack 段之前。但 baseline SASS
+(fc03183,nvcc 13.3,persist sm_100a,hd128 per-warp 非 causal 实例的
+稳态步)里 ptxas 把这条独立链**沉进了 pack 尾部**:STTM.x2 出现在 F2FP
+突发中段、距 P store 仅 ~25 条;LDTM→STTM.x2 窗口共 ~510 条指令,构成:
+
+| 窗口内 op(baseline) | 条数 |
+|---|---|
+| I2FP(行转换) | 128 |
+| MUFU.EX2 | **128(= 全部)** |
+| FFMA2 / FADD2 | 64 / 44 |
+| F2FP(e4m3 pack) | 46 |
+| FMNMX(max 树) | 87 |
+
+即:**整个 exp2 突发和近半 pack 都发射在 vec 交付之前**——发射序=程序序
+(in-order issue),vec_full 实际完成点 ≈ s_empty,correction 拿到
+o_scale 的时间比设计晚一整个 XU 突发。G1「max 定案即交付」从未在 SASS
+兑现;21.3% 自旋是这个 sink 的直接后果。ptxas 没有 mbarrier 消费者的
+概念,直线基本块内它只按局部 ILP 排,arrive 无依赖压力就被垫到后面;
+§10.3(descriptor 链跨 wait 前置)是同一性质的既往案例。
+
+cudnn DSL 对照(prefill_d128_f16_sm100.py):stat 交付点与我们同位
+(max 定案后、行 rescale/exp2 前,:1360-1372 alpha 算好即 arrive
+mb_stat_full);它的 f16 路径 S 天生 f32,结构性没有我们的 128 I2F;
+correction 消费侧只 ld 一个 alpha 字。它 correction 等待更低的两个来源
+(无转换负担、交付语义真正前置)本改动都对齐。
+
+### 14.2 候选算账(任务书三项 + 一项附加)
+
+* **(a) vec store+arrive 前移到 row_max 定案点**:字面版 G1 已做,被
+  ptxas 收回。真正要做的是让它在**发射序**上兑现,拆成两件:
+  1. **int-domain row max**:行在 int32 域驻留,max 树用整数 IMNMX,
+     树根一次 I2F 回 f32 再乘 dequant——vec store 的依赖链从
+     「128 I2F + FMNMX 树」缩到「IMNMX 树 + 1 I2F」,128 个行 I2F 挪进
+     exp2 段(逐 quad 融进 packed fma 的 a 操作数,同一条 I2F 换了位置)。
+  2. **issue wall**:arrive 之后插一个不透明恒真分支(gate =
+     bar_vfull 的 shared-window 地址,按 bars 布局恒非零;过空
+     `asm volatile("+r")` 遮 NVVM,运行期地址值 ptxas 不可折叠),
+     pack 段整体对它控制依赖 → 任何一条都不能发射到 arrive 之前;
+     分支本身也不能翻过 arrive(翻了 arrive 变条件执行,非法)。
+     选中,即本改动。
+* **(b) cudnn 的 chunk0 合并 correction 计数**(§11.2 旧候选):判负不做。
+  P-chunk(dfbeb24)已实证「每步两次完成 + 常量 parity」在真机 tile 0
+  即死锁;合并版还要把 corr_empty 语义搬进 s_empty 一侧,corr_full/
+  corr_empty/s_empty 三条 pipe 的计数与 H3/H6 链全部重写——账本重写面
+  与 P-chunk 同级,收益只是 mma 省一次 wait spin。
+* **(c) ballot 全跳时 correction 免等 vec_full**:判负不做。「本块无
+  rescale」这条信息在 softmax 的 row_max 定案点才产生——与 vec_full 的
+  完成点是同一时刻,侧信号没有任何提前量;唯一节省是 correction 的
+  vec ld + exp2(见下条,同样中性),却要新增信号通道与 vec_empty 的
+  节流分析。
+* **(附)alpha 载荷(cudnn 同款,vec 改存 o_scale 单字)**:评估为中性
+  不做。o_scale 本身要一次 MUFU.EX2:存 alpha 则这次 EX2 进生产侧
+  (store 依赖它,交付晚 ~一个 MUFU 延迟),存 (m_prev,row_max) 则进
+  消费侧(correction 等后自己算)——vec_full→corr_empty 端到端链路
+  长度不变,只省 correction 每步 1 EX2 + x2→x1 的 TMEM 口流量
+  (≈ ballot 已省流量的 1.5%,不值得动 vec 契约)。
+
+### 14.3 设计落点(实现即此)
+
+两个 TU 同改(`qk_int_sv_f8_cuda_sm100_ws.cu` /
+`qk_int_sv_f8_cuda_sm100_ws_persist.cu`,softmax 步共 4 处):
+
+1. `ws::tree_imax / tree_imax_cls`:tree_fmax 的整数孪生(同形状树)。
+2. 稳态步转换环删除,行驻留 int32;peeled 步(is_last)原样保留 f32
+   转换+mask+fmax 树(-inf 哨兵在 int 域没有等价 fold 语义,见 14.4)。
+3. max 块按 `is_last` 分叉:f32 树 / int 树 + 树根 I2F。
+4. pack 环 a 操作数经 `col_f32`(peeled:`__uint_as_float`;稳态:
+   `__int2float_rz`,即被挪走的那 128 条 I2F)。
+5. arrive 后 issue wall:`vec_gate = bar_vfull` 过空 volatile asm,
+   `if (vec_gate == 0) return;`(lambda 恒不走的早退)。
+
+### 14.4 bit-exact 论证(golden 硬判据的依据)
+
+* **row_max 链**:int32→f32 对 |S| < 2^24 精确且严格单调(S = int8×int8
+  ×128 累加,|S| ≤ ~2.1e6),故 I2F(整数树 max) 与「先逐元素 I2F 再
+  fmax 树」逐位同值(相等元素转换后仍相等;int 0 → +0.0,无 -0.0 来源;
+  非 peeled 步无 -inf/NaN 来源)。m_deq = dequant × 该值,乘法输入逐位
+  同 → 输出逐位同。per-thread 粒度逐 class 同理,class 间 fmaxf fold
+  形状未动。
+* **P/d_sum 链**:pack 环里 `__int2float_rz(raw)` 产出的 f32 与旧转换环
+  产出的是同一个值(同一条指令换位置),packed fma/exp2/pack/d_sum 的
+  输入序列逐位不变。
+* **peeled 步**:整段原样(转换+mask+f32 树),mask 语义零变化。int 域
+  不可行的原因记档:mask 哨兵若用 INT_MIN,I2F 后是 -2^31 而非 -inf,
+  全 class 被 mask 时 m_deq = d×(-2^31) 是有限值,-5e6 floor 的取舍与旧
+  行为(-inf → floor 恒赢)出现分歧 → row_max 可能改位。
+* **issue wall**:纯控制流,gate 恒非零(bar_vfull = bars 基址 +
+  (kBarVecFull+tile)×8 ≥ 112,shared-window 地址),真机永不早退;
+  唯一新增指令 ISETP+BRA(+ptxas 的 WARPSYNC/BSSY 重汇合),无浮点。
+  分支对 warpgroup 一致(bar_vfull warpgroup-uniform),其下 tcgen05
+  ld/st 的 .aligned 约定成立(kernel 头部 divergence audit 口径)。
+* **账本影响**:vec_full/s_empty/vec_empty 的完成者、次数、phase、
+  事件相对序全部不变(wall 在 arrive 之后、pack 之前,不跨任何 barrier
+  边界);H3/H8/H9 的链条逐字沿用,仅 §2 的步内措辞更新(int 驻留、
+  wall 位置)。
+
+### 14.5 本地门禁(全过;nvcc 13.3,复现命令同 §5/§13.3)
+
+| 项 | 结果 |
+|---|---|
+| ptxas,ws + persist probe 各 4 实例 × sm_100a/sm_110a | 全部 0 spill / 0 stack / 入口 128 reg;无 C7508 |
+| USETMAXREG 标记 | TRY_ALLOC 0xc0 / DEALLOC 0x58 / 0x28 各 ×4,两 TU 两 arch 不变 |
+| softmax 区峰值(nvdisasm -lrm=count,USETMAXREG 分段) | persist sm_100a 160-166(基线 159-163),sm_110a 172-176;≤191 预算 |
+| correction/other 区 | correction 峰值 55-56 不变;两区 SASS 未触及 |
+| 代码量 | persist sm_100a 全 TU +44 条(≈ 每步 ISETP+BRA+WARPSYNC+BSSY ×4 实例) |
+
+SASS 结构自证(persist sm_100a,hd128 per-warp 非 causal,稳态步):
+
+| 口径 | baseline | wave22 |
+|---|---|---|
+| LDTM→STTM.x2(vec)窗口 | ~510 条 | **~77 条** |
+| 窗口内 I2FP / MUFU.EX2 / F2FP | 128 / 128 / 46 | **1 / 0 / 0** |
+| 窗口内 max 树 | 87 FMNMX | 85 VIMNMX(3) |
+| arrive 后第一条 pack 指令 | (pack 已基本发完) | `@!P0 BRA` 之后才开始 I2FP/FFMA2/EX2 突发 |
+
+顺带的正向伪影:ptxas 把 o_scale 的 EX2 与 denom 的 FMUL 也排到了
+arrive 之后(它们不在 store 依赖链上)——交付点比源码序还早两条。
+
+### 14.6 上机判据(B200;口径同 §13.4,预期下一会话)
+
+1. **golden 三轨**:WS=0 对 golden-sm100(旧 TU 未动,应 ok=2082
+   diff=0);WS=1 对 golden-sm100-g1ws、WS=1+PERSIST=1 对同 golden
+   ——**diff=0 硬判据**,出 diff 即 14.4 的论证被证伪,整改动 revert
+   定位,不得降级 accuracy 口径。
+2. **压测**:ws_stress SWEEP 2k-128k×两态 + s32768 2×8000 + s139264、
+   W=1/trip 退化(s256/s512/s1024 b1h1)零挂死。新增关注面 = wall 分支:
+   若挂死,症状应落在 mma 的 s_empty spin(softmax 假早退会漏 P store
+   ——恒真 gate 下不可能,但这是排查入口)。
+3. **bench 22 点** vs fc03183 同场:geomean >1.005 且无形状 <0.995;
+   主看 **c0 d128:s4096(wsp/cudnn 0.878→?)与 s1024(0.926→?)**
+   ——§13.5 的两个 <1.0 段位;s≥16k 三段(1.012/1.059/1.096)不回退。
+   c1(非 persist ws)同场顺带采:vec 交付提前对 §13.5 的 19.7/3.4
+   偏斜与 0.65-0.88 段位可能同向有益,但不设判据。
+4. **ncu(b4h32s4096c0,PERSIST=1)**:主判据 correction 视角 vec_full
+   自旋 **21.3% 回落**(样本按 PHASECHK 站点归属,方法同 wave16/20);
+   佐证 duration 928us 下探、eligible 0.508 上探;mma 视角
+   wait_corr_empty 自旋同向回落(vec 早到 → rescale 早完 → PV 早发)。
+   若 vec_full 自旋回落但 duration 不动,说明 correction 链不是当前
+   critical loop,把余量记档、改动保留(无回退理由,交付语义本就该此)。
