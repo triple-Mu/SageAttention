@@ -22,6 +22,11 @@ XU%;「同结构差距」= 与 cutedsl 分支(同 16-warp WS 结构的 CuTe-DSL 
 > 态 d64 12 点 auto/old geomean 1.0590、12/12 ≥1.03,d128 22 点与
 > wave20/23 参照带逐点吻合(max dev 0.35pp);auto/cudnn 全段战线图在
 > §8.6.3。
+>
+> wave26 更新:G3 判定收官(§9)——wave24 后剩余 mio 1.016 的站点归属
+> 99% 在 MUFU.EX2,LDTM/STTM 全家族 mio=0、驻留 ≤0.42%,G3 注销
+> (定位 A5 也无收益兑付);d64 余量的下一步只剩 C2 类结构或算法域减
+> EX2。
 
 1. **d64 输 cudnn 的根子是算术强度,不是 tile 几何**。head_dim 减半把 FLOPs 砍
    半,但 int8-QK 的 softmax XU 工作量(I2F 1 + EX2 1 + e4m3 pack 0.5 ≈ 2.5
@@ -188,7 +193,8 @@ TMEM 口在 384 列集中脚印下的争用变化。经典 kernel 无此反常(0
 
 1. **d64 ncu 首采**(零风险,§5):裁决 §1.4 反常与 G3/编译器归因,后续一切
    立项的证据基础。w11/w14/w16 的 ncu 全部只有 d128(附录 C),d64 从未采过。
-2. **A5 根因定位 → G3(4×x32 批量 S drain)**。A5 红线(4+ outstanding
+2. **A5 根因定位 → G3(4×x32 批量 S drain)**(**wave26 注销:G3 无收益
+   兑付,不再立项,§9**)。A5 红线(4+ outstanding
    tcgen05.ld 挂死,根因未定位)的黑名单条目自带翻案条件「根因定位」;wave16
    已把可靠的死锁调试姿势记档(cuda-gdb from-launch + SIGINT 打断,attach 在
    ComputeLab 拿不到 CUDA 态,C1_DESIGN §11.4)。做法:probe TU 复现 A5(批量
@@ -572,7 +578,7 @@ exp2(128×EX2)保持在前移 wait 之后,错相直接作用于本步 EX2 段。
 
 | 本文候选 | 相关黑名单条目 | 对照结论 |
 |---|---|---|
-| C0.2 G3 批量 S drain | A5(4+ outstanding tcgen05.ld 挂死,根因未定位) | 合规路径:黑名单自带翻案条件「根因定位」,M1 做的正是定位;定位失败则只做 2-outstanding 交错(不越界) |
+| C0.2 G3 批量 S drain | A5(4+ outstanding tcgen05.ld 挂死,根因未定位) | 合规路径:黑名单自带翻案条件「根因定位」,M1 做的正是定位;定位失败则只做 2-outstanding 交错(不越界)。**wave26 注销:LDTM 站点 mio=0、驻留 ≤0.21%,定位成功也无收益,§9** |
 | C0.2 交错 lever | ptxas 复沉(r4/r5 两轮实证,源级不可控) | 已知限制,方案本身即针对它(填独立工作);bit-exact 论证重做 |
 | C1a q_stage=4 | 无直接条目;P-chunk(wave16 首块死锁)为同类 barrier 改造前科 | 不立项主因是收益机制缺失,前科佐证风险 |
 | C1b CTA_K=256 | 两遍 TMEM 读 0.887×(C1_DESIGN §6.1) | 寄存器账必然退回两遍读,视同已判不可行 |
@@ -824,6 +830,62 @@ stress_*.log、bench-d64/、bench-d128/、build.log、clocks.csv)、脚本
 `scripts-w25/`(w25_orch.sh、w25_all.sh、w25_routing.py)、树
 `sage-w14.tar.gz`(2b652df)。
 
+## 9. wave26:G3 判定——d64 的 mio 余量里没有 LDTM/STTM 的份,G3 不立项
+
+口径:与 C1_DESIGN §16 同一 alloc(JID 4040318,umb-b200-248,tree
+sage-w14 = 2b652df ≡ feat/varlen e3e65b5 代码态,即 wave24 vec_full 交付
+KEEP 之后的现产树);ncu 显式 `--clock-control base`(1.12 GHz),
+d64 s16384 nc b4h32,ws 与 persist 同场各一发 `--set full`(+XU pass);
+w24 的 ws 发(自由 boost)作跨会话对照。数据 `logs-w26/ncu/
+{ws,wsp}_d64_s16384_c0.*`、`xu_*`;分析 `scripts-w26/w26_analyze_mio.py`。
+
+问题(wave24 遗留):vec_full 交付 KEEP 后 mio_throttle/issue 仍 1.016
+(XU 侧收益、mio 未降),G3(S drain 批量 4×x32,受 A5 红线挡)或其他
+MIO 消费者是否还值得立项。
+
+**同场对(锁频)**:
+
+| 指标 | ws d64 | wsp d64 |
+|---|---:|---:|
+| Elapsed cycles | 26.73M | 25.97M(−2.8%) |
+| mio_throttle/issue | **1.016**(逐位复现 w24) | 0.918 |
+| eligible/sched | 0.537 | 0.581 |
+| XU 管线指令 | 1091.2M | 1091.3M(同) |
+
+**stall_mio 的 SASS 站点归属**(source 页逐条按 opcode 家族汇总;
+样本 = warp 驻留):
+
+| 家族 | ws:样本(占比)/其中 mio | wsp:样本(占比)/其中 mio |
+|---|---|---|
+| MUFU(=EX2 段) | 203.3K(21.7%)/ **96.1K** | 197.1K(22.1%)/ **85.3K** |
+| LDTM.x64(S drain ×2) | 1.3K(0.14%)/ **0** | 1.9K(0.21%)/ **0** |
+| LDTM.x32 + STTM 全家 | 2.1K(0.22%)/ 0 | 3.7K(0.42%)/ 0 |
+| LDG(wsp 的 k_scale) | 0.9K(0.10%)/ 0 | 1.4K(0.16%)/ 0 |
+| LDS/STS | 0.5K / 0 | 0.2K / 0 |
+| **stall_mio 合计** | 96.9K(其中 EX2 占 **99.2%**) | 86.0K(**99.1%**) |
+
+- **G3 的猎物不存在**:S drain(LDTM.x64)在两条产线 kernel(auto 的
+  nc→wsp、causal→ws)上 mio=0、全家族驻留 0.14-0.21%(其中 wait
+  约千样本 = 被遮蔽的固有延迟)。把 2×x64 改 4×x32 批发所能回收的
+  暴露窗口上限 ≤0.5% 量级,而它要求先解 A5(4+ outstanding
+  tcgen05.ld 挂死,根因未定位)并守 A3(排空 ld/wait 区间禁混
+  mask 指令,SM100_VARLEN_DESIGN 6.4.6)。**判定:G3 不立项,黑名单
+  维持且翻案条件收紧**——§3/§4 里「A5 根因定位 → 解锁 G3」的路线注销
+  (定位成功也没有收益兑付),A5 根因定位不再有 G3 侧的立项理由;
+  两条经验红线均不触碰(无边界问题,因为不越界)。
+- **mio 1.016 的真身**:99% 落在 128 个 MUFU.EX2 发射点 = XU 发射带宽
+  的 operating point,不是待修故障。旁证:cudnn d64 在 XU 68.8% 时
+  mio/issue 0.63(§7.5),cudnn d128 c1 在赢我们 1.46× 时 mio 0.68
+  (C1_DESIGN §16.2)——mio_throttle 高低与胜负不同向,追它本身没有
+  意义。wave24 的收益路径(把 XU 突发从交付窗口挪走)已把 wait/issue
+  下探(MUFU 家族 wait 103K→71.5K,w19→w26 ws),eligible
+  0.484→0.537。
+- **d64 剩余余量的去处**(§1.2 roofline 与 §7.2 归因维持):同结构
+  可追的只剩发射平滑度(EX2 同相突发),弹性在 C2 类结构(2 CTA/SM
+  双独立流,§3.4)或减少 EX2 本身(算法域,fp8-QK/软 exp2 均在
+  BEYOND_CUDNN_PLAN 不进本役清单);M1(C0.2)条款在 §8.5 兑现后,
+  本节把 C0.2 的 G3 支线正式关闭。
+
 ## 附录 B:per tile-block 归一化(§1.4)
 
 定义:SM·µs per tile-block = duration_ms × 148 ÷ N_unit × 1000,
@@ -834,6 +896,10 @@ tile-block 比值 1.041/1.023 = 1.018,与 bench 的 ws/old 0.982 互为倒数。
 
 ## 附录 C:数据来源
 
+- **w26(§9;C1_DESIGN §16 同 alloc)**:集群
+  `SageAttention_refactor/logs-w26/`(ncu/、scan/、STAGE、10_ncu.log)、
+  脚本 `scripts-w26/`(w26_orch.sh、w26_ncu.sh、w26_analyze_mio.py、
+  w26_details.py);树复用 sage-w14。
 - **w25(§8.6)**:集群 `SageAttention_refactor/logs-w25/`(g_*.txt、
   routing.log、stress_*.log、bench-d64/、bench-d128/)、脚本
   `scripts-w25/`、树 `sage-w14.tar.gz`(2b652df)。

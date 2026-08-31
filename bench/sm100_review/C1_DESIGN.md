@@ -1651,3 +1651,128 @@ wave23 收口:
   d64-only gate 重启(§14 两件套 gate 到 head_dim==64,d128 SASS 逐字节
   不动),**B200 判 KEEP**(d64 ws/old 0.9575→1.0302、wsp/old
   0.9399→1.0537;d128 抽查零影响)——设计、门禁与判决见 D64_DESIGN §8.5。
+
+## 16. wave26:c1 剩余 10% 的动态归因(B200 纯测量会话,零代码改动)
+
+口径:tree = 集群 `sage-w14`(2b652df,与 feat/varlen tip e3e65b5 代码
+逐字节同,复用 w25 构建产物,smoke 过);JID 4040318,umb-b200-248,
+健康门一次过,单 alloc 完毕即 cancel。ncu 全部显式 `--clock-control base`
+(SM 锁 1.12 GHz,四方同频,规避 w19/w20 的自由 boost 混频),比较一律
+cycles 口径。数据:集群 `logs-w26/{ncu,scan}`,脚本 `scripts-w26/`
+(采集 `w26_ncu.sh`;分析 `w26_analyze_mio.py`/`w26_details.py`/
+`w26_corr_order.py`/`w26_slope.py`,ledger 用 `w26_analyze_source.py`
+= w20 版 + 多 launch 汇样)。战况
+(wave25,自由时钟 bench):auto/cudnn d128 c1 全段 0.902,其中
+s4096 0.672/0.817、s16384 0.859/0.989(b1/b4)。
+
+### 16.1 (a) persistent causal 的 W=1 残差:{persist×causal} 纯交互,病灶在 softmax 侧 vec_empty/s_full
+
+**slope 2×2(b1h32 单波,scan 3 发取中位,`sm__cycles_elapsed.max`;
+斜率 = 对临界 CTA 的 kv 块数拟合,c1 取 2·(s/256)、c0 取 s/128):**
+
+| engine×mask | s256 | s512 | s1024 | 斜率 cyc/kv 块 | 截距 |
+|---|---:|---:|---:|---:|---:|
+| ws c0 | 23926 | 33045 | 49228 | 4192 | 15.8K |
+| ws c1 | 23471 | 33819 | 48773 | 4149 | 16.0K |
+| wsp c0 | 24743 | 31405 | 48702 | **4041** | 16.1K |
+| wsp c1 | 23593 | 34520 | 52648 | **4798** | 14.5K |
+
+- wsp/ws 斜率:c0 **0.964**,c1 **1.157**;engine 内 c1/c0:ws 0.99,
+  wsp 1.19。**残差是 {persistent × causal} 的纯交互项**:persistent 本身
+  在 W=1 c0 反而每 kv 块快 3.6%(k_scale LDG、loop-carry phase、q_empty/
+  epi_empty 记账全部无罪),causal 对 ws 每块零成本;w20b 的 +13% 复现为
+  +15.7%(跨会话/节点散布带内)。截距四方 14.5-16.1K,序幕不在案。
+- **W=1 per-barrier 自旋分解**(full shot ×8 launch 汇样,b1h32 s1024
+  c1,PHASECHK 位移解码;样本 = warp 驻留时间):
+
+| barrier(消费者) | ws(6844 样本) | wsp(7281 样本) |
+|---|---:|---:|
+| vec_full[0]+[1](correction) | 18.0% + 7.1% | 16.8% + 6.0% |
+| s_full[0](softmax) | 12.6% | 13.4% |
+| **vec_empty[0](softmax)** | **0** | **4.2%** |
+| epi_full[0](epilogue) | 9.0% | 4.9% |
+| kv_empty(load) | 1.1% | 2.3% |
+| dealloc / corr_empty(mma) | 3.0 / 1.7% | 3.5 / 2.2% |
+| barrier 自旋合计 | 55.7% | 55.0% |
+
+- **增量全部落在 softmax 侧**:vec_empty[0] 从 0 涨到 4.2%(softmax 等
+  correction 交回 tile0 的 vec buffer)、s_full +0.8pp;vec_full 偏斜
+  两 TU 同形(2.5 vs 2.8,W=1 无跨 item 链,w20 的 19.7/3.4 链式偏斜
+  不在本形状)。总驻留 +6.4% ≈ 墙钟 +7.7%。
+- **三项静态排除坐实**(全在案):codegen ±3%(13.6.1 SASS 对照);
+  k_scale LDG 传输(wsp 的 LDG 全家族 0 样本,c0 斜率反而更快);
+  correction 的 barrier 排布——用 `w26_corr_order.py` 逐条对齐两 TU 的
+  SYNCS 序,steady 循环完全同序(vec_full wait → ≤6 条内 ARRIVE
+  vec_empty → corr_full → 87 条 rescale → corr_empty;causal 附加的
+  S1-only 块同位),排除 ptxas 把 vec_empty arrive 下沉的假设。
+- **量化锚点**:Δ斜率 = 4798−4149 = **649 cyc/kv 块** ≈ correction 单个
+  rescale 块的时长量级(87 条,FMUL 链 65 + LDTM.x32 往返)。机制读法:
+  causal 下 correction 每块要走三段串行消费(rescale 对 + S1-only),
+  tile0 vec 归还的余量本就贴线;persist 实例把它推过线,softmax 每块吃
+  一个 rescale 长度的空转,级联出 s_full。排除完传输/codegen/排布后,
+  剩余可疑差异只剩 persist 专属的 mma 发射循环形态(`#pragma unroll 1`
+  + kv_dep 假依赖,§13.3 的 spill 手术)对 QK 发射节奏的影响——首发
+  嫌疑,未定罪(需 PM sampling 时间线或计数器 patch 才能闭环)。
+- **判定:结构性**(steady-loop 相位余量,非 codegen、非序幕、非传输、
+  非调度器)。对 auto 的含义:该残差只挡「causal 翻 persistent」一件事,
+  当前 auto(causal→per-tile ws)不受影响。lever 记档不立项(修复
+  不在本轮):L-a1 vec buffer 深度 2(断掉 vec0 归还贴线;先审 TMEM
+  列预算,d128 已右尺寸化,大概率不够——纸面审计先行);L-a2
+  correction 三段消费重排/合并(S1-only 与 rescale 对共享一次 vec/corr
+  往返)。两者预注册判据同 13.6.4:W=1 c1 斜率比 ≤1.05 且 s16384 c1
+  wsp/ws ≥0.95,c0 二十点 geomean ≥1.05 回归闸;EX2 phase gate 族
+  (移 wait)有判负前科(§15.4),不再作为候选。
+
+### 16.2 (b) causal per-tile ws vs cudnn:发射效率 ×1.33-1.37 主因,尾波 heavy-last 次因(可修),每块工作量洗清
+
+**同场同频四发对照(b4h32 d128 c1,锁 1.12 GHz;cudnn 9.24)**:
+
+| 指标 | ws s4096 | cudnn s4096 | ws s16384 | cudnn s16384 |
+|---|---:|---:|---:|---:|
+| Elapsed cycles | 1.070M | **0.675M** | 13.36M | **9.18M** |
+| ws/cudnn(cycles) | **1.586** | | **1.455** | |
+| exec inst | 211.8M | 198.6M | 2971.7M | 2808.8M |
+| issued/sched | 0.38 | 0.52 | 0.40 | 0.53 |
+| eligible/sched | 0.46 | 0.74 | 0.48 | 0.75 |
+| warp-cyc/issued inst | 9.59 | 7.68 | 9.37 | 7.56 |
+| stall/issue:long_sb | 5.10 | 3.76 | 5.16 | 3.64 |
+| stall/issue:wait | 1.82 | 0.89 | 1.88 | 0.89 |
+| stall/issue:mio_throttle | 0.26 | 0.64 | 0.18 | 0.68 |
+| tensor pipe active % | 22.1 | 72.6 | 27.9 | 81.8 |
+| SM active max/avg(尾波) | **1.098** | 1.038 | 1.039 | 1.021 |
+| grid | (16,32,4) | **(2048,1,1)** | (64,32,4) | **(8192,1,1)** |
+| local spill 请求 | 0 | 82.8K | 0 | 303.9K |
+
+- **乘法分解**(cycles 比 ≈ 指令量 × 发射效率 × SM 空闲/尾波):
+  s4096:1.586 ≈ 1.067 × 1.368 × 1.059;s16384:1.455 ≈ 1.058 × 1.325
+  × 1.021。**「每块工作量」洗清**(指令量只差 6-7%);主因 = 发射效率
+  (issued 0.38-0.40 vs 0.52-0.53,w14 的 c0 结论在 c1 放大:wait/issue
+  差 2×、branch_resolving 差 6×、divergent branch 10-42 vs 0.5);
+  次因 = 尾波不均(s4096 差 6pp,s16384 差 1.8pp)。
+- **cudnn 的 causal 排法**:同一个 kernel 二进制(名字、232.45KB smem
+  与 c0 逐字同;causal 是运行时路径,代价 = local spill 82.8K/303.9K
+  请求,仍赢),但 **grid 从 c0 的 (s/256,h,b) 拍扁成 1-D**——CTA→tile
+  映射进 kernel 内做,配合 max/avg 1.038 vs 我方 1.098 读作 causal 感知
+  的均衡序。我方 per-tile ws 的 c1 grid 是 x=qblk2 升序 = **heavy-last
+  (反 LPT)**:trip 最深的 CTA(`x=n-1`,trip=2n,源:ws.cu:710/726)
+  在每个 head 的发射序末尾、也落在最后一个 partial wave 里,晚启动的
+  重 CTA 直接决定 straggler 长度。每单位(128×128 qk 块)causal 税:
+  cudnn +7.3% vs 我方 +13.8%(w19 dive 同场内比,s4096)。
+- **口径注记**:锁频 cycles 差 1.46-1.59×,而自由时钟 bench 只差
+  1.01-1.22×(w25)——cudnn 的 tensor 72-82% 高利用在自由时钟下先撞
+  功耗/降频,把结构差压扁(§15.3 反向教训的又一例;判据仍以 bench 为
+  准,结构归因以锁频为准)。
+- **判定:主因结构性**(发射效率差 = 16-warp 形态的既有战场,归
+  BEYOND_CUDNN_PLAN 既有立项范围,不新立);**尾波可修**,lever 草案:
+  **L-b1 per-tile ws causal 的 qblk2 发射序翻转**(kernel 内
+  `qblk2 = gridDim.x-1-blockIdx.x` 或 host 侧等价,heavy-first 静态
+  LPT,与 wsp decode 同款;逐 tile 数学与输出不动,golden diff=0 硬闸,
+  SASS 范围 = ws TU 两 mask 实例)。预注册判据:bench c1 d128
+  s4096 ≥+3%、s16384 ≥+1%(对照 w25 auto 列),c0 全段与 d64 不劣化
+  (>-0.5%),ncu SM active max/avg 1.098→≤1.05;不达线 revert。
+  上限账:尾波项全收 ≈ s4096 +5%、s16384 +2%,吃不动 0.902→1.0 的
+  全部,剩余归发射效率项。
+
+数据:`logs-w26/ncu/{ws,cudnn}_s{4096,16384}_c1.*`、
+`logs-w26/ncu/bal_*`(尾波)、`logs-w26/ncu/w1_*`(16.1 full)、
+`logs-w26/scan/`(16.1 slope 2×2)、`cudnn_c1_kernel_names.txt`。
