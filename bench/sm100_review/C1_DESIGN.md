@@ -960,3 +960,118 @@ w7a 全绿)+ varlen A0(红,SM100_VARLEN_DESIGN §6.4.5)⇒ f591296 原样
 (ballot 的 diff=0 与全套压测已在 w7a 实证,revert 后 dense ws TU 文本
 即 65d30f7 态);ballot(65d30f7)与 varlen fence(f3e617b)保留;
 sm100 varlen 按 §6.4.5 撤出 plan 等 A3。
+
+## 12. A′:RESCALE_THRESHOLD 惰性 max(wave17 实现;上机待验收)
+
+BEYOND_CUDNN_PLAN §4.5 的精度换性能项(既定政策,双级门禁):块 max 对
+running max 的抬升不超过阈值 T(log2 域)就不更新 row_max,o_scale 精确
+== 1.0,§11.1 的 correction ballot 从「块没抬 max」的偶发命中变成常态命
+中。cudnn DSL 同机制同参数:`prefill_d128_fp8_sm100.py:1242-1260`
+(`update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)`),
+fp8 阈值 4.0(`config_sm100.py rescale_threshold()`,fp16 8.0)。主攻
+wave16 表的两处谷地:nc s4096 0.746 与 s16384 0.896(ballot 在中短 trip
+命中率低,rescale 期正落在这两段)。单 commit,独立可回退。
+
+### 12.1 设计
+
+softmax 的 max 更新点(唯一改位;m_deq 的 FMNMX 树、vec 传递、correction
+与 epilogue 全部不动):
+
+```
+旧:row_max = max(row_max, fmaf(m_deq, ls, -S_FP8_OFFSET))
+新:m_chal  = fmaf(m_deq, ls, -kLazyMaxFold)         // 8.807 - T
+    row_max = (m_chal - row_max > T) ? m_chal : row_max
+```
+
+* **fold 偏移让位 T**(kLazyMaxFold = S_FP8_OFFSET − 4 = 4.807):不变量
+  `row_max ≥ m_chal − T` 每步成立(−5e6 初值本身就是一个 stale max;更新
+  则恢复 row_max = m_chal),exp2 参数 ≤ T + (8.807−T) = 8.807 —— 与
+  eager 版同一 P 上限(<448,satfinite 余量不变)。fresh max 的 P 映射点
+  从 448 降到 448·2⁻⁴ = 28,staleness 把它爬回 448:P 底部提前 T 个
+  binade 进 e4m3 subnormal/zero,这是全部精度代价(12.2 量化)。
+* **跳过 = 恒等**:不更新时 row_max 保持 m_prev 的位型,`m_prev - row_max`
+  精确 +0,`ex2.approx(+0) = 1.0` → §11.1 的 `o_scale == 1.0f` ballot 逐位
+  命中;correction 侧零改动。denom·1.0 与 O 跳写的位保真论证沿用 §11.1。
+* **首块**:m_chal − (−5e6) ≫ T,必更新(cudnn 的 is_first 由 −5e6 初值
+  免费承担);全 mask/zero-amax 角落经 m_deq 的 −5e6 floor 走同一条路。
+* **denom/LSE 尺度自由**:lse = log2(denom) + row_max 对 row_max 取值不
+  敏感(分子分母同乘 exp2(Δ)),sim 实测 lse 移动 ≤ 3.1e-5(log2 域)。
+* row_max 语义自 G1 的「与旧 kernel 逐位一致」(§9.1)进一步放弃 ——
+  m_deq 仍逐位复刻旧 serial fold,row_max 采纳与否是新语义;kernel 头部
+  numerics contract 注释已同步。
+
+### 12.2 阈值扫描(bench/sm100_review/lazy_max_sim.py,numpy 位级仿真)
+
+框架 = g1_softmax_sim.py 同一套模型(helper 直接 import,base 路径即
+今日 ws kernel 的 G1 值序);自检:lazy(T=0) 与 base 全输出逐位相等
+(硬断言),P 上限断言 p_f32 < 448 全过。新增对抗场景:ramp_slow /
+ramp_fast(K 块幅度线性爬升,running max 每块 +0.5 / +2,staleness 常驻
+(0,T] —— ballot 与 stale 刻度打包的双重最坏情况)、randn_long(128 块
+= s16384 形状的命中率)。ballot 口径 = 每 (32 行 correction warp, 块≥1)
+全 32 行 o_scale==1.0 的比率。
+
+T 扫描(去 neg_5e6 的 gate 场景集;附加 l1 = lazy/ref 相对 base/ref 的
+最坏增量):
+
+| T | 最差 cos | 最差 rel_l1 | 附加 rel_l1 | randn 家族 ballot 下限 | 判 |
+|---|---|---|---|---|---|
+| base | 0.9956 | 0.0476 | — | 0.129(32 块)/ 0.533(128 块) | — |
+| 2 | 0.9956 | 0.0489 | +0.0014 | 0.855 | 过 |
+| 3 | 0.9956 | 0.0489 | +0.0014 | 0.988 | 过 |
+| **4(选定)** | 0.9956 | 0.0489 | +0.0023 | **0.996** | 过 |
+| 5 | 0.9956 | 0.0493 | +0.0033 | 1.000 | 过 |
+
+选 T=4:cudnn fp8 同值;randn 家族 ballot ≥0.996(T=3 在 128 块 trip 还
+留 1.2% 的 warp-块要 rescale,T=5 只再买 0.4pp 却把附加误差 +43%);
+fresh-max P=28 离 e4m3 zero-flush 还有 13.8 binade,randn 的 P 置零率
+0.000 不动。
+
+T=4 分场景(per-warp 行;per-thread 同带,全表跑脚本复现):
+
+| 场景 | upd% | ballot base→lazy | P 改写 | cos lazy/ref(base) | rel_l1 lazy/ref(base) | rel_l1 lazy/base |
+|---|---:|---|---:|---|---|---:|
+| randn | 0.00 | 0.129→1.000 | 1.000 | 0.999239(0.999272) | 0.0387(0.0380) | 3.3e-2 |
+| randn_causal | 0.00 | 0.145→1.000 | 1.000 | 0.999236(0.999268) | 0.0389(0.0381) | 3.3e-2 |
+| randn_long(128 块) | 0.01 | 0.533→0.996 | 1.000 | 0.999210(0.999237) | 0.0397(0.0391) | 3.6e-2 |
+| big_range | 7.59 | 0.194→0.258 | 0.173 | 0.999394(0.999411) | 0.0273(0.0268) | 2.1e-3 |
+| sharp | 6.43 | 0.129→0.266 | 0.009 | 0.998157(0.998118) | 0.0462(0.0464) | 4.7e-3 |
+| const_rows | 0.00 | 1.000→1.000 | 1.000 | 0.999651(0.999651) | 0.0282(0.0282) | 0 |
+| outlier_block | 3.23 | 0.839→0.968 | 0.157 | 0.995593(0.995593) | 0.0394(0.0394) | 2.8e-6 |
+| ramp_slow | 9.15 | 0.000→0.161 | 0.808 | 0.999212(0.999257) | 0.0375(0.0367) | 1.2e-2 |
+| ramp_fast | 23.56 | 0.000→0.024 | 0.323 | 0.998065(0.998182) | 0.0489(0.0476) | 5.0e-3 |
+| zero_amax | 0.00 | 0.177→1.000 | 1.000 | 0.999241(0.999269) | 0.0387(0.0381) | 3.3e-2 |
+| neg_5e6(域外) | 8.42 | 0.274→0.274 | 0.001 | 0.954994(0.954994) | 0.0873(0.0873) | 1.3e-7 |
+| short_kv(单块) | — | —(trip=1 无 rescale) | 1.000 | 0.999486(0.999486) | 0.0315(0.0315) | 9e-8 |
+
+读法:randn 系的 lazy/base rel_l1 3.3e-2 是 P 换刻度后 e4m3 量化噪声重抽
+(P 改写率 100%),对参考的误差不动(附加 ≤+0.0006);真正的附加误差极值
+在 ramp/sharp(+0.0013~0.0023),仍远离 0.06 闸。neg_5e6 base 同样不过
+(int8 attention 表示域外,§9.3 结论沿用)。lse 全场景 max|Δ| ≤ 3.1e-5。
+
+perf 预期:ballot 命中率 32 块 trip(=s4096)0.13→1.00、128 块
+(=s16384)0.53→1.00,正对两处谷地;s≥32k 段 ballot 已吃到 0.8+,A′
+增量偏中段。wave16 单 ballot 的分段收益(s4096 +3.9%、s16k +6.6%)是
+乘数参照,A′ 挂账再 +1~3%(§4.5),上机 duration 定夺。
+
+### 12.3 本地门禁(已过;复现命令同 §5)
+
+| 项 | 结果 |
+|---|---|
+| ptxas ×4 实例 × sm_100a/sm_110a(nvcc 13.3) | 入口 128 reg,0 spill / 0 stack |
+| USETMAXREG 标记 | TRY_ALLOC 0xc0 / DEALLOC 0x58 / 0x28 各 4,不变 |
+| SASS 分区寄存器上界 | 与基线逐实例逐区相同(sm_100a softmax 167-177 ≤191、corr 71-77 ≤87;sm_110a softmax 188、corr 71-74;pt 实例尾部布局伪影同基线,§10.3 记法) |
+| 静态指令增量 | 每实例 FMNMX −2、FADD/FSETP/FSEL 各 +2(两个 softmax step 站点,select 无分支),合 NOP 排布 ≤ +8/实例(sm_100a hd128-pt 净 +0) |
+| host TU | torch 2.13 / CUDA 13.2 头 -O0 全量编过 |
+
+### 12.4 上机判据(下一会话,B200;口径同 §9.5/§11.1)
+
+| 项 | 判据 |
+|---|---|
+| golden(WS=0,golden-sm100) | `diff=0`(classic TU 未动) |
+| golden(WS=1,对 golden-sm100-g1ws) | **预期 diff**(P 换刻度 → attn/e2e 段);只作形态复核:无 NaN/Inf、diff 圈在 arch=100;正式闸是 accuracy gate |
+| accuracy gate(WS=1) | `pytest test/test_accuracy.py` 全过(cos≥0.99 / rel_l1≤0.06 / LSE rtol 2e-2);数值抄录预期与 G1 实测同带(randn cos ~0.9992 / rel_l1 ~0.039,12.2 表) |
+| bench 22 点 vs ballot 态(本 commit 父 tree) | 几何均值 >1.005 且无形状 <0.995;主看 nc s4096 / s16384 行(谷地 0.746 / 0.896) |
+| 压测 | ws_stress SWEEP + s32768 2×8000 零挂死 + s139264 回退分支(改动是纯标量 select,barrier 计数/warp 一致性面零变化) |
+| ncu(b4h32s16384c0) | duration 下降为准;佐证:correction 视角 issued inst 崩落(rescale 全跳)、softmax 视角 long_scoreboard(TMEM 口争用)回落 |
+| 重 dump golden | 全过后 WS=1 固化到新轨 `golden-sm100-lazymax`(WS=0 轨仍为 golden-sm100);HARDWARE_CHECKLIST 记切换点 commit,此后 ws 路 bitwise gate 以新轨为准 |
+| 回退 | 任一硬闸失败即 kernel 单 commit revert(sim/doc 不连坐) |
