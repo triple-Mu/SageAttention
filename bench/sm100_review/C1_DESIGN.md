@@ -1275,7 +1275,7 @@ routing 自检:torch.profiler 确认 PERSIST=1 时 launch 的是
    commit)单独立项后再翻。手动 `SAGEATTN_SM100_WS_PERSIST=1` 两态照旧
    可用。
 
-### 13.6 wave22:causal EX2 去错相(EX2 phase gate;本地闸全过,待上机)
+### 13.6 wave22:causal EX2 去错相(EX2 phase gate;**wave23 上机判负,已 revert**,§15)
 
 #### 13.6.1 W=1 +13% 的本地 SASS 对照:静态代码生成同位,mask/trip 假设排除
 
@@ -1358,7 +1358,7 @@ lse=false,mask 两态,即 auto 路径的默认 gran)。复现:对
    14.7/7.9);softmax mio 11% 的去向;kv_empty[1] 5.3% 的去向;顺带
    W=1 c1 斜率复测(13.6.1 的遗留归因)。
 
-## 14. wave22:vec_full 交付时机修复——int-domain row max + issue wall(实现完成,本地门禁全过;上机待验收)
+## 14. wave22:vec_full 交付时机修复——int-domain row max + issue wall(**wave23 上机判负,已 revert**,§15)
 
 攻坚对象:§13.5 的遗留 —— c0 稳态里 correction 自旋 vec_full 21.3%
 (s4096/s16384 同值,persistent 只吃序幕没动它)。改动两件套,均落在
@@ -1508,3 +1508,142 @@ arrive 之后(它们不在 store 依赖链上)——交付点比源码序还早�
    wait_corr_empty 自旋同向回落(vec 早到 → rescale 早完 → PV 早发)。
    若 vec_full 自旋回落但 duration 不动,说明 correction 链不是当前
    critical loop,把余量记档、改动保留(无回退理由,交付语义本就该此)。
+
+## 15. wave23:两支 wave22 分支融合上机——B200 验收、FFMA 反契约破案与分项裁决
+
+树 sage-w12 = wave23/fused(fc03183 + 13.6 两 gate cherry-pick + §14 两
+commit rebase 融合 + fmaf 修复),两次 alloc:JID 4036311(umb-b200-260,
+融合树全量验收)、JID 4037418(umbriel-b200-021,revert 后终树复验)。
+容器 pytorch_26.07,10.0a + PRUNE=OFF,健康门全过,完毕即 cancel。数据:
+集群 `SageAttention_refactor/logs-w23{,b}/`,脚本 `scripts-w23/`。
+
+### 15.1 融合结构与本地闸
+
+softmax 步融合后新序(两 TU 同构):STTM.x2 → arrive vec_full →
+[gated:try_wait vec_empty] → issue wall(ISETP+BRA)→ I2F/EX2/pack 突发。
+wall 放在 gate 的 wait 之后:wait 在 arrive 后(gate 语义),wall 又把
+exp2 段压在 wait 之下——phase gate 的「exp2 段在 moved wait 后」从调度习
+惯升级为控制依赖强制(账本 §10/P6 措辞同步)。本地闸:4 实例 ×
+sm_100a/sm_110a × 两 TU 全过(0 spill/0 stack/128-reg entry,USETMAXREG
+0xc0/0x58/0x28);16/16 实例 SASS 站点形态正确(ungated=仅 wall,
+gated=wait+wall,顺序 arrive→wait→wall→burst);imax_domain_sim.py 复跑
+PASS。
+
+### 15.2 golden 首跑 132 diff:FFMA contraction 是值契约的一部分
+
+首跑 golden:ws0 diff=0,**ws1/wsp 各 diff=132**——全部是 kv>128(≥2 KV
+block)的形状,单 block 形状全过;1-ulp 量级,lse 失配(每形状 30+ 行)
+远多于 O 失配(个位数);compare_reference 的小 scale 输入
+(rand×0.05+1e-4)触发,大 scale(+0.5)复现不出。
+
+定位:对 fused vs fc03183 的稳态循环(backward-branch 切 loop body)做
+**FP opcode 逐类全量对账**(d128 c0,gate 不生效,纯 §14 改动):唯一值
+链差异是基线把 `denom *= o_scale; …; denom += d_sum` 收缩成一条
+`FFMA(o_scale, denom, d_sum)`(nvcc 前端 contraction,直线段内),而
+wave22 在两语句之间插入的控制流(issue wall;gated 实例的 moved wait)
+切开 basic block,contraction 失效 → FMUL+FADD 双舍入。**两支分支的
+「纯控制流 = bit-exact」论证在此双双被证伪**:13.6 的本地 SASS 闸只看
+op 总数(FFMA→FMUL+FADD 是 -1+2,「±0/+8」看不出),§14 的 op-mix 闸同
+理。教训成规:声称 bit-exact 的控制流改动,本地闸必须加 FP opcode 逐类
+计数对账(memory: sageattention-fma-contraction-contract)。
+
+修复(a034939):rescale 点去掉 `*=`,d_sum 累加点显式
+`denom = fmaf(o_scale, denom, acc[0] + acc[1])`——把基线收缩出的那条
+FFMA 写死在源码。修后稳态循环 FP 计数与基线逐项相等,仅剩设计内差异
+(FMNMX/FMNMX3 f32 树 → VIMNMX/VIMNMX3 int 树、+1 I2F 树根、+wall 的
+BRA)。数值 repro(同形状同输入 fused vs sage-w10)四变体全 0 diff。
+
+### 15.3 融合树全量验收(JID 4036311)
+
+1. **golden 三轨全 diff=0**(修复后):WS=0 对 golden-sm100 ok=2082、
+   WS=1 PERSIST=0 与 WS=1 PERSIST=1 对 golden-sm100-g1ws 各 ok=2107
+   diff=0 missing=0。
+2. **压测 15/15 零挂死**:auto 双路 main(SWEEP 2k-128k×两态×10 +
+   s32768 8000×2)+ s139264 2000×2;PERSIST=1 强制 causal 面
+   p32768/p_w1/p_trip256/p_trip512/p_tiny 各 2000×2;ws TU 面
+   ws_w1/ws_trip256/ws_trip512/ws_tiny;d64 面 d64main(SWEEP+8000×2)
+   /d64_trip256/d64_trip512/p_d64。wall 与两 gate 的挂死面全部空白。
+3. **bench(22 点 4 引擎 ×3 轮 + d64 12 点 3 引擎 ×3 轮)**,old/cudnn
+   跨会话 ms 与 wave20 逐位吻合(1007.25↔1007.30),时钟可比:
+
+   | 段位 | wave20 | wave23 融合树 | 判读 |
+   |---|---|---|---|
+   | c0 d128 五段 wsp/ws | 1.108/1.104/1.073/1.068/1.070(geomean 1.0842) | 1.082/1.086/1.047/1.039/1.033(1.0572) | 全段回退,s4096/s1024「应再进」未达 |
+   | c0 d128 ws/old(20 点) | 1.2292 | 1.2191 | ws TU −0.8% |
+   | c0 d128 wsp/old(20 点) | 1.3327 | 1.2889 | persist −3.3%,长段 ~−5% |
+   | wsp/cudnn s≥16k 三段 | 1.0420/1.0760/1.1021 | 0.9971/1.0309/1.0430 | 「不回退」线破,s16384 掉回 <1 |
+   | c1 d128 十点 wsp/ws | 0.8813 | 0.8949(最好 0.9698,最差 0.7847) | +1.5pp,仍 <0.90 判负线 |
+   | c1 d128 ws/old | 1.2404 | 1.2063 | ws TU c1 −2.7% |
+   | d64 12 点 ws/old | 0.980(wave19) | **1.0269**(c0 1.0303/c1 1.0237,最差 0.9950) | +4.8pp——**混杂读数,15.5 拆解后归 vec_full 改动,gate 单独为负** |
+   | d64 12 点 wsp/old | — | 1.0309(c0 1.04-1.11,c1 0.93-1.03) | persist-d64 c0 比 ws-d64 更快(同为混杂读数) |
+
+4. **ncu**(方法同 wave16/20,PHASECHK 站点归属):
+   - wsp s4096 c0:correction vec_full 自旋 21.3%(13.5+7.8)→
+     **20.0%(17.3+2.7)**——[1] 槽回落但 [0] 反涨,总量几乎不动;
+     eligible 0.508→0.571、ncu 隔离 duration 927.6→882.7us(−4.8%)
+     **但自由时钟 bench +2.3%**——ncu 锁频态与 bench 态方向相反,判据
+     以 bench 为准(§13.4 口径);mio 0.129→0.674。vec 早交付没有解开
+     correction 链,反而恶化了自由时钟下的整体重叠。
+   - wsp s16384 c1:19.7/3.4 → 18.7/3.3,phase gate 没有把偏斜拉回 ws
+     的 14.7/7.9 参照形;且融合树上 ws 自己也变成 18.6/3.0(§14 改动把
+     ws c1 的自旋形状推向 persist 形)。
+   - d64 s16384 c0(融合树):mio_throttle 0.95→0.927、eligible
+     0.48→0.50、XU 53.7→56.7——当时读作「错相后的 XU 供给平滑」;15.5
+     终树复验证明这组读数(和 bench 的 +4.8pp)全来自 vec_full 交付改
+     动,gate 单独把 mio 推到 1.06、XU 压到 51.9(D64_DESIGN 8.4)。
+
+### 15.4 分项裁决(独立 revert,不连坐)
+
+| 改动 | 判据 | 实测 | 裁决 |
+|---|---|---|---|
+| §14 vec_full 交付(int max + wall) | 14.6.3:22 点 geomean >1.005 且无形状 <0.995;s4096/s1024 应再进;s≥16k 不回退 | ws/old 相对 −0.8%,wsp/old −3.3%,主战场两段皆负,长段线破 | **判负 revert**(3383654;§14 文档与 imax sim 留档) |
+| 13.6 persist causal EX2 gate | 13.6.4.3:wsp/ws ≥0.95 方向成立,<0.90 判负 | 0.8949(还叠着 §14 的顺风) | **判负 revert**(7f9aab7;13.6 文档留档) |
+| 13.6/D64_8 ws-d64 EX2 gate | D64 8.3.3:ws/old ≥0.980 底线,<0.96 判负 | 融合树 1.0269,底线大幅过 | **暂保留**——15.5 终树复验推翻,判负 revert(2637748) |
+| fmaf 显式化(a034939) | golden diff=0 硬闸 | 三轨全 0;SASS 逐类对账与基线相等 | **保留**(d64 gate 在树上时是 bit-exact 的必要条件;gate revert 后 SASS 恒等,纯源码硬化) |
+
+两 revert 后的中间树 = fc03183 + ws-d64 EX2 gate + 显式 fmaf。本地 SASS
+恒等闸:persist TU 8/8 实例(×两 arch)与 fc03183 逐条恒等;ws TU d128
+4/4 恒等;d64 4 实例按设计差异(moved wait,+8/+16 条)——生产路径改动
+收敛为 ws-d64 两实例,由 15.5 单独复验。
+
+### 15.5 终树复验(JID 4037418):d64 gate 也判负,wave23 代码改动清零
+
+复验树 = fc03183 + ws-d64 EX2 gate + 显式 fmaf(15.4 的中间树,重打包
+sage-w12)。golden 三轨全 diff=0(ws0 ok=2082,ws1/wsp 各 ok=2107);
+d64 压测 5/5 零挂死(SWEEP+8000×2、w1、trip256、trip512、tiny 各
+2000×2)。语义面二次确认干净,判决全在 bench:
+
+| 段位 | 融合树(JID 4036311) | 终树(JID 4037418) | 判读 |
+|---|---|---|---|
+| d64 12 点 ws/old | 1.0269(c0 1.0303/c1 1.0237,最差 0.9950) | **0.9575**(c0 0.9444/c1 0.9708,最差 0.9164) | <0.96 判负线,且低于 wave19 无改动基线 0.980 |
+| d64 12 点 wsp/old | 1.0309 | 0.9399(c0 0.9687/c1 0.9120) | persist-d64 同向更差 |
+| old 列跨节点比(终/融合) | — | geomean 1.0012,最大 0.50% | 节点/时钟可比性成立 |
+| ws 列跨节点比 | — | 慢 7.4%(wsp 慢 9.8%) | 差值全落在被 revert 的 vec_full 交付改动上 |
+
+结论:**融合树的 d64 收益全部来自同场的 vec_full 交付改动**(int max 把
+128 I2F 移出 pre-arrive 窗口、vec 提前一个 XU 突发,对 XU-bound 的 d64
+正中要害;它自己在 d128 主战场判负,§14/15.4),gate 单独存在是净负——
+15.3/15.4 的 d64 行是两改动混杂的读数,本次复验正是为拆这层混杂预注册
+的。ncu(s16384 nc b4h32):mio_throttle/issue 0.95→1.06(gate 使自己
+立项要修的指标恶化)、eligible 0.48→0.479、XU 53.7→51.9%——「移
+vec_empty wait 造 per-step stagger」这个 lever 被证伪,机制细节与 M1
+后续方向记 D64_DESIGN 8.4。
+
+判决:按 D64 8.3.3 判负,revert(2637748)。revert 后本地 SASS 恒等闸
+**16/16 实例(两 TU × d{64,128} × c{0,1} × sm_{100a,110a})与 fc03183
+逐条恒等**——终树二进制即 fc03183,无需三次上机。
+
+wave23 收口:
+- **代码净沉淀 = 显式 fmaf 一处**(a034939 + 注释,SASS 恒等的源码级
+  值契约硬化);wave22 三个性能改动(vec_full 交付、persist causal
+  gate、d64 gate)全部按各自预注册判据判负 revert(3383654/7f9aab7/
+  2637748),设计、账本与判决记录留档(§13.6/§14/本节;D64 §8;
+  barrier_ledger §10)。
+- **auto 全不翻**:c1 persist 维持 per-tile ws(0.8949 < 0.90),d64
+  维持经典 kernel(launcher 判据注释不动);组合态 = wave20 验收态。
+- 方法论沉淀:①声称 bit-exact 的控制流改动,门禁必须加 FP opcode 逐类
+  对账(15.2);②双改动同场上机,keep 判决必须预注册单改动复验(本节
+  就是该条款兑现);③ncu 锁频读数与自由时钟 bench 可以反向(15.3),
+  判据以 bench 为准。
+- 数据:集群 `logs-w23b/`(golden/stress/bench-d64/ncu),对照
+  `logs-w23/`;树 archive `sage-w12.tar.gz`(复验树版本)。

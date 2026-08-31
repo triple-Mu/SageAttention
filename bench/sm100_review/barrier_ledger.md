@@ -160,15 +160,13 @@ softmax_t (each of 128 threads; step j):
 [w] s_full#j
 ld chunks 0-3 (one ld + wait::ld each) -> dequant+mask row kept in regs, m_local
 m/denom update; st vec=(m_prev,row_max) -> wait::st, fence, arrive vec_full#j
-([w] vec_empty#j HERE instead of the step tail on EX2-phase-gated instances:
-  d64 on this TU per section 10)
 exp2+pack from the retained row (no TMEM reads);
-  denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: the gated
-  instances' moved wait splits the basic block, so the old *= / += pair no
-  longer contracts on its own - the fmaf keeps the baseline's FFMA bit
-  pattern in every code shape)
+  denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: any control
+  flow inserted between the old *= / += pair - both reverted wave22 changes
+  did this - splits the basic block and stops the pair contracting on its
+  own; the fmaf keeps the baseline's FFMA bit pattern in every code shape)
 st P -> wait::st, fence, arrive s_empty#j
-[w] vec_empty#j (tail position: ungated instances only)
+[w] vec_empty#j
 ```
 after the loop: st final vec=(denom,row_max) on the slot acquired by the
 last step's `[w] vec_empty#(trip_t-1)`; arrive vec_full#trip_t; (LSE store);
@@ -372,7 +370,15 @@ fires when QK(i) retires, which can precede softmax's read of block i's
 scale — a per-slot k_scale copy could be overwritten one ring lap early
 (checked and rejected; the one-shot prefix copy has no such lifetime).
 
-## 10. EX2 phase gate (wave22, d64 instances): the per-step vec_empty wait moved pre-exp2
+## 10. EX2 phase gate (wave22, d64 instances): the per-step vec_empty wait moved pre-exp2 — REVERTED
+
+Design record. Implemented in wave22, reverted after the wave23b B200
+final-tree re-verification: gate alone d64 ws/old 0.9575 geomean against
+the pre-registered <0.96 revert line (the fused-tree 1.0269 was carried by
+the also-reverted vec_full delivery change; C1_DESIGN.md 15.5). The §2
+event program is back to the tail-position wait; the correctness argument
+below stays as the record that the move was semantics-safe (wave23 golden
+diff=0, stress zero hangs).
 
 d64 instances only (`head_dim == 64`; d128 code is untouched). Both softmax
 warpgroups' per-step `[w] vec_empty#j` (§2 event program, last line of the

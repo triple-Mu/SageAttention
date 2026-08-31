@@ -502,7 +502,7 @@ M0 ✅(本节)。D1 ✅:反常归因 = EX2 发射同相突发(7.2),G3 判据落�
 
 ---
 
-## 8. M1 首刀:EX2 phase gate(wave22 实现;本地闸全过,待上机)
+## 8. M1 首刀:EX2 phase gate(wave22 实现;**wave23b 上机判负,已 revert**,§8.4)
 
 7.2/7.4 判据的第一个落地:d64 反常的根是两个 softmax warpgroup 的 EX2
 段同相打满 MUFU 队列,修复走「交错/去同相」lever。与 C1_DESIGN §13.6
@@ -570,6 +570,38 @@ exp2(128×EX2)保持在前移 wait 之后,错相直接作用于本步 EX2 段。
 | C3 经典 fork | C2 TMEM 腾挪 0.6508(128 线程地基)、CTA_Q=128 单 tile 变体(cutedsl 侧) | 不立项与黑名单无关(维护策略);fork 才能绕 SASS 恒等门禁本身就是成本 |
 | 软件 exp2 / f16x2 EX2 | 全线劣化(七月)/ XU 计数平手 + M6 已裁 | 维持封存,d64 不例外 |
 
+### 8.4 wave23/23b 实测与判决:判负 revert(2637748)
+
+上机两轮(方法、融合结构与 FFMA 破案见 C1_DESIGN §15):
+
+- **融合树**(fc03183 + 本 gate + §14 vec_full 交付 + fmaf;JID 4036311,
+  umb-b200-260,`logs-w23/bench-d64/`):ws/old geomean **1.0269**
+  (c0 1.0303 / c1 1.0237,最差 0.9950)——8.3.3 底线大幅过,当时按
+  「保留,终树复验」记档。
+- **终树**(fc03183 + 本 gate + fmaf,vec_full 改动已 revert;JID
+  4037418,umbriel-b200-021,`logs-w23b/bench-d64/`):ws/old geomean
+  **0.9575**(c0 0.9444 / c1 0.9708,最差 0.9164 = c0 b1 s4096);
+  wsp/old 0.9399。跨节点可比性:old 列与融合树逐形状 geomean 比 1.0012
+  (最大 0.50%),ws 列却慢 7.4%、wsp 列慢 9.8%——融合树的 d64 收益
+  **全部来自同场被 revert 的 vec_full 交付改动**(int max 把 128 I2F 移
+  出 pre-arrive 窗口 + vec 提前一个 XU 突发交付,对 XU-bound 的 d64 正
+  中要害),gate 单独存在是净负。
+- 判决:0.9575 < 0.96 判负线(8.3.3),revert 本 gate(2637748);
+  低于 wave19 无改动基线 0.980,「12 点全 ≥1 翻 auto」更无从谈起——
+  **M2 auto 判据不动,d64 维持经典 kernel**。golden 双轨 diff=0 与
+  d64 压测 15/15 零挂死照过:语义安全,纯性能判负。
+- ncu(终树 s16384 nc b4h32,`logs-w23b/ncu/`):mio_throttle/issue
+  0.95 → **1.06**(gate 使自己要修的指标恶化)、eligible 0.48 → 0.479
+  (持平)、XU 53.7 → **51.9%**(供给更差)。7.2 的「EX2 同相突发」
+  诊断没有被推翻,但「移 wait 造 per-step stagger」这个 lever 被证伪:
+  无 vec 提前交付时,tile 1 的前置 wait 是纯串行插入;融合树曾测出的
+  XU 56.7 / mio 0.927 应归因 vec_full 交付改动,不是 stagger。后续若
+  重启 M1,机制得换(候选:vec 交付时机对 d64 单独成刀——vec_full 改
+  动 d64 段独测 +7%,但它在 d128 主战场判负,C1_DESIGN §14.6/§15.5)。
+- revert 后 SASS 恒等闸:16/16 实例(两 TU × d{64,128} × c{0,1} ×
+  sm_{100a,110a})与 fc03183 逐条恒等;显式 fmaf(a034939)留在源码
+  (它就是基线收缩出的那条 FFMA,C1_DESIGN §15.2)。
+
 ## 附录 B:per tile-block 归一化(§1.4)
 
 定义:SM·µs per tile-block = duration_ms × 148 ÷ N_unit × 1000,
@@ -580,6 +612,9 @@ tile-block 比值 1.041/1.023 = 1.018,与 bench 的 ws/old 0.982 互为倒数。
 
 ## 附录 C:数据来源
 
+- **w23/w23b(§8.4)**:集群 `SageAttention_refactor/logs-w23/bench-d64/`
+  (融合树)、`logs-w23b/{bench-d64,ncu,stress_*.log,g_*.txt}`(终树);
+  会话脚本 `scripts-w23/`。
 - **w19(本文 §7 全部数据)**:集群 `SageAttention_refactor/logs-w19/`
   (bench 12 形状 ×3 轮、ncu 全量 .ncu-rep + raw/details/source csv、scan、
   健康 gate 日志);会话脚本 `SageAttention_refactor/scripts-w19/`;坏节点
