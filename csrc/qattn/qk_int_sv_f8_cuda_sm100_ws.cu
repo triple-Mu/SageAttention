@@ -701,13 +701,35 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     // (re)computed inside each warpgroup branch: a value computed before the
     // setmaxnreg boundary and used after it must be carried across, and in
     // the 32-register region that shows up as stack spills (measured).
+    //
+    // CTA -> q-tile map (L-b1, C1_DESIGN 16.2): under causal the trip count
+    // grows with the q-block index while blockIdx.x issues ascending, so the
+    // identity map put the deepest CTAs in the last partial wave (tail-wave
+    // SM active max/avg 1.098). Reverse the map -- heavy-first static LPT,
+    // the persist TU decode's trick. Pure CTA<->tile relabeling: every
+    // per-tile value derives from cta_q(), so tile math and outputs are
+    // unchanged (golden diff=0). Non-causal keeps the identity map (uniform
+    // trips make the order inert; the instance stays SASS-identical). Reads
+    // special registers only, so each setmaxnreg region rematerializes it.
+    auto cta_q = [&]() -> uint32_t {
+        if constexpr (mask_mode == MaskMode::kCausal) {
+            uint32_t flipped = gridDim.x - 1 - blockIdx.x;
+            // Pin per call site (the kscale_qo_per trick): keeps the flip a
+            // region-local single register instead of a cross-region carried
+            // value (measured: 8B stack spill in the 40-reg mma region).
+            asm volatile("" : "+r"(flipped));
+            return flipped;
+        }
+        return blockIdx.x;
+    };
+
     // KV trip counts per tile (differentiated causal trips; per 128-row tile
     // this equals the 128-thread kernel's num_iterations with the q-block
-    // index 2*bx / 2*bx+1):
+    // index 2*cta_q() / 2*cta_q()+1):
     auto trip_count = [&](uint32_t tile) {
         const uint32_t kblk = div_ceil(kv_len, CTA_K);
         if constexpr (mask_mode == MaskMode::kCausal) {
-            return min(2 * blockIdx.x + 1 + tile, kblk);
+            return min(2 * cta_q() + 1 + tile, kblk);
         }
         return kblk;
     };
@@ -723,7 +745,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         const uint32_t lane_row = threadIdx.x % 128;  // S row within the tile == TMEM lane
 
         const uint32_t batch_id     = blockIdx.z;
-        const uint32_t cta_idx_q    = blockIdx.x;  // covers Q rows [256*bx, 256*bx + 256)
+        const uint32_t cta_idx_q    = cta_q();  // covers Q rows [256*cta_q(), 256*cta_q() + 256)
         const uint32_t head_id      = blockIdx.y;
         const uint32_t num_qo_heads = gridDim.y;
 
@@ -1388,7 +1410,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         if (warp_idx == kMmaWarp) {
             if (tcgen05::elect_one()) {
                 const uint32_t trip0 = trip_count(0);
-                const uint32_t trip1 = trip_count(1);
+                // trip1 is derived after the steady loop (its only use): the
+                // causal flip's volatile pin is order-fixed in source order,
+                // so deriving it here would carry the bound across the loop
+                // as a 4B stack spill (40-reg budget; L-b1).
                 // one live TMEM base; per-call +CONST rematerializes freely
                 const uint32_t tb = tmem_addr_slot;
 
@@ -1478,7 +1503,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 //      QK0(i) | PV1(i-1) | QK1(i) | PV0(i) ----
                 bool     pv1_started = false;
                 uint32_t v_item      = 1;  // ring item of the V the next PV1 consumes
-                for (uint32_t i = 1; i < trip0; i++) {
+                // One counter across both loops: re-deriving trip0 at the
+                // S1-drain entry made ptxas carry the flipped 2q+1 through
+                // the steady loop as a 4B stack spill (40-reg budget; L-b1).
+                // The i sequence in both loops is unchanged (trip0 >= 1).
+                uint32_t i = 1;
+                for (; i < trip0; i++) {
                     wait_kv(2 * i);  // K_i
                     qk(tb + TMEM_COL_S0, sQ_u32, kv_slot_u32(2 * i), bars_u32 + kBarSFull * 8);
 
@@ -1510,25 +1540,35 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                        /*accumulate=*/true);  // PV0(i)
                 }
 
-                // ---- causal S1-only rounds (cutedsl L707-728): PV1 + QK1 ----
-                for (uint32_t i = trip0; i < trip1; i++) {
-                    wait_kv(2 * i);  // K_i
-                    if (pv1_started) {
-                        wait_corr_empty(bars_u32 + (kBarCorrEmpty + 1) * 8, corr1_empty_phase);
+                // ---- causal S1-only rounds (cutedsl L707-728): PV1 + QK1;
+                //      constexpr-gated: non-causal has trip1 == trip0, and
+                //      the gate keeps the dead loop out of the kNone
+                //      instances (the merged counter defeated nvcc's own
+                //      emptiness proof there) ----
+                if constexpr (mask_mode == MaskMode::kCausal) {
+                    const uint32_t trip1 = trip_count(1);
+                    for (; i < trip1; i++) {
+                        wait_kv(2 * i);  // K_i
+                        if (pv1_started) {
+                            wait_corr_empty(bars_u32 + (kBarCorrEmpty + 1) * 8, corr1_empty_phase);
+                        }
+                        pv(tb + TMEM_COL_O1,
+                           tb + TMEM_COL_S1 + TMEM_COL_P,
+                           bars_u32 + (kBarSEmpty + 1) * 8,
+                           s1_empty_phase,
+                           bars_u32 + (kBarCorrFull + 1) * 8,
+                           kv_slot_u32(v_item),
+                           pv1_started);  // PV1(i-1)
+                        pv1_started = true;
+                        release_kv(v_item);
+                        qk(tb + TMEM_COL_S1,
+                           sQ_u32 + SMEM_Q_BYTES,
+                           kv_slot_u32(2 * i),
+                           bars_u32 + (kBarSFull + 1) * 8);
+                        release_kv(2 * i);
+                        wait_kv(2 * i + 1);  // V_i
+                        v_item = 2 * i + 1;
                     }
-                    pv(tb + TMEM_COL_O1,
-                       tb + TMEM_COL_S1 + TMEM_COL_P,
-                       bars_u32 + (kBarSEmpty + 1) * 8,
-                       s1_empty_phase,
-                       bars_u32 + (kBarCorrFull + 1) * 8,
-                       kv_slot_u32(v_item),
-                       pv1_started);  // PV1(i-1)
-                    pv1_started = true;
-                    release_kv(v_item);
-                    qk(tb + TMEM_COL_S1, sQ_u32 + SMEM_Q_BYTES, kv_slot_u32(2 * i), bars_u32 + (kBarSFull + 1) * 8);
-                    release_kv(2 * i);
-                    wait_kv(2 * i + 1);  // V_i
-                    v_item = 2 * i + 1;
                 }
 
                 // ---- tail: PV1(trip1-1) (cutedsl L733-743) ----
@@ -1555,7 +1595,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             if (tcgen05::elect_one()) {
                 const uint32_t trip1      = trip_count(1);
                 const uint32_t batch_id   = blockIdx.z;
-                const uint32_t cta_idx_q  = blockIdx.x;
+                const uint32_t cta_idx_q  = cta_q();
                 const uint32_t head_id    = blockIdx.y;
                 const uint32_t kv_head_id = head_id / qo_per_kv_head;
                 // issue order Q0, K0, Q1, V0, (K,V)* mirrors cutedsl L589-611;
@@ -1630,7 +1670,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 ws::prefetch_tensormap(&tensorMapO);  // G4: cold-fetch off the store path
                 const uint32_t bars_u32 = ws::smem_u32(bars);
                 const uint32_t sO_u32   = ws::smem_u32(smem_) + 2 * SMEM_Q_BYTES + kKvStages * SMEM_KV_BYTES;
-                const uint32_t q_base   = blockIdx.x * (2 * CTA_Q);
+                const uint32_t q_base   = cta_q() * (2 * CTA_Q);
 #pragma unroll
                 for (uint32_t t = 0; t < 2; t++) {
                     ws::wait_bar(bars_u32 + (kBarEpiFull + t) * 8, 0);
