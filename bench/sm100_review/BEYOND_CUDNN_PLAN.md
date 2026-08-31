@@ -202,8 +202,6 @@ F2FP.SATFINITE.E4M3.PACK 512、F2FP.F16/BF16.PACK 各 192、MUFU.RCP 20。
 
 ### 4.1 correction 按 ballot 跳过 O rescale(cudnn 同款,去阈值版)
 
-**wave14 已实现,待上机验收(C1_DESIGN §11.1)。**
-
 - 机制:o_scale = exp2(m_prev−row_max),块没刷新 max 时恒等于 1.0;
   correction 当前无条件做 128 列 O 的 LDTM→FMUL2→STTM 往返
   (`qk_int_sv_f8_cuda_sm100_ws.cu` rescale lambda,:1033-1068)。
@@ -243,9 +241,6 @@ F2FP.SATFINITE.E4M3.PACK 512、F2FP.F16/BF16.PACK 各 192、MUFU.RCP 20。
   w11 ncu 记过 L2 read +14%)。
 
 ### 4.3 P 分块交付,PV chunk0 提前发(cudnn 同款)
-
-**wave14 已实现(保列序 bit-exact 版,s_empty 两次完成/步 + 常量 parity;
-待上机验收,C1_DESIGN §11.2)。**
 
 - 机制:softmax 先算完前 64 列的 exp2+pack 并 arrive,MMA 即发 PV 的前半
   (V 行 0-63 的 2 个 K=32 子步),后 64 列跟上;s_empty 一分为二。

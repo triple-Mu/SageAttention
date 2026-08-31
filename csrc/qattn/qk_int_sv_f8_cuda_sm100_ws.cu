@@ -589,13 +589,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         kBarKvFull    = 2,   // +slot: TMA expect_tx, count 1, 4-slot ring
         kBarKvEmpty   = 6,   // +slot: tcgen05.commit by mma warp, count 1
         kBarSFull     = 10,  // +tile: tcgen05.commit after QK chain
-        kBarSEmpty    = 12,  // +tile: completed TWICE per step by 128 softmax
-                             // arrivals each (cudnn bmm2_ready[chunk], 64-col P
-                             // delivery): completion #2j = S drained + P chunk 0
-                             // (cols [TMEM_COL_P, TMEM_COL_P+16)) stored,
-                             // #2j+1 = P chunk 1 stored. Even completions are
-                             // always parity 0 and odd ones parity 1, so the
-                             // mma warp waits constant parities - no phase var.
+        kBarSEmpty    = 12,  // +tile: 128 softmax arrivals = S drained + P stored
         kBarVecFull   = 14,  // +tile: 128 softmax arrivals = vec stored
         kBarVecEmpty  = 16,  // +tile: 128 correction arrivals = vec read
         kBarCorrFull  = 18,  // +tile: tcgen05.commit after PV chain
@@ -967,23 +961,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             uint32_t RP_u32[CTA_K / 4];
 #pragma unroll
             for (uint32_t w = 0; w < CTA_K / 4; w++) {
-                // P ships to TMEM in two 64-column chunks (cudnn
-                // bmm2_ready[chunk] delivery, prefill_d128_f16_sm100.py
-                // :1387-1405): once columns [0,64) are packed, the first 16
-                // P words store and complete s_empty a first time (#2j) so
-                // the mma warp can start the PV first half while this loop
-                // packs columns [64,128). The per-w body, the w order and the
-                // d_sum chain feeding are untouched - only the store is split
-                // and an arrive added - so every float value is bit-identical
-                // to the single-store form. w is a compile-time constant
-                // under the unroll, so the branch folds to one mid-loop store
-                // site.
-                if (w == CTA_K / 8) {
-                    tcgen05::tmem_st_32x32b_x16(tmem_row + TMEM_COL_P, RP_u32);
-                    tcgen05::tmem_st_wait();
-                    tcgen05::tcgen05_fence_before_sync();
-                    ws::arrive_bar(bar_empty);
-                }
                 // quad w = columns 4w..4w+3; pairs share a k-scale class
                 // ((j%8)/2 equal for j, j+1 with j even), classes {0,1} on
                 // even w and {2,3} on odd w
@@ -1028,13 +1005,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             ws::f32x2_add(acc[0], acc[1], acc[0], acc[1], acc[2], acc[3]);
             denom += acc[0] + acc[1];
 
-            // ---- P chunk 1 -> TMEM (TS A-operand layout, mirrors :493-499;
-            //      cols [32,64) alias S but the row is already in registers),
-            //      then release the S tile: this second completion (#2j+1)
-            //      tells the mma warp both "S drained" (next QK may
-            //      overwrite) and "P fully stored" (the PV second half may
-            //      read). Chunk 0 shipped mid-loop above. ----
-            tcgen05::tmem_st_32x32b_x16(tmem_row + TMEM_COL_P + 16, &RP_u32[16]);
+            // ---- P -> TMEM (TS A-operand layout, mirrors :493-499; cols
+            //      [32,64) alias S but the row is already in registers), then
+            //      release the S tile: this single arrival tells the mma warp
+            //      both "S drained" (next QK may overwrite) and "P ready"
+            //      (PV may read). ----
+            tcgen05::tmem_st_32x32b_x32(tmem_row + TMEM_COL_P, RP_u32);
             tcgen05::tmem_st_wait();
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_empty);
@@ -1296,9 +1272,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 const uint32_t tb = tmem_addr_slot;
 
                 // pipeline state as scalars passed by reference: dynamically
-                // indexed local phase arrays would spill (32-reg budget).
-                // s_empty needs no phase state: two completions per step at
-                // constant alternating parities (see pv below).
+                // indexed local phase arrays would spill (32-reg budget)
+                int s0_empty_phase = 0, s1_empty_phase = 0;
                 int corr0_empty_phase = 0, corr1_empty_phase = 0;
 
                 // one u32 base for every barrier and smem operand address
@@ -1317,14 +1292,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 // slot free once every prior MMA (incl. its last reader) retired
                 auto release_kv = [&](uint32_t item) { ws::commit_bar(bars_u32 + (kBarKvEmpty + (item & 3)) * 8); };
 
-                // S_t = Q_t K_i^T (kind::i8 SS chain, mirrors :375-385).
-                // The opaque redefinition pins this call's Q/K descriptor
-                // math at the call site: with the extra pv chunk wait, ptxas
-                // otherwise floats descriptor SHF/LOP3 chains across the
-                // added wait spin and carries them on the stack (measured
-                // 8-24B spills in the 40-reg region).
+                // S_t = Q_t K_i^T (kind::i8 SS chain, mirrors :375-385)
                 auto qk = [&](uint32_t tmem_S_t, uint32_t sQ_t, uint32_t sK_slot, uint32_t bar_full_t) {
-                    asm volatile("" : "+r"(sQ_t), "+r"(sK_slot));
 #pragma unroll
                     for (uint32_t k_it = 0; k_it < num_tiles_qk_inner; k_it++) {
                         const uint64_t desc_q =
@@ -1336,45 +1305,24 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     ws::commit_bar(bar_full_t);
                 };
 
-                // O_t (+)= P_t V_i (kind::f8f6f4 TS chain, mirrors :525-543),
-                // consumed in two 64-column chunks (cudnn's bmm2_ready wait
-                // structure, prefill_d128_f16_sm100.py:1079-1093): the first
-                // half of the K chain (KV columns [0,64), P cols +[0,16))
-                // starts on s_empty completion #2j - typically while softmax
-                // is still packing columns [64,128) - and the second half on
-                // completion #2j+1 (P fully stored; softmax arrives each only
-                // after the matching chunk's tcgen05.st completed). #2j+1
-                // still doubles as the S-drained signal for the next QK on
-                // this tile, issued after this call in program order. Even
-                // completions are always parity 0 and odd ones parity 1, so
-                // both waits use constant parities and no phase state exists
-                // (see the kBarSEmpty note).
+                // O_t (+)= P_t V_i (kind::f8f6f4 TS chain, mirrors :525-543).
+                // The bar_s_empty wait is the P-ready acquire: softmax arrives
+                // only after its P tcgen05.st completed (and it doubles as the
+                // S-drained signal for the next QK on this tile).
                 auto pv = [&](uint32_t tmem_O_t,
                               uint32_t tmem_P_t,
                               uint32_t bar_p_ready,
+                              int&     p_ready_phase,
                               uint32_t bar_o_done,
                               uint32_t sV_slot,
                               bool     accumulate) {
-                    // The opaque redefinitions pin each half's V-descriptor
-                    // math behind its own wait (same rationale as the qk pin).
-                    uint32_t sV_desc_base = sV_slot;
-                    ws::wait_bar(bar_p_ready, 0);  // #2j: P chunk 0 ready
+                    ws::wait_bar(bar_p_ready, p_ready_phase);
+                    p_ready_phase ^= 1;
                     tcgen05::tcgen05_fence_after_sync();
-                    asm volatile("" : "+r"(sV_desc_base));
 #pragma unroll
-                    for (uint32_t v_it = 0; v_it < num_tiles_pv_inner / 2; v_it++) {
-                        const uint64_t desc_v = tcgen05::make_smem_desc_sm100(
-                            sV_desc_base + v_it * 32, tcgen05::kKMajorLBO, V_SBO, V_SWIZZLE);
-                        tcgen05::mma_f8f8f32_ts(
-                            tmem_O_t, tmem_P_t + v_it * 8, desc_v, idesc_pv, accumulate || (v_it > 0));
-                    }
-                    ws::wait_bar(bar_p_ready, 1);  // #2j+1: P fully stored
-                    tcgen05::tcgen05_fence_after_sync();
-                    asm volatile("" : "+r"(sV_desc_base));
-#pragma unroll
-                    for (uint32_t v_it = num_tiles_pv_inner / 2; v_it < num_tiles_pv_inner; v_it++) {
-                        const uint64_t desc_v = tcgen05::make_smem_desc_sm100(
-                            sV_desc_base + v_it * 32, tcgen05::kKMajorLBO, V_SBO, V_SWIZZLE);
+                    for (uint32_t v_it = 0; v_it < num_tiles_pv_inner; v_it++) {
+                        const uint64_t desc_v =
+                            tcgen05::make_smem_desc_sm100(sV_slot + v_it * 32, tcgen05::kKMajorLBO, V_SBO, V_SWIZZLE);
                         tcgen05::mma_f8f8f32_ts(
                             tmem_O_t, tmem_P_t + v_it * 8, desc_v, idesc_pv, accumulate || (v_it > 0));
                     }
@@ -1400,6 +1348,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 pv(tb + TMEM_COL_O0,
                    tb + TMEM_COL_S0 + TMEM_COL_P,
                    bars_u32 + kBarSEmpty * 8,
+                   s0_empty_phase,
                    bars_u32 + kBarCorrFull * 8,
                    kv_slot_u32(1),
                    /*accumulate=*/false);
@@ -1418,6 +1367,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     pv(tb + TMEM_COL_O1,
                        tb + TMEM_COL_S1 + TMEM_COL_P,
                        bars_u32 + (kBarSEmpty + 1) * 8,
+                       s1_empty_phase,
                        bars_u32 + (kBarCorrFull + 1) * 8,
                        kv_slot_u32(v_item),
                        pv1_started);  // PV1(i-1)
@@ -1433,6 +1383,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     pv(tb + TMEM_COL_O0,
                        tb + TMEM_COL_S0 + TMEM_COL_P,
                        bars_u32 + kBarSEmpty * 8,
+                       s0_empty_phase,
                        bars_u32 + kBarCorrFull * 8,
                        kv_slot_u32(v_item),
                        /*accumulate=*/true);  // PV0(i)
@@ -1447,6 +1398,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     pv(tb + TMEM_COL_O1,
                        tb + TMEM_COL_S1 + TMEM_COL_P,
                        bars_u32 + (kBarSEmpty + 1) * 8,
+                       s1_empty_phase,
                        bars_u32 + (kBarCorrFull + 1) * 8,
                        kv_slot_u32(v_item),
                        pv1_started);  // PV1(i-1)
@@ -1465,6 +1417,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 pv(tb + TMEM_COL_O1,
                    tb + TMEM_COL_S1 + TMEM_COL_P,
                    bars_u32 + (kBarSEmpty + 1) * 8,
+                   s1_empty_phase,
                    bars_u32 + (kBarCorrFull + 1) * 8,
                    kv_slot_u32(v_item),
                    pv1_started);
