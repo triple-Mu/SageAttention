@@ -158,20 +158,15 @@ load (elected thread): issue order `Q0, K0, Q1, V0, (K_i, V_i)*` for
 softmax_t (each of 128 threads; step j):
 ```
 [w] s_full#j
-ld x64 x2 (one collective wait::ld) -> raw row kept in regs (int32 on steady
-  steps; peeled step converts+masks to f32 here); block row max (integer
-  tree on steady steps - wave22, C1_DESIGN 14)
+ld chunks 0-3 (one ld + wait::ld each) -> dequant+mask row kept in regs, m_local
 m/denom update; st vec=(m_prev,row_max) -> wait::st, fence, arrive vec_full#j
 ([w] vec_empty#j HERE instead of the step tail on EX2-phase-gated instances:
-  d64 on this TU per section 10, causal on the persistent TU per P6)
-issue wall (wave22): opaque never-taken branch; the segment below cannot
-  issue before the arrive above (nor before the moved vec_empty wait, when
-  gated). Pure control flow - completions, counts and phases of every pipe
-  unchanged
-I2F+exp2+pack from the retained row (no TMEM reads);
-  denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: the control
-  flow above splits the basic block, so the old *= / += pair no longer
-  contracts on its own - the fmaf keeps the baseline's FFMA bit pattern)
+  d64 on this TU per section 10)
+exp2+pack from the retained row (no TMEM reads);
+  denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: the gated
+  instances' moved wait splits the basic block, so the old *= / += pair no
+  longer contracts on its own - the fmaf keeps the baseline's FFMA bit
+  pattern in every code shape)
 st P -> wait::st, fence, arrive s_empty#j
 [w] vec_empty#j (tail position: ungated instances only)
 ```
@@ -262,7 +257,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j); a warp that ballot-skipped the rescale (wave14) has no in-flight TMEM write to order — its arrival is trivially safe |
 | H7 | correction reads O_t (rescale j / epilog) before PV_t(j-1) finished accumulating | `corr_full#(j-1)` completes when the PV chain retired (tcgen05.commit semantics) |
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
-| H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: the whole S row is loaded (and retained in registers - raw int32 on steady steps since wave22) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
+| H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
 | H10 | `tmem_dealloc` while any warp still touches TMEM | 384 dealloc arrivals, each after the thread's last TMEM op (+ fence); the final PV retired transitively before correction's epilog arrivals (H7); mma warp waits ph 0 then deallocs collectively |
 | H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale / sK_scale are written pre-`__syncthreads` and read by correction / softmax over the generic proxy — plain sync suffices (sK_scale: section 9). The one generic->async edge in the kernel body is correction's sO staging feeding the bulk-store engine: every thread issues `fence.proxy.async.shared::cta` after its STS and before its epi_full arrival, and the epilogue warp's TMA store is ordered behind the barrier wait (SS-twin lesson applied) |
 | H12 | epilogue TMA store reads sO[t] before all 128 correction threads staged it | epi_full[t] completes only after 128 arrivals, each preceded by that thread's STS + `fence.proxy.async` |
@@ -395,11 +390,12 @@ tile 1's completes only after correction also passed the O_0 rescale — tile
 1's P store (s_empty_1#j, hence QK_1(j+1), hence softmax1's next step) runs
 about one rescale behind tile 0, a structural per-step phase offset between
 the two softmax warpgroups' EX2 bursts on each SMSP (D64_DESIGN.md 8; the
-d64 in-phase EX2 verdict is D64_DESIGN.md 7.2). Post-wait placement of the
-exp2 segment is contractual since the wave23 fusion: the §2 issue wall sits
-between the moved wait and the exp2 segment, so ptxas cannot hoist the FP
-chain above the wait (the wave22 caveat about the data-edge-free spin is
-subsumed) — the offset applies within the step.
+d64 in-phase EX2 verdict is D64_DESIGN.md 7.2). SASS check (nvcc 13.3): in
+this branch-free form ptxas keeps the whole exp2 segment after the moved
+wait, so the offset applies within the step; scheduling is not contractual
+though (the rejected predicated form had the exp2 math hoisted above the
+wait — no data edge into the FP chain), and either placement yields the
+same steady-state stagger.
 
 * Deadlock (tile t): the moved wait's completion (correction's `arrive
   vec_empty_t#j`) requires `vec_full_t#j` (arrived immediately above the
@@ -576,11 +572,11 @@ already complete and free; tile 1's completes only after correction also
 passed the O_0 rescale — tile 1's P store (s_empty_1#j, hence QK_1(j+1),
 hence softmax1's next step) runs about one rescale behind tile 0, a
 structural per-step phase offset between the two warpgroups' EX2 bursts on
-each SMSP (C1_DESIGN.md 13.6). Post-wait placement of the exp2 segment is
-contractual since the wave23 fusion: the §2 issue wall sits between the
-moved wait and the exp2 segment, so ptxas cannot hoist the FP chain above
-the wait (the wave22 caveat about the data-edge-free spin is subsumed) —
-the offset applies within the step.
+each SMSP (C1_DESIGN.md 13.6). SASS check (nvcc 13.3): in this branch-free
+form ptxas keeps the whole exp2 segment after the moved wait, so the offset
+applies within the step; scheduling is not contractual though (the rejected
+predicated form had the exp2 math hoisted above the wait — no data edge into
+the FP chain), and either placement yields the same steady-state stagger.
 
 * Deadlock (tile t): the moved wait's completion (correction's `arrive
   vec_empty_t#j`) requires `vec_full_t#j` (arrived immediately above the

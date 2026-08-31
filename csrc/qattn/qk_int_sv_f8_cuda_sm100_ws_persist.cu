@@ -426,36 +426,6 @@ __device__ __forceinline__ float tree_fmax_cls(const uint32_t* r)
     }
 }
 
-// Integer twins of the two trees, over the row's original int32 S values
-// (wave22, C1_DESIGN.md section 14): int32 -> f32 conversion is exact and
-// strictly monotone for |S| < 2^24, so one I2F of the integer tree max is
-// bit-identical to the fmax tree over the converted row - and the row's 128
-// I2Fs leave the s_full -> vec_full window correction spins on (they run
-// fused into the exp2 arguments instead, after the vec hand-off). Steady
-// (non-peeled) steps only: the peeled step's -inf mask sentinel needs the
-// f32 trees above.
-template<uint32_t N>
-__device__ __forceinline__ int32_t tree_imax(const uint32_t* r)
-{
-    if constexpr (N == 1) {
-        return static_cast<int32_t>(r[0]);
-    }
-    else {
-        return max(tree_imax<N / 2>(r), tree_imax<N / 2>(r + N / 2));
-    }
-}
-
-template<uint32_t I0, uint32_t N>
-__device__ __forceinline__ int32_t tree_imax_cls(const uint32_t* r)
-{
-    if constexpr (N == 1) {
-        return static_cast<int32_t>(r[8 * (I0 / 2) + (I0 % 2)]);
-    }
-    else {
-        return max(tree_imax_cls<I0, N / 2>(r), tree_imax_cls<I0 + N / 2, N / 2>(r));
-    }
-}
-
 }  // namespace ws
 
 // ---------------------------------------------------------------------------
@@ -803,8 +773,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         //
         // G1 (C1_DESIGN.md section 9): the row stays in the RAW integer
         // domain - no dequanted row is materialized. The block row max is a
-        // balanced max tree over the raw row (integer IMNMX on steady steps
-        // since wave22, C1_DESIGN.md section 14) scaled back per k-scale class
+        // balanced FMNMX tree over the raw row scaled back per k-scale class
         // (bit-identical to the old serial dequant+fold, see below), and the
         // exp2 argument is ONE packed fma per pair from the raw word:
         //   p = exp2(raw * (local_sm_scale*dequant) - row_max)
@@ -834,19 +803,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             ws::wait_bar(bar_full, s_full_phase);
             s_full_phase ^= 1;
 
-            // ---- load, whole raw row retained. The row array is uint32_t;
-            //      on the peeled step each f32 word overwrites its raw word
-            //      in place (the ld's in-flight block and the retained row
-            //      share registers), on steady steps the row STAYS int32 -
-            //      its 128 I2Fs would otherwise sit inside the s_full ->
-            //      vec_full window that correction spins on (wave22,
-            //      C1_DESIGN.md section 14); they run fused into the exp2
-            //      arguments below instead, after the vec hand-off. r4: both
-            //      x64 lds issue back to back under one collective wait so
-            //      their TMEM-load latencies can overlap (PTX-level
-            //      structure; SASS reality per arch in C1_DESIGN.md 6.4).
-            //      Peeled step: convert + mask here, in the f32 domain,
-            //      exactly as before wave22. Masked lanes become -inf, which
+            // ---- load + convert + mask, whole raw row retained. The row
+            //      array is uint32_t so each f32 word overwrites its raw
+            //      word in place: the ld's in-flight block and the retained
+            //      row share registers. r4: both x64 lds issue back to back
+            //      under one collective wait so their TMEM-load latencies
+            //      can overlap (PTX-level structure; SASS reality per arch
+            //      in C1_DESIGN.md 6.4). Masked lanes become -inf, which
             //      every consumer folds correctly: the fmax tree ignores it
             //      (unless the whole class is masked, absorbed by the -5e6
             //      floor below), and the exp2 argument becomes -inf -> p = 0
@@ -867,10 +830,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 }
             }
             tcgen05::tmem_ld_wait();
-            if constexpr (is_last) {
 #pragma unroll
-                for (uint32_t j = 0; j < CTA_K; j++) {
-                    float          raw    = __int2float_rz(static_cast<int32_t>(RS_row[j]));  // exact, |S| < 2^24
+            for (uint32_t j = 0; j < CTA_K; j++) {
+                float raw = __int2float_rz(static_cast<int32_t>(RS_row[j]));  // exact, |S| < 2^24
+                if constexpr (is_last) {
                     const uint32_t kv_idx = iter * CTA_K + j;
                     bool           oob;
                     if constexpr (mask_mode == MaskMode::kCausal) {
@@ -882,53 +845,32 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                     if (oob) {
                         raw = __uint_as_float(0xff800000u);  // -inf
                     }
-                    RS_row[j] = __float_as_uint(raw);
                 }
+                RS_row[j] = __float_as_uint(raw);
             }
 
-            // ---- block row max (G1; wave22 int domain on steady steps):
-            //      balanced max tree in the raw domain, one exact I2F at
-            //      each integer tree root, one multiply per k-scale class
-            //      back to the dequant domain. int32 -> f32 is exact and
-            //      strictly monotone for |S| < 2^24, so I2F(integer tree
-            //      max) is bit-identical to the old fmax tree over the
-            //      converted row; and rnd(x*d) is monotone in x for d >= 0,
-            //      so the class max of rounded products equals the rounded
-            //      product of the class max: m_deq is bit-identical to the
-            //      old serial fold over the dequanted row. The peeled step
-            //      keeps the f32 tree (its -inf mask sentinel has no int
-            //      encoding with the same fold semantics); there the -5e6
-            //      floor reproduces the old m_local init (a masked/-5e6-
-            //      sentinel lane could win the old fold the same way), and
-            //      also absorbs the one NaN corner - d * (-inf) with a
-            //      zero-amax d = 0 - because fmaxf drops a NaN operand.
-            //      row_max / o_scale / the vec hand-off therefore stay
-            //      bit-identical to the 128-thread kernel (:454-458). ----
+            // ---- block row max (G1): balanced fmax tree in the raw domain,
+            //      one multiply per k-scale class back to the dequant domain.
+            //      rnd(x*d) is monotone in x for d >= 0, so the class max of
+            //      rounded products equals the rounded product of the class
+            //      max: m_deq is bit-identical to the old serial fold over
+            //      the dequanted row. The -5e6 floor reproduces the old
+            //      m_local init (a masked/-5e6-sentinel lane could win the
+            //      old fold the same way), and also absorbs the one NaN
+            //      corner - d * (-inf) with a zero-amax d = 0 - because
+            //      fmaxf drops a NaN operand. row_max / o_scale / the vec
+            //      hand-off therefore stay bit-identical to the 128-thread
+            //      kernel (:454-458). ----
             float m_deq;
-            if constexpr (is_last) {
-                if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-                    m_deq = dequant_scale[0] * ws::tree_fmax_cls<0, 32>(&RS_row[0]);
+            if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+                m_deq = dequant_scale[0] * ws::tree_fmax_cls<0, 32>(&RS_row[0]);
 #pragma unroll
-                    for (uint32_t cls = 1; cls < kNumKScales; cls++) {
-                        m_deq = fmaxf(m_deq, dequant_scale[cls] * ws::tree_fmax_cls<0, 32>(&RS_row[2 * cls]));
-                    }
-                }
-                else {
-                    m_deq = dequant_scale[0] * ws::tree_fmax<CTA_K>(RS_row);
+                for (uint32_t cls = 1; cls < kNumKScales; cls++) {
+                    m_deq = fmaxf(m_deq, dequant_scale[cls] * ws::tree_fmax_cls<0, 32>(&RS_row[2 * cls]));
                 }
             }
             else {
-                if constexpr (K_GRAN == QuantGranularity::kPerThread) {
-                    m_deq = dequant_scale[0] * __int2float_rz(ws::tree_imax_cls<0, 32>(&RS_row[0]));
-#pragma unroll
-                    for (uint32_t cls = 1; cls < kNumKScales; cls++) {
-                        m_deq =
-                            fmaxf(m_deq, dequant_scale[cls] * __int2float_rz(ws::tree_imax_cls<0, 32>(&RS_row[2 * cls])));
-                    }
-                }
-                else {
-                    m_deq = dequant_scale[0] * __int2float_rz(ws::tree_imax<CTA_K>(RS_row));
-                }
+                m_deq = dequant_scale[0] * ws::tree_fmax<CTA_K>(RS_row);
             }
             m_deq = fmaxf(m_deq, -5000000.0f);
 
@@ -936,13 +878,13 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             //      o_scale rescale is folded into the d_sum accumulation
             //      below as an EXPLICIT fmaf: nvcc contracted the old
             //      `denom *= o_scale; ...; denom += d_sum` pair into one FFMA
-            //      inside the straight-line step, and the wave22/23 control
-            //      flow inserted between them (issue wall, moved vec_empty
-            //      wait) splits the basic block, which killed the
-            //      contraction and turned golden bit-exactness into 1-ulp
-            //      denominator drift (wave23 B200 golden, 132 diffs, all
-            //      multi-block shapes). fmaf keeps the FFMA in every code
-            //      shape. ----
+            //      inside the straight-line step, and control flow inserted
+            //      between the two statements (the reverted wave22 issue
+            //      wall / moved vec_empty wait were both instances) splits
+            //      the basic block, which killed the contraction and turned
+            //      golden bit-exactness into 1-ulp denominator drift (wave23
+            //      B200 golden, 132 diffs, all multi-block shapes). fmaf
+            //      keeps the FFMA in every code shape. ----
             const float m_prev  = row_max;
             row_max             = max(row_max, fmaf(m_deq, local_sm_scale, -S_FP8_OFFSET));
             const float o_scale = math::ptx_exp2(m_prev - row_max);
@@ -975,42 +917,21 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             //      1's P store (s_empty_1, hence QK_1(iter+1), hence its NEXT
             //      step and that step's exp2 segment) runs about one rescale
             //      behind tile 0 - a structural per-step offset replacing the
-            //      cross-work-item phase lock. Same wait, same completion,
-            //      same phase sequence - only its position in this
-            //      warpgroup's program moved, so every ledger count/phase is
-            //      untouched (barrier_ledger.md, persistent section P6, incl.
-            //      the deadlock argument). No float op moves: bit-exact.
-            //      (wave23 fusion: the issue wall below now pins the exp2
-            //      segment under this wait in ALL forms, subsuming the
-            //      wave22 SASS-schedule caveat about ptxas hoisting the FP
-            //      chain above a data-edge-free spin.) ----
+            //      cross-work-item phase lock. (SASS check, nvcc 13.3: in
+            //      this form ptxas keeps the whole exp2 segment after the
+            //      moved wait, so the offset applies within the step; in the
+            //      rejected predicated form it hoisted the exp2 math above
+            //      the wait - the spin has no data edge into the FP chain -
+            //      which would only shift the offset to the next step's
+            //      start, same steady-state stagger.) Same wait, same
+            //      completion, same phase sequence - only its position in
+            //      this warpgroup's program moved, so every ledger
+            //      count/phase is untouched (barrier_ledger.md, persistent
+            //      section P6, incl. the deadlock argument). No float op
+            //      moves: bit-exact. ----
             if constexpr (kEx2PhaseGate) {
                 ws::wait_bar(bar_vempty, vec_empty_phase);
                 vec_empty_phase ^= 1;
-            }
-
-            // ---- issue wall (wave22, C1_DESIGN.md section 14). Without it
-            //      ptxas sinks the vec STTM/arrive into the exp2/pack tail
-            //      (baseline SASS: STTM.x2 amid the F2FP burst, ~25
-            //      instructions before the P store), so the hand-off
-            //      correction spins on was delivered a whole XU burst late -
-            //      in-order issue makes textual order issue order, and a
-            //      straight-line block lets the scheduler interleave freely.
-            //      The wall is a control dependence: an opaque never-taken
-            //      early-out (vec_gate is bar_vfull's shared-window address,
-            //      nonzero by the bars layout; the volatile asm hides the
-            //      value from NVVM, and ptxas cannot fold a runtime address),
-            //      which neither compiler can delete, and no instruction
-            //      below it can issue above the branch - or above the arrive
-            //      (and, under the EX2 phase gate, the moved vec_empty wait)
-            //      before it (hoisting the branch would make the arrive
-            //      conditional). Warp-uniform by construction (bar_vfull is
-            //      warpgroup-uniform), so the tcgen05 .aligned contract below
-            //      holds. Runtime cost: ISETP+BRA per step. ----
-            uint32_t vec_gate = bar_vfull;
-            asm volatile("" : "+r"(vec_gate));
-            if (vec_gate == 0) {
-                return;
             }
 
             // ---- p = exp2(fma(raw, c_raw, -row_max)), d_sum, e4m3 pack from
@@ -1045,19 +966,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 }
             }
             const float neg_row_max = -row_max;
-            // Retained-row word -> f32 exp2 operand: the peeled step holds
-            // f32 bits (mask sentinel path); steady steps hold the raw int32
-            // and convert here - the same exact I2F the old convert loop ran
-            // before the vec hand-off, just past it now (wave22).
-            auto col_f32 = [&](uint32_t rw) {
-                if constexpr (is_last) {
-                    return __uint_as_float(rw);
-                }
-                else {
-                    return __int2float_rz(static_cast<int32_t>(rw));
-                }
-            };
-            float acc[8];  // 4 packed f32x2 d_sum accumulators
+            float       acc[8];  // 4 packed f32x2 d_sum accumulators
 #pragma unroll
             for (uint32_t k = 0; k < 8; k++) {
                 acc[k] = 0.0f;
@@ -1080,16 +989,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 float a[4];
                 ws::f32x2_fma(a[0],
                               a[1],
-                              col_f32(RS_row[4 * w]),
-                              col_f32(RS_row[4 * w + 1]),
+                              __uint_as_float(RS_row[4 * w]),
+                              __uint_as_float(RS_row[4 * w + 1]),
                               c01,
                               c01,
                               neg_row_max,
                               neg_row_max);
                 ws::f32x2_fma(a[2],
                               a[3],
-                              col_f32(RS_row[4 * w + 2]),
-                              col_f32(RS_row[4 * w + 3]),
+                              __uint_as_float(RS_row[4 * w + 2]),
+                              __uint_as_float(RS_row[4 * w + 3]),
                               c23,
                               c23,
                               neg_row_max,
