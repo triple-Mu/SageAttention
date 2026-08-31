@@ -327,9 +327,9 @@ def test_varlen_downgrades_smooth_v():
 
 
 def test_varlen_accepts_sm100():
-    """The sm100 packed kernel landed at the plan level; the python wrapper
-    gates it off again pending the async-hang fix (the plan op itself still
-    resolves it, which is what the A3 debugging arms rely on)."""
+    """The sm100 packed kernel is a first-class varlen backend: the plan op
+    resolves it and the python wrapper serves it (the wave16/17 async-hang
+    gate is lifted, SM100_VARLEN_DESIGN.md 6.4.6)."""
     p = Plan(*PLAN_OP(10, 0, 128, "sm100", None, None, None, True))
     if p.error:
         assert "not in this build" in p.error
