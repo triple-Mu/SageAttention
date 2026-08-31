@@ -1446,7 +1446,8 @@ correction 消费侧只 ld 一个 alpha 字。它 correction 等待更低的两�
   fmax 树」逐位同值(相等元素转换后仍相等;int 0 → +0.0,无 -0.0 来源;
   非 peeled 步无 -inf/NaN 来源)。m_deq = dequant × 该值,乘法输入逐位
   同 → 输出逐位同。per-thread 粒度逐 class 同理,class 间 fmaxf fold
-  形状未动。
+  形状未动。numpy 位级自检:`bench/sm100_review/imax_domain_sim.py`
+  (10000 行 × 整行 + 4 class,含 0 与重复 max corner,PASS)。
 * **P/d_sum 链**:pack 环里 `__int2float_rz(raw)` 产出的 f32 与旧转换环
   产出的是同一个值(同一条指令换位置),packed fma/exp2/pack/d_sum 的
   输入序列逐位不变。
