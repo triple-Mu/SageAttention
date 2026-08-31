@@ -608,32 +608,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
                 }
                 float s = __int2float_rz(static_cast<int32_t>(RS_u32[jj])) * dequant_scale_j;
 
-#ifdef SAGE_VARLEN
-                // Bottom-right alignment can put masked elements in more than
-                // the peeled last tile (delta not a multiple of CTA_K), so the
-                // trigger is a runtime tile-index predicate; block-uniform,
-                // since iter and first_masked_tile both are. Signed throughout:
-                // the shifted row bound can be negative, and an unsigned
-                // compare would wrap it into "mask nothing" exactly where
-                // everything is masked. With delta == 0 the masked elements
-                // are the dense peeled-tile ones and every other tile runs the
-                // dense arithmetic, so the dense bit-equality holds. The
-                // prefetches above and below stay peeled on is_last.
-                if (static_cast<int32_t>(iter) >= first_masked_tile) {
-                    // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
-                    const int32_t kv_idx = static_cast<int32_t>(iter * CTA_K + j);
-                    bool          is_out_of_bounds;
-                    if constexpr (mask_mode == MaskMode::kCausal) {
-                        is_out_of_bounds = (kv_idx > q_idx_mask) || (kv_idx >= static_cast<int32_t>(kv_len));
-                    }
-                    else {
-                        is_out_of_bounds = (kv_idx >= static_cast<int32_t>(kv_len));
-                    }
-                    if (is_out_of_bounds) {
-                        s = -5000000.0f;
-                    }
-                }
-#else
+#ifndef SAGE_VARLEN
                 if constexpr (is_last) {
                     // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
                     const uint32_t kv_idx = iter * CTA_K + j;
@@ -648,12 +623,65 @@ __global__ void __launch_bounds__(NUM_THREADS)
                         s = -5000000.0f;
                     }
                 }
+                m_local = max(m_local, s);
 #endif
 
-                m_local   = max(m_local, s);
                 RS_f32[j] = s;
             }
         }
+
+#ifdef SAGE_VARLEN
+        // Bottom-right alignment can put masked elements in more than the
+        // peeled last tile (delta not a multiple of CTA_K), so masking wants
+        // a runtime tile predicate (block-uniform: iter and first_masked_tile
+        // both are). It must NOT ride inside the S-drain loop above. Compiled
+        // there, the mask lowers to ~500 compare/select instructions
+        // interleaved with the four tcgen05.ld of every tile - issued,
+        // predicated on or off, on every tile of every causal CTA - and with
+        // that stream in the drain the causal instances intermittently lose
+        // a barrier completion: one CTA parks in the main loop's
+        // wait(barrier_V) forever, ~1/50-1/2000 launches on mixed-trip
+        // causal grids (the wave14/16 varlen stress hang). The B200 verdict
+        // matrix (SM100_VARLEN_DESIGN 6.4.6) walked the alternatives: the
+        // E5 scheduling deltas (k_scale position, S-drain load concurrency)
+        // and every shape axis are ruled out; moving the chain to a branched
+        // twin of the loop only cuts the rate (~50x, still struck); an
+        // unsigned-form chain in place still strikes; dropping the chain
+        // from the loop (this form, or the dense-shape diagnostic) is what
+        // turns the arm green. Hardware-level mechanism unidentified - treat
+        // "no mask instructions between the drain's tcgen05.ld/wait" as an
+        // empirical constraint of this TU, same standing as the A2/A5
+        // entries in test/HARDWARE_CHECKLIST.md.
+        //
+        // So: drain first (dense instruction shape), then mask the registers,
+        // then reduce the row max - the same values in the same reduction
+        // order, so results are bit-identical, and with delta == 0 the masked
+        // elements are the dense peeled-tile ones (dense bit-equality holds).
+        // Signed compares, as before: a dead row's shifted bound is negative
+        // and must mask everything, not wrap. The prefetches stay peeled on
+        // is_last.
+        if (static_cast<int32_t>(iter) >= first_masked_tile) {
+#pragma unroll
+            for (uint32_t j = 0; j < CTA_K; j++) {
+                // fused causal/OOB mask: column j <-> kv position iter*CTA_K + j
+                const int32_t kv_idx = static_cast<int32_t>(iter * CTA_K + j);
+                bool          is_out_of_bounds;
+                if constexpr (mask_mode == MaskMode::kCausal) {
+                    is_out_of_bounds = (kv_idx > q_idx_mask) || (kv_idx >= static_cast<int32_t>(kv_len));
+                }
+                else {
+                    is_out_of_bounds = (kv_idx >= static_cast<int32_t>(kv_len));
+                }
+                if (is_out_of_bounds) {
+                    RS_f32[j] = -5000000.0f;
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t j = 0; j < CTA_K; j++) {
+            m_local = max(m_local, RS_f32[j]);
+        }
+#endif
 
         // ---- online softmax update (thread-local; no shuffles) ----
         // row_max folds sm_scale (already x log2e) and the e4m3-saturation offset:
