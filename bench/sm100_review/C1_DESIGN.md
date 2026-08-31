@@ -1134,7 +1134,7 @@ sim 模型经 accuracy gate 实证(误差带吻合),perf 侧的「ballot 命中�
 revert**;c398bb5(sim)与 §12 文档保留,本节即判负记录。golden 轨不切
 换,后续 ws 路 bitwise gate 仍对 `golden-sm100-g1ws`。
 
-## 13. Phase B:persistent CTA(wave20 实现;上机待验收)
+## 13. Phase B:persistent CTA(wave20 实现;wave20 B200 验收:golden/压测全过,非 causal 全胜、causal 判负,建议 c0-only 进 auto,见 13.5)
 
 BEYOND_CUDNN_PLAN §4.4 的第一步(NATURAL→LPT 里直接做了静态 LPT;CLC
 try_cancel 动态调度留二期,需 p0d probe 先行)。独立 TU
@@ -1214,3 +1214,63 @@ issue 循环 `#pragma unroll 1`(外层大循环里 frontend 展开叠 live);kblk
    long_scoreboard 对 wave14 侧写复查;K scale LDG 回归的 L2 read 增量
    单独归因(决定是否做 sK_scale 重铺)。
 5. 过线后再谈 auto 选路(现默认 off,不影响任何既有路径)。
+
+### 13.5 wave20 上机实测(B200;golden/压测全过,bench 按 causal 分裂)
+
+树 sage-w10 = 8f79428,构建 10.0a + PRUNE=OFF;主会话 JID 4034447
+(umbriel-b200-073,健康门过),c1 补充会话 JID 4034943(umb-b200-041)。
+原始数据:集群 `logs-w20/`(golden/stress/bench/ncu/scan + ncu-c1/scan-c1)。
+routing 自检:torch.profiler 确认 PERSIST=1 时 launch 的是
+`*_ws_persist` 符号,=0 时不是(排除静默回退假阳性)。
+
+1. **golden 三轨全过**:WS=0 对 golden-sm100 ok=2082、WS=1 对
+   golden-sm100-g1ws ok=2107、WS=1+PERSIST=1 对 golden-sm100-g1ws
+   **ok=2107,全部 diff=0 missing=0**——persistent bit-exact 硬闸兑现
+   (P1-P5 账本的跨 work item 语义无一泄漏)。
+2. **压测零挂死**(全部 PERSIST=1):SWEEP 2k-128k×两态×10 + s32768
+   8000×2;s139264 b1h32 2000×2(17408 item / 148 CTA ≈ 118 波
+   grid-stride);W=1 退化 s1024 b1h32;trip 退化 s256/s512;单 head 单
+   batch b1h1 s4096;各 2000×2。
+3. **bench 22 点 ×3 轮(四方轮换,轮间 spread <1.5%)**:全表
+   wsp/ws 0.979 —— 但按 causal 干净分裂:
+
+   | d128 段 | wsp/ws c0 | wsp/ws c1 | wsp/cudnn c0 | ws/cudnn c0 |
+   |---|---|---|---|---|
+   | s1024 | 1.108 | 0.884 | 0.926 | 0.835 |
+   | s4096 | **1.104** | 0.923 | 0.878 | 0.796 |
+   | s16384 | 1.072 | 0.873 | **1.012** | 0.944 |
+   | s32768 | 1.068 | 0.865 | 1.059 | 0.992 |
+   | s131072 | 1.070 | 0.864 | 1.096 | 1.025 |
+   | 全段 | **1.084** | 0.881 | 0.991 | 0.914 |
+
+   c0 20 点全正(最小 1.030 b1s1024,最大 1.192 b4s1024),s4096 命中
+   §7.7 的 +8~13% 预测;**wsp/cudnn 在 c0 s≥16384 三段全部 ≥1.0**
+   (s16384 段 1.012,其中 b4h32 1.042——首次在 16k 破 cudnn)。c1 十点
+   全负(0.819-0.975),长序列稳定 -13.5%。d64 两探针 0.99(不专为它,
+   符合预期)。
+4. **ncu**:
+   - `launch__waves` 13.84→1(s4096 c0)、3.46→1(s1024 c0);duration
+     993→928 us、95.0→84.4 us。
+   - 序幕摊薄坐实:tiny driver 重扫,ws 单波截距 **17.3K cycles/CTA
+     (逐字复现 w19 锚点)**、斜率 4.27K/kv 块;wsp 截距 18.8K 但每 CTA
+     只付一次——b4s4096 每 SM 序幕成本 238.8K→18.8K cycles(12.7×);
+     指令口径 UTCATOMSWS(TMEM alloc)执行数 4096→296(= grid 比
+     13.8×)。
+   - **vec_full 自旋未被吃掉**:c0 s4096 21.2%→21.3%(稳态管线属性,
+     与序幕无关);barrier 自旋总份额 55.3%→55.3%;收益全部来自序幕,
+     eligible 0.475→0.508、cycles/issue 9.58→9.01。
+   - 新 barrier 在 c0 近零成本:q_empty 自旋样本 0(s4096)/1.3%
+     (s1024),epi_empty ≤0.1%;K scale LDG 回归不可见(L2 read 持平,
+     201.55→201.58 GB),sK_scale 重铺不立项。
+   - **c1 劣化归因(补充会话)**:s16384 c1 wsp 慢 14.1%(7.16→8.17
+     ms),指令数反而更少(2969M→2940M)→ 纯发射效率损失;ledger 显示
+     vec_full 从 14.7/7.9 偏斜成 **19.7/3.4**(双 Q tile 跨 item 链式
+     去错相),kv_empty[1] 2.7%→5.3%,softmax mio 3%→11%(EX2 同相,
+     w19 d64 §7 同款);且 **W=1 单 item 退化下 c1 每 kv 块斜率已 +13%**
+     (无链式也慢)——causal 劣化是稳态结构性的,不是序幕问题。
+5. **结论与 auto 建议**:VERDICT_PERSIST_PARTIAL——golden/压测硬闸全
+   过,kernel 语义安全;bench/ncu 支持 **auto 选中 ws 且非 causal 时默
+   认走 persistent**(d128 c0 全段全正),causal 维持非 persist ws,等
+   c1 的去错相/短 runway 修复(候选:两 tile 交错重错相、q_empty 提前
+   commit)单独立项后再翻。手动 `SAGEATTN_SM100_WS_PERSIST=1` 两态照旧
+   可用。
