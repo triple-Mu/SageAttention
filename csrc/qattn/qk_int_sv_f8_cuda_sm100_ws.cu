@@ -689,6 +689,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         const uint32_t trip     = trip_count(tile);
         const uint32_t lane_row = threadIdx.x % 128;  // S row within the tile == TMEM lane
 
+        // EX2 phase gate (wave22; D64_DESIGN.md 8). d64 instances only: the
+        // step-tail vec_empty acquire moves to right after the vec_full
+        // arrive (details at the two wait sites below). The wave19 d64 ncu
+        // verdict (D64_DESIGN.md 7.2): the halved QK shadow lets the two
+        // softmax warpgroups' MUFU.EX2 segments run in phase on each SMSP -
+        // mio_throttle 2.4x, burst-and-hole XU supply, the whole 8.7%
+        // per-tile-block anomaly. d128 keeps the tail acquire (its long MMA
+        // shadow staggers the warps naturally); its SASS must not move.
+        constexpr bool kEx2PhaseGate = (head_dim == 64);
+
         const uint32_t batch_id     = blockIdx.z;
         const uint32_t cta_idx_q    = blockIdx.x;  // covers Q rows [256*bx, 256*bx + 256)
         const uint32_t head_id      = blockIdx.y;
@@ -911,8 +921,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
             // ---- vec = (m_prev, row_max) -> correction, sent before the exp2
             //      segment so the O rescale overlaps it. Slot held from the
-            //      previous step's tail acquire (virgin on step 0). All S
-            //      reads are done, so aliasing cols [0,2) is harmless. ----
+            //      previous step's acquire (tail, or pre-exp2 under the EX2
+            //      phase gate; virgin on step 0). All S reads are done, so
+            //      aliasing cols [0,2) is harmless. ----
             uint32_t vec_u32[2];
             vec_u32[0] = __float_as_uint(m_prev);
             vec_u32[1] = __float_as_uint(row_max);
@@ -920,6 +931,38 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::tmem_st_wait();
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_vfull);
+
+            // ---- EX2 phase gate (d64 only): the vec_empty acquire moves
+            //      HERE from the step tail, both tiles (a tile-predicated
+            //      variant was tried first: ptxas carried the `tile` predicate
+            //      across the setmaxnreg boundary on the stack - 8B frame,
+            //      6 LDL reloaded at the hot loop top - so the branch-free
+            //      form it is; the asymmetry below comes from correction's
+            //      program order, not from code). The completion is
+            //      correction's arrive after reading vec_t(iter). Correction
+            //      consumes vec_0 first - it spins on vec_full_0 in the
+            //      steady profile (D64_DESIGN.md 7.2: 22.9%/1.5%) - so tile
+            //      0's wait is already satisfied and free; tile 1's wait
+            //      completes only after correction also passed the O_0
+            //      rescale, so tile 1's P store (s_empty_1, hence QK_1
+            //      (iter+1), hence its NEXT step and that step's exp2
+            //      segment) runs about one rescale behind tile 0 - a
+            //      structural per-step offset breaking the d64 EX2 phase
+            //      lock. (SASS check, nvcc 13.3: in this form ptxas keeps the
+            //      whole exp2 segment after the moved wait, so the offset
+            //      applies within the step; in the rejected predicated form
+            //      it hoisted the exp2 math above the wait - the spin has no
+            //      data edge into the FP chain - which would only shift the
+            //      offset to the next step's start, same steady-state
+            //      stagger.) Same wait, same completion, same phase sequence
+            //      - only its position in this warpgroup's program moved, so
+            //      every ledger count/phase is untouched (barrier_ledger.md
+            //      section 10, incl. the deadlock argument). No float op
+            //      moves: bit-exact. ----
+            if constexpr (kEx2PhaseGate) {
+                ws::wait_bar(bar_vempty, vec_empty_phase);
+                vec_empty_phase ^= 1;
+            }
 
             // ---- p = exp2(fma(raw, c_raw, -row_max)), d_sum, e4m3 pack from
             //      the retained raw row (G1 domain fold). With
@@ -1015,9 +1058,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_empty);
 
-            // acquire the vec slot for the next store (correction read it)
-            ws::wait_bar(bar_vempty, vec_empty_phase);
-            vec_empty_phase ^= 1;
+            // acquire the vec slot for the next store (correction read it);
+            // under the EX2 phase gate the acquire already happened pre-exp2
+            if constexpr (!kEx2PhaseGate) {
+                ws::wait_bar(bar_vempty, vec_empty_phase);
+                vec_empty_phase ^= 1;
+            }
         };
 
         for (uint32_t iter = 0; iter + 1 < trip; iter++) {
@@ -1027,8 +1073,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
 
         // ---- final vec = (denom, row_max): correction derives the epilogue
         //      d_rcp from denom (bit-identical: f32 round-trips TMEM exactly).
-        //      The slot was acquired at the tail of the last step, so the
-        //      store cannot clobber a vec correction has not read. ----
+        //      The slot was acquired inside the last step (tail, or pre-exp2
+        //      under the EX2 phase gate), so the store cannot clobber a vec
+        //      correction has not read. ----
         uint32_t vec_u32[2];
         vec_u32[0] = __float_as_uint(denom);
         vec_u32[1] = __float_as_uint(row_max);

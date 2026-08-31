@@ -502,7 +502,63 @@ M0 ✅(本节)。D1 ✅:反常归因 = EX2 发射同相突发(7.2),G3 判据落�
 
 ---
 
-## 附录 A:黑名单对照(立项前必查;总表在 BEYOND_CUDNN_PLAN 附录 A)
+## 8. M1 首刀:EX2 phase gate(wave22 实现;本地闸全过,待上机)
+
+7.2/7.4 判据的第一个落地:d64 反常的根是两个 softmax warpgroup 的 EX2
+段同相打满 MUFU 队列,修复走「交错/去同相」lever。与 C1_DESIGN §13.6
+(persist causal 同族问题)同一机制,分别 gate 在两个 TU:本 TU
+`head_dim == 64`(d128 SASS 一字节不动),persist TU gate causal。
+
+### 8.1 机制
+
+softmax 两个 warpgroup 的 per-step `vec_empty` acquire 从 step 尾
+(P store 之后)前移到 `arrive vec_full` 之后。错相来自 correction 的程
+序序而非代码分支:correction 先消费 vec_0(7.2:它在 vec_full_0 上自旋
+22.9%/1.5%,恒领先 softmax0)→ tile0 的前移 wait 到达即完成,零开销;
+tile1 的 wait 要等 correction 再走完 O_0 rescale → tile1 的 P store
+(继而 QK_1(j+1)、softmax1 下一步)每步落后 tile0 约一个 rescale——
+结构性错相,拆掉 EX2 同相突发。SASS 实测(nvcc 13.3):ptxas 把整段
+exp2(128×EX2)保持在前移 wait 之后,错相直接作用于本步 EX2 段。
+
+- **branch-free 的由来**:tile 谓词版(只挪 tile1)实测让 ptxas 把
+  `tile` 谓词跨 setmaxnreg 边界放栈上(d64 c1 sm_100a:8B frame、6 LDL
+  在热循环顶部重载),判弃;无分支版谓词彻底消失,靠动态耦合出不对称。
+- **语义**:同 wait 同 completion 同 phase 序,只挪线程内位置;计数/
+  相位/deadlock 论证 barrier_ledger.md §10(含 step-0/trip-1 退化)。
+  无浮点移动,bit-exact,golden 双轨 diff=0 仍是硬闸。
+- **候选取舍**:per-warp 起始列旋转——旋转改 d_sum 4 链的累加序
+  (f32 加法不可结合)→ denom 位变 → 违反 golden 硬闸,判不可行;
+  exp2 段分半与 pack 交错——warp 内密度整形,但 7.2 判据指向 warp 间
+  相位(d128 同款 per-warp 代码无反常),且在 128-reg 行峰值上重排
+  寄存器风险高,收益弱,不做。
+- **黑名单对照**:§4.7 的 USE_SEQ_GATE(cutedsl S0/S1 named-barrier 硬
+  错拍,实测删掉更快)不适用——本修复零新 barrier、零 warpgroup 会合
+  点,只挪既有 wait,是数据流耦合出的软错相,空转成本自限(wait 已满
+  足时零延迟)。
+
+### 8.2 本地门禁(全过;nvcc 13.3)
+
+- ptxas probe(命令见 qk_int_sv_f8_cuda_sm100_ws_probe.cu 文件头)4 实
+  例 × sm_100a/sm_110a:0 spill/stack、128 entry、USETMAXREG
+  0xc0/0x58/0x28 各 ×4。
+- SASS 范围(cuobjdump 按函数对照基线 fc03183):d128 两实例两 arch
+  **逐字节相同**;d64 两实例 +8/+16 指令,softmax steady loop 594→596
+  (c0 kPerWarp 口径),op mix 不变,新序列
+  `STTM.x2 → arrive vec_full → try_wait vec_empty → 128×EX2 → STTM.x32`
+  已逐条确认。
+
+### 8.3 上机判据(B200)
+
+1. golden 双轨(含 hd64 形状)diff=0:`SAGEATTN_SM100_WS=1` 对
+   golden-sm100-g1ws;WS=0 路不受影响。
+2. 压测:ws_stress.py hd64 两态 SWEEP + trip=1 退化,零挂死。
+3. bench(7.6 口径 12 点:hd64 s{4096,16384,32768} × b{1,4} × 两态,
+   3 轮 median,spread ≤1.5%):ws/old 基线 0.980(12 点全 <1,最差
+   0.948)。判据:geomean **≥0.980 为不回退底线**;12 点全部 ≥1 才翻
+   M2 的 auto 判据(launcher 注释同步改);<0.96 判负回退本 commit。
+4. ncu(s16384 nc b4h32,7.1 口径):stall/issue mio_throttle 0.95 →
+   往 old 的 0.12 收;eligible 0.48 → 0.67 方向;vec_full 自旋相位
+   22.9/1.5 回平;XU % 53.7 →(追平线 81)的进度即本刀的天花板读数。
 
 | 本文候选 | 相关黑名单条目 | 对照结论 |
 |---|---|---|
