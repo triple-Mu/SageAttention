@@ -168,7 +168,10 @@ issue wall (wave22): opaque never-taken branch; the segment below cannot
   issue before the arrive above (nor before the moved vec_empty wait, when
   gated). Pure control flow - completions, counts and phases of every pipe
   unchanged
-I2F+exp2+pack from the retained row (no TMEM reads); denom += d_sum
+I2F+exp2+pack from the retained row (no TMEM reads);
+  denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: the control
+  flow above splits the basic block, so the old *= / += pair no longer
+  contracts on its own - the fmaf keeps the baseline's FFMA bit pattern)
 st P -> wait::st, fence, arrive s_empty#j
 [w] vec_empty#j (tail position: ungated instances only)
 ```

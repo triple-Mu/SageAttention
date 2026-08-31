@@ -932,11 +932,20 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             }
             m_deq = fmaxf(m_deq, -5000000.0f);
 
-            // ---- online softmax update (expressions of :454-458) ----
+            // ---- online softmax update (expressions of :454-458). denom's
+            //      o_scale rescale is folded into the d_sum accumulation
+            //      below as an EXPLICIT fmaf: nvcc contracted the old
+            //      `denom *= o_scale; ...; denom += d_sum` pair into one FFMA
+            //      inside the straight-line step, and the wave22/23 control
+            //      flow inserted between them (issue wall, moved vec_empty
+            //      wait) splits the basic block, which killed the
+            //      contraction and turned golden bit-exactness into 1-ulp
+            //      denominator drift (wave23 B200 golden, 132 diffs, all
+            //      multi-block shapes). fmaf keeps the FFMA in every code
+            //      shape. ----
             const float m_prev  = row_max;
             row_max             = max(row_max, fmaf(m_deq, local_sm_scale, -S_FP8_OFFSET));
             const float o_scale = math::ptx_exp2(m_prev - row_max);
-            denom *= o_scale;
 
             // ---- vec = (m_prev, row_max) -> correction, sent before the exp2
             //      segment so the O rescale overlaps it. Slot held from the
@@ -1098,7 +1107,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             ws::f32x2_add(acc[0], acc[1], acc[0], acc[1], acc[4], acc[5]);
             ws::f32x2_add(acc[2], acc[3], acc[2], acc[3], acc[6], acc[7]);
             ws::f32x2_add(acc[0], acc[1], acc[0], acc[1], acc[2], acc[3]);
-            denom += acc[0] + acc[1];
+            // denom = o_scale * denom + d_sum, one FFMA - the exact op nvcc
+            // contracted the old  *= / +=  pair into (see the o_scale note).
+            denom = fmaf(o_scale, denom, acc[0] + acc[1]);
 
             // ---- P -> TMEM (TS A-operand layout, mirrors :493-499; cols
             //      [32,64) alias S but the row is already in registers), then
