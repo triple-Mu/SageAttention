@@ -26,7 +26,7 @@
 ## 3. 本轮新增语义(必读)
 
 - `fwd` 有 keyword-only `backend=None` 覆写(resolve 的 req_backend 透传);显式 backend 撞未编 SASS 会得到干净 TORCH_CHECK(plan.cpp `backend_serves`)。
-- **`SAGEATTN_SM100_WS` 三态**:未设=auto(d128 且 qo_len≥16384 非 causal / ≥32768 causal 自动走 WS kernel)、`1`=强制 WS、`0`=强制旧(跑旧路 golden/SS oracle 必须显式 0)。
+- **`SAGEATTN_SM100_WS` 三态**:未设=auto(head_dim 64/128 都走 ws 路,再按 `SAGEATTN_SM100_WS_PERSIST` 三态分流:非 causal→persistent、causal→per-tile ws;wave25 起,见 D64_DESIGN §8.6)、`1`=强制 WS、`0`=强制旧(跑旧路 golden/SS oracle 必须显式 0)。
 - V 融合门限 per-arch:sm89=12288、sm100/110=24576、其余 4096(quant_cuda.cu `fused_v_quant_max_tokens`);两路 bit 等价,换路不动 golden。
 - quant kernel:per_warp/per_thread 家族 dense/varlen 双实例;per-block 家族 dense 仍走 kVarlen=true 实例(H200 判据,见 FINAL_PASS_REPORT §3)。
 - `SAGE_PRUNE_GENCODE`(**默认 ON**,2026-08-30 用户拍板):build CPU −36%/体积 −38%;cc12 机上显式请求 sm89 家族对拍需 -DSAGE_PRUNE_GENCODE=OFF 重建。
