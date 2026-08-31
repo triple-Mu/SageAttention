@@ -98,18 +98,43 @@ Sm100WsMode sm100_ws_mode()
     return mode;
 }
 
-// SAGEATTN_SM100_WS_PERSIST: truthy = route ws-selected calls to the
-// persistent kernel (env read once, same contract as SAGEATTN_SM100_WS).
-bool sm100_ws_persist_on()
+// SAGEATTN_SM100_WS_PERSIST, three-state like SAGEATTN_SM100_WS (env read
+// once, only the mode is cached):
+//   unset / "auto"  persistent for non-causal ws calls only (default). The
+//                   wave20 B200 acceptance (C1_DESIGN 13.5) has persistent
+//                   winning every non-causal d128 shape (+6.8..19.2% vs ws,
+//                   prologue amortized 12.7x) but losing 9-18% on causal
+//                   (steady-state de-phasing across work items), so causal
+//                   stays on the per-tile ws kernel until that is fixed.
+//   "1" / "on"      force persistent for every ws-selected call
+//   "0" / "off"     never
+enum class Sm100PersistMode {
+    kAuto,
+    kOn,
+    kOff
+};
+
+Sm100PersistMode sm100_ws_persist_mode()
 {
-    static const bool on = [] {
+    static const Sm100PersistMode mode = [] {
         const char* v = std::getenv("SAGEATTN_SM100_WS_PERSIST");
-        return v != nullptr
-               && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "ON") == 0
-                   || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "YES") == 0
-                   || std::strcmp(v, "yes") == 0);
+        if (v == nullptr || std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+            return Sm100PersistMode::kAuto;
+        }
+        if (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "ON") == 0
+            || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "YES") == 0
+            || std::strcmp(v, "yes") == 0) {
+            return Sm100PersistMode::kOn;
+        }
+        return Sm100PersistMode::kOff;
     }();
-    return on;
+    return mode;
+}
+
+bool sm100_ws_persist_pick(int is_causal)
+{
+    const Sm100PersistMode mode = sm100_ws_persist_mode();
+    return mode == Sm100PersistMode::kOn || (mode == Sm100PersistMode::kAuto && !is_causal);
 }
 
 // Heuristic for kAuto. After G1 (raw-domain softmax) the ws kernel wins on
@@ -150,7 +175,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
     const Sm100WsMode ws_mode = sm100_ws_mode();
     if (ws_mode == Sm100WsMode::kOn
         || (ws_mode == Sm100WsMode::kAuto && sm100_ws_auto_pick(query, tensor_layout, is_causal))) {
-        if (sm100_ws_persist_on()) {
+        if (sm100_ws_persist_pick(is_causal)) {
             return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws_persist(query,
                                                                         key,
                                                                         value,
