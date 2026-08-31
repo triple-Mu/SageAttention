@@ -139,7 +139,8 @@ if(SAGE_BUILD_VARLEN)
 endif()
 set(SAGE_SRC_SM100
   csrc/qattn/qk_int_sv_f8_cuda_sm100.cu
-  csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu)
+  csrc/qattn/qk_int_sv_f8_cuda_sm100_ws.cu
+  csrc/qattn/qk_int_sv_f8_cuda_sm100_ws_persist.cu)
 # Same pattern as sm90: the varlen TU joins the group (and its accel gencode
 # list); it names its own namespace internally.
 if(SAGE_BUILD_VARLEN)

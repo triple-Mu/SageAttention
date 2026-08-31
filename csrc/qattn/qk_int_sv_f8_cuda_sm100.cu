@@ -57,6 +57,22 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(torch::Tensor query,
                                                            float         sm_scale,
                                                            int           return_lse);
 
+// Persistent ws kernel (qk_int_sv_f8_cuda_sm100_ws_persist.cu, Phase B).
+// Reached only when the ws path is selected AND SAGEATTN_SM100_WS_PERSIST is
+// truthy (opt-in, default off; auto integration waits for B200 acceptance).
+torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws_persist(torch::Tensor query,
+                                                                   torch::Tensor key,
+                                                                   torch::Tensor value,
+                                                                   torch::Tensor output,
+                                                                   torch::Tensor query_scale,
+                                                                   torch::Tensor key_scale,
+                                                                   torch::Tensor value_scale,
+                                                                   int           tensor_layout,
+                                                                   int           is_causal,
+                                                                   int           qk_quant_gran,
+                                                                   float         sm_scale,
+                                                                   int           return_lse);
+
 namespace {
 
 enum class Sm100WsMode {
@@ -80,6 +96,20 @@ Sm100WsMode sm100_ws_mode()
         return Sm100WsMode::kOff;  // "0"/"off"/anything else (keeps the old opt-in strictness)
     }();
     return mode;
+}
+
+// SAGEATTN_SM100_WS_PERSIST: truthy = route ws-selected calls to the
+// persistent kernel (env read once, same contract as SAGEATTN_SM100_WS).
+bool sm100_ws_persist_on()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("SAGEATTN_SM100_WS_PERSIST");
+        return v != nullptr
+               && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "ON") == 0
+                   || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "YES") == 0
+                   || std::strcmp(v, "yes") == 0);
+    }();
+    return on;
 }
 
 // Heuristic for kAuto. After G1 (raw-domain softmax) the ws kernel wins on
@@ -120,6 +150,20 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
     const Sm100WsMode ws_mode = sm100_ws_mode();
     if (ws_mode == Sm100WsMode::kOn
         || (ws_mode == Sm100WsMode::kAuto && sm100_ws_auto_pick(query, tensor_layout, is_causal))) {
+        if (sm100_ws_persist_on()) {
+            return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws_persist(query,
+                                                                        key,
+                                                                        value,
+                                                                        output,
+                                                                        query_scale,
+                                                                        key_scale,
+                                                                        value_scale,
+                                                                        tensor_layout,
+                                                                        is_causal,
+                                                                        qk_quant_gran,
+                                                                        sm_scale,
+                                                                        return_lse);
+        }
         return qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_ws(query,
                                                             key,
                                                             value,
