@@ -524,6 +524,77 @@ cudnn L2 read 反而比 nc 多(1.139G vs 1.087G,我们 0.569G 减半)——它�
 prefill kernel 里都没开,§4.4/§4.6 的预期收益不能再拿「cudnn 有」背书,
 要靠自己的消融立项。
 
+### 7.7 wave19 采集实录:s4096 发射效率去向 + per-CTA 固定开销(persistent 立项数据)
+
+口径:sage-w9 = 910a831(ballot 态,lazy 已 revert),B200 umbriel-b200-073
+(JID 4033880),ncu 自由 boost 频率(w16/w18 同口径;比值尽量用 cycles)。
+原始数据:集群 `logs-w19/ncu/dive_*`(--set full + SourceCounters +
+PmSampling)与 `logs-w19/scan/`。d64 侧的同场全套在 D64_DESIGN §7。
+
+**(a)eligible 0.48 vs 0.72 的去向(d128 b4h32 s4096,source-level 首采)**
+
+warp-stall 采样按角色代码区聚合(角色 = SASS 分区;barrier 自旋按
+PHASECHK 位移解码,消费者见 barrier 账本)。ws 全 kernel 样本的 **55.4%
+是 barrier 自旋**(c1 53%),cudnn 同形状 41%:
+
+| ws 自旋边(nc,占全 kernel 样本) | 占比 | 说明 |
+|---|---:|---|
+| correction 等 `vec_full`(tile0+tile1) | 21.3% | 等 softmax 交 (m_prev,row_max)——correction 区内 84% 时间在自旋,其中 78% 是这一条边 |
+| softmax 等 `s_full` | 16.6% | 等 mma 的 QK commit |
+| epi 等 `epi_full` | 6.6% | 等 correction 把 O_t 摆进 sO |
+| load 等 `kv_empty` | 5.9% | ring 满,正常背压 |
+| mma 等 `corr_empty`+`dealloc` | 4.1% | 等 correction rescale 完成 |
+| 其余(q_full/kv_full/…) | ~1% | |
+
+- softmax 区内构成:s_full 自旋 32%(计在 long_sb),其余 = EX2 链固有
+  wait 31% + 正常发射 selected 17% + mio_throttle 8%;LDTM 数据返回的
+  long_scoreboard ≈ 0(与 s16384 同,D64_DESIGN §7.2)。**s4096 与
+  s16384 的 stall 结构逐项相同**(自旋 55.4/56.9%、角色占比一致)——中段
+  谷地不是稳态结构变差,而是每 CTA 固定开销 × 13.84 waves 的摊薄不足,
+  见 (b)。
+- 排序含义:占比第一的 `vec_full` 边是 softmax 关键路径的下游投影(vec 在
+  max 树之后、exp2 之前交付),它和 `s_full` 一起把「softmax 串行链 + QK
+  等待」定为 eligible 亏损的两大来源;w14 表的 per-issue wait 2 倍差
+  (1.8 vs 0.9)与此同源。cudnn 的自旋分布更平(最大单边 12%),没有
+  一条 21% 的独大边。
+
+**(b)per-CTA 固定开销:单 wave 截距回归(prologue+ramp+teardown)**
+
+方法:b1h32 d128 nc 的 s{256,512,1024}(32/64/128 CTA,单 wave,kernel
+duration == 单 CTA 驻留)对 kv_blocks 线性回归;b4 多 wave 点做交叉核对
+与摊薄分母。ncu duration-only,每形状 3 实例 spread ≤1.4%(cudnn b4 s256
+7.4% 除外);驱动 `scripts-w19/w19_seq_scan.py`:
+
+| 引擎 | 截距 c0(cycles) | 斜率(cycles/KV 块) | c0 @1.8GHz | 拟合残差 |
+|---|---:|---:|---:|---:|
+| ws | **17.3K** | 4.23K | 9.6 µs | <1.2% |
+| cudnn | **14.0K** | 2.96K | 7.8 µs | <1.0% |
+
+- **截距占比上界**(c0×CTA 数/(148×总 cycles),= persistent 全摊薄的
+  理论上限):ws @s4096 **13.7%**、@s2048 24.4%、@s1024 35.7%(cudnn
+  16.5/30.7/46.4%)。
+- 上界要打折:多 wave 实测已有跨 CTA 重叠——ws b4 s4096 平均每 CTA
+  126.6K cycles < 单 wave 隔离外推 152.8K(-17%),波间充放本就部分重叠;
+  且 b1 低 trip 三点的斜率含 ramp,c0 是「纯 prologue+ramp 打包」。现实
+  锚:ws s4096 的 XU 利用率比 s16384 低 9.6%(52.8 vs 58.4),这部分是
+  persistent 能追的实际损失。**Phase B 在 s4096 的预期收益带修正为
+  +8~13%**(原 §4.4 的 +5~15% 收窄),s1024 段维持 +15~25%。
+- cudnn 对照的含义:它**不用 persistent**(§7.6)也赢谷地,靠的是
+  每 CTA 固定开销低 19%(14.0K vs 17.3K)+ 稳态斜率低——persistent 只能
+  收回我们的固定开销份额,剩下的谷地差仍要 (a) 的发射效率项
+  (correction/vec 链、EX2 平滑)补。
+- cudnn 的 b4 扫描点出现 tensor 压满导致的降频(s2048/s4096 掉到
+  1.50 GHz,b1 点 1.82-1.88 正常),墙钟斜率对比要用 cycles 列。
+
+**(c)节点健康门(方法论,后续 B200 会话沿用)**
+
+wave19 首个 alloc(umbriel-b200-019)空载 77-83°C、SM 钟摆到 120 MHz、
+bench 轮间 spread 最大 349%,全部三方(含 cudnn)数字作废
+(`logs-w19-node019-bad/` 留档)。此后 alloc 后先跑
+`scripts-w19/w19_05_health.sh`(空载温度 <70°C + 5 轮 fp16 matmul
+spread <5% 且 >800 TFLOPS)再进正式阶段;判坏即 cancel 换节点
+(--exclude 累加)。
+
 ## 附录 A:黑名单对照总表(立项前必查)
 
 | 已判不可行项 | 判据出处 | 边界(什么情况不适用) |

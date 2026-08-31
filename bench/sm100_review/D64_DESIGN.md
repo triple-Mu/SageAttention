@@ -10,6 +10,10 @@ XU%;「同结构差距」= 与 cutedsl 分支(同 16-warp WS 结构的 CuTe-DSL 
 
 ## 一屏结论
 
+> wave19 更新:M0 采集与 D1 裁决已完成,判据与修正全部在 §7——8.0 ms 不变量
+> 直测成立(§7.1),§1.4 反常归因为 softmax EX2 发射同相突发(§7.2),G3 的
+> d64 弹性判据落空(§7.4),ws/old 仍全 <1、auto 不翻(§7.6)。
+
 1. **d64 输 cudnn 的根子是算术强度,不是 tile 几何**。head_dim 减半把 FLOPs 砍
    半,但 int8-QK 的 softmax XU 工作量(I2F 1 + EX2 1 + e4m3 pack 0.5 ≈ 2.5
    op/S 元素)只随 s² 走,与 d 无关——XU 忙时在 b4h32s16384 恒 ~8.0 ms,d64 与
@@ -125,6 +129,11 @@ ws 是唯一比值 >1 的实现:d64 比 d128 每单位工作**多花** 8% 时间
 eligible warps 掉档;PV 的 N=64 UMMA 每指令周期未随 N 减半(固定开销);
 TMEM 口在 384 列集中脚印下的争用变化。经典 kernel 无此反常(0.89),说明这
 是 WS 结构 × d64 的特有交互,不是形态必然。
+
+> wave19 裁决(§7.2/§7.3):三个候选全部不中——correction 是下游受害者、
+> N=64 UMMA 无固定开销、TMEM 口数据返回稳态不可见。真身是 softmax 的
+> MUFU.EX2 发射同相突发(mio_throttle 2.4×):QK 阴影减半让 8 个 softmax
+> warp 失去错相。
 
 ---
 
@@ -287,6 +296,9 @@ scheduler 基建未来对 d64 同样生效。
 
 ## 5. 下一 B200 会话采集清单(交付物)
 
+> wave19 已执行(清单全跑 + s4096 深挖与 seq 扫描加项),读数在 §7;
+> A′ 已于 wave18 判负 revert,本清单单独成场。
+
 与 A′(wave17)验收同场跑,新增预算 ~1h。全部命令模板沿用 w14
 (`bench/sm100_review/ws_prof.py` + `--set full --section PmSampling
 --section PmSampling_WarpStates -s 2 -c 1`,ncu 锁频口径)。
@@ -351,6 +363,145 @@ scheduler 基建未来对 d64 同样生效。
 
 ---
 
+## 7. D1 判据回填(wave19 B200 实测)
+
+口径:tree sage-w9 = 910a831(feat/varlen tip,ballot 态 + A3 修复,lazy max
+已 revert;dense ws TU md5 == 65d30f7)、`TORCH_CUDA_ARCH_LIST=10.0a` +
+PRUNE=OFF;B200 单卡(umbriel-b200-073,JID 4033880,pytorch_26.07-py3,
+torch 2.13.0a0 nv26.07 / CUDA 13.3 / cudnn 9.24 / driver 595.58)。ncu 本轮
+**自由 boost 频率**(长 kernel 1.84 GHz 附近,短 kernel 1.65-1.81;
+w16/w18 同为自由频率,w11/w14 是锁频 1.48——跨波比较用 cycles 口径,
+本节双列)。原始数据:集群
+`SageAttention_refactor/logs-w19/{bench,ncu,scan}`(ncu-rep 含 PmSampling
+时间线未展开,GUI 可续读);首个 alloc(4033731,umbriel-b200-019)因节点
+病态废弃(空载 77-83°C、SM 掉 120 MHz、bench 轮间 spread 最大 349%),证据
+`logs-w19-node019-bad/`;此后会话固定先跑 5 轮 matmul 稳定性 gate
+(`scripts-w19/w19_05_health.sh`,spread <5%)。
+
+### 7.1 ncu 三方主表(s16384 nc b4h32;s4096/s32768 见 raw)
+
+| 指标 | ws d64 | old d64 | cudnn d64 | ws d128 | old d128 |
+|---|---:|---:|---:|---:|---:|
+| duration | 14.916 ms | 14.505 | **9.019** | 13.757 | 16.312 |
+| SM cycles | 27.46M | 26.67M | 15.96M | 25.27M | 29.96M |
+| XU % of peak | 53.7 | 54.8 | **68.8** | 58.4 | 48.8 |
+| XU 忙时(dur×XU%) | 8.01 ms | 7.95 | 6.21 | 8.03 | 7.96 |
+| tensor pipe active % | 13.2 | 13.6 | 45.4 | 28.7 | 24.2 |
+| eligible / issued per sched | 0.48/0.35 | **0.67/0.52** | 0.79/0.57 | 0.48/0.39 | 0.65/0.50 |
+| stall/issue:long_sb | 5.47 | 0.64 | 3.32 | 5.23 | 0.83 |
+| stall/issue:mio_throttle | **0.95** | 0.12 | 0.63 | 0.41 | 0.05 |
+| stall/issue:not_selected | 0.37 | 0.31 | 0.38 | 0.22 | 0.31 |
+| inst executed | 5.65G | 8.09G | 5.34G | 5.76G | 8.77G |
+| 每 tile-block SM·cycles | 1938 | 1882 | **1126** | 1783 | 2114 |
+
+- **8.0 ms 不变量 d64 直测成立**:四个 int8 kernel 的 XU 忙时全落在
+  7.95-8.03 ms;cycles 口径 14.63-14.75M,ws d64 与 ws d128 同为 14.75M
+  (三位有效数字一致)。s² 定标同验:ws d64 s32768 = 58.96M(4.00×)、
+  s4096 = 0.92M(1/16.0)。**§1.2 roofline 全部结论维持。**
+- 追平线随同场 cudnn 复测微调:cudnn d64 较 w16 又快 1.5-3.4%
+  (bench s16384 nc 10.200→9.857 ms、s4096 0.586→0.577),追平所需 XU
+  利用率 = s4096 89%、s16384 81%、s32768 80%——仍全部在 cutedsl 演示带
+  (67-72%)之外,形态内不可超越的判定不变。我们现值 50.2/53.7/54.8%
+  (s4k/16k/32k)。
+
+### 7.2 §1.4 反常归因:softmax 的 EX2 发射突发(mio_throttle),不是 TMEM 口流量
+
+source-level 对照(`--set full` SourceCounters,ws d64 vs ws d128 @s16384,
+977K vs 899K stall samples,采样率相同,样本数即 warp 驻留时间):
+
+- **分角色时间占比逐项相同**(softmax 54.0/54.1%、correction+epilogue
+  27.0/27.0%、load 6.1/6.1%、mma 1.2/1.6%、冷块尾 11.5/11.0%)——没有哪个
+  角色单独爆掉,整机等比慢 8.7%。correction 的样本 90-94% 是 vec_full 自旋
+  (等 softmax 交 vec),是下游受害者不是根源;「correction 减半后掏空
+  eligible」的候选解释不成立。
+- **softmax 指令流逐条相同**(exec 5030.8M vs 5031.5M)但驻留 +8.5%,增量
+  全部对到 stall 构成移位:mio_throttle 36.6K→88.5K(**2.4×**,+51.9K,
+  全部落在 128 个 MUFU.EX2 发射点上)、not_selected +12.2K,s_full 自旋
+  −31.8K(部分回收),wait 持平(161.8K vs 160.7K,EX2 链固有延迟)。
+- **TMEM 口/数据返回洗清**:softmax 非 barrier 的 long_scoreboard ≈ 0
+  (d64 228 / d128 177 个样本,占比 0.02%)——S drain(LDTM x64)的数据
+  返回在稳态完全被遮蔽,「384 列集中脚印的 TMEM 口争用」候选也不成立。
+- 归因:XU 忙时 cycles 两边同为 14.75M,duration 差 = XU 空洞。d64 的 QK
+  MMA K 减半把 MMA 阴影砍半,8 个 softmax warp 失去天然错相,EX2 以同相
+  突发打满 MUFU 队列(mio_throttle)后又集体转入等待,XU 供给变成
+  「突发-空洞」;d128 的长 MMA 阴影自动错开各 warp 的 EX2 段。旁证:
+  vec_full 自旋的 tile 相位不对称在 d64 更极端(tile0/tile1 = 22.9%/1.5%,
+  d128 17.3%/5.9%);经典 kernel 2 CTA/SM 两条独立流天然去同相,eligible
+  0.67、mio 0.12,无反常(0.890)。
+- **对 C2 的含义**:§3.4 的收益机制(SMSP 层两条独立流交错)被本判据坐实
+  且有了量化目标——反常本身值 8.7%(2.2M cycles @s16k),叠加 old 已示范
+  的 eligible 0.67 vs 0.48。M3 的「D1 归因支持」条件视为满足(产品需求
+  条件仍待确认)。
+
+### 7.3 tensor pipe:N=64 UMMA 无固定开销税
+
+tensor 忙时 = duration × tensor%:ws d64 13.2%×14.92 = 1.97 ms vs ws d128
+28.7%×13.76 = 3.95 ms——**精确减半**(0.499)。PV 的 N=64 步与 QK 的 K=64
+没有可见的每指令固定损耗,§5 判读点 2 的「d64 税」不存在,C2 资源账不必
+加税。
+
+### 7.4 G3/编译器占比:判据落空,M1 方向改写
+
+§1.3 预设「G3(S drain 暴露窗口)在 d64 双倍伤害」的可直读判据是 softmax
+long_scoreboard——实测非 barrier long_sb ≈ 0(7.2),暴露窗口在稳态剖面
+里不可见,d64 弹性坐实失败。同结构差 33% 的登记项里,本轮证据把主因指向
+**发射平滑度**(EX2 突发 + 同相化)而非 drain 批量;M1(C0.2)的 lever
+优先级相应改写:A5 定位→G3 批量的预期收益降级(黑名单维持),交错/
+去同相类 lever(错开两个 softmax wg 的 EX2 段、或直接走 C2 结构)升级。
+注意与 §4.7(cutedsl 判负的 USE_SEQ_GATE 错拍)的边界:那是 S0/S1 两个
+wg 之间加 named-barrier 硬错拍,cutedsl 实测删掉更快;本判据指向的是
+warp 间自然相位,手段待 M1 重新设计,不自动翻案 §4.7。
+
+### 7.5 cudnn d64 侧写(判读点 4)
+
+- kernel 名(torch profiler,s4096/s16384 同名):
+  `cudnn_generated_fort_native_sdpa_sm100_flash_fprop_f16_knob_1_128x128x64_4x1x1_cga1x1x1_kernel0_0`。
+  tile 几何 128×128×64,与 d128 版同族仅 K 维 knob 改 64。
+- launch:grid = b·h·s/256(CTA 双 Q tile 覆盖 256 行,与我们同构)、
+  512 线程 / 128 reg(setmaxnreg 全特化)、**dyn smem 232.45KB 与 d128 版
+  一字不差**(fp16 KV ring 未按 d64 右尺寸化)、1 CTA/SM、cga1x1x1 无
+  cluster、grid 随形状线性(55.35/13.84 waves)→ **非 persistent**。
+  即:cudnn 的 d64 就是 d128 skeleton 换 knob,没有 d64 专属结构。
+- 执行像:XU 68.8% 顶 SOL(tensor 45.4%),eligible 0.79/issued 0.57,
+  mio_throttle 0.63(它也在 MUFU 队列上,但直到 69% 利用率才碰到);每
+  tile-block 1126 cycles = 我们 ws 的 0.58×。它的 d64/d128 每 tile-block
+  比值(cycles,d128 用 w14 锁频场换算)= 0.89,与我们 old 同级——§1.4
+  表的 0.75 是 bench 墙钟口径(w19 复算 0.72),两口径都 <1,d64 反常仍
+  是 ws 独有。
+
+### 7.6 bench 复测:s32768 落数,auto 不翻(M2 暂缓)
+
+hd64 全网格 s{4096,16384,32768} × b{1,4} × causal 两态,old(WS=0)/
+ws(WS=1)/cudnn 三方 3 轮 median,逐形状 spread ≤1.1%(集群
+`logs-w19/bench/`,驱动 `scripts-w19/w19_bench_d64.py`):
+
+| 段 | ws/old | ws/cudnn | old/cudnn |
+|---|---:|---:|---:|
+| 全 12 点 geomean | **0.980** | 0.621 | 0.634 |
+| s32768(4 点) | 0.985(0.979-0.994) | 0.672 | 0.682 |
+| nc(6 点) | 0.984 | 0.643 | 0.653 |
+| causal(6 点,首采) | 0.976 | 0.600 | 0.615 |
+
+- **ws/old 12 点全部 <1**(最差 nc b1 s4096 0.948,最好 nc b1 s16384
+  0.999)。ballot 后的 0.98-0.99 复现,但 s32768 也没翻正——M2 的翻转
+  判据(全 sweep ≥1)不成立,**auto 维持 d64 走经典 kernel**,launcher
+  注释的改写同步搁置(§1.1 的证伪记录仍有效:排除理由要从「TMEM 384 列」
+  改成 7.2 的发射同相化,等 M1 一并动)。
+- causal d64 首次成表:ws/cudnn 0.51-0.69,比 nc 段还深——causal 的每
+  tile-block 劣化我们 +5.2%(s16384 b4,1.095 vs 1.041 SM·µs)大于 cudnn
+  的 +2.7%,M1/C2 的验收网格要含 causal。
+- 同场 cudnn 目标线(nc b4):s4096 952 TF / s16384 892 TF / s32768
+  876 TF(w16 比较值 938/862/—;w16 的 s4096 三轮 9% 抖动未再现,w19
+  三轮 spread 0.4%)。
+
+### 7.7 milestone 表读数后的状态
+
+M0 ✅(本节)。D1 ✅:反常归因 = EX2 发射同相突发(7.2),G3 判据落空
+(7.4),8.0 ms 不变量成立(7.1),ws/old 未全面 ≥1(7.6)。M1 方向改写
+后依赖不变;M2 暂缓待 M1;M3 的归因前置条件已满足、等产品需求信号。
+
+---
+
 ## 附录 A:黑名单对照(立项前必查;总表在 BEYOND_CUDNN_PLAN 附录 A)
 
 | 本文候选 | 相关黑名单条目 | 对照结论 |
@@ -372,6 +523,12 @@ per-CTA 推导:ws 与经典在该形状下 wave 数同为 55.35(ws 8192 CTA × 1
 tile-block 比值 1.041/1.023 = 1.018,与 bench 的 ws/old 0.982 互为倒数。
 
 ## 附录 C:数据来源
+
+- **w19(本文 §7 全部数据)**:集群 `SageAttention_refactor/logs-w19/`
+  (bench 12 形状 ×3 轮、ncu 全量 .ncu-rep + raw/details/source csv、scan、
+  健康 gate 日志);会话脚本 `SageAttention_refactor/scripts-w19/`;坏节点
+  留档 `logs-w19-node019-bad/`。s4096 深挖与 seq 扫描的读数在
+  BEYOND_CUDNN_PLAN §7.7。
 
 - w16 bench(本文 §1.1/§1.4 主数据):主控 scratchpad
   `w16/bench/{cudnn,old,wsa,wsg2}-r{1,2,3}.json`;集群
