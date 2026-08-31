@@ -1,6 +1,6 @@
-# sm100 varlen 支持设计(M1/M2 已落地;M3 上机:pytest 全绿、压测挂死,红)
+# sm100 varlen 支持设计(M1/M2 已落地;M3 挂死已定位修复,wave17 全量重跑绿)
 
-基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2,M3 wave14 实录(含挂死画像与建议)见 §6.3,wave15 的 race 根因分析、已落地修复与 B200 裁决矩阵见 §6.4。
+基线 commit:5af2e06(master/feat/varlen 同点)。所有 file:line 以该点为准;M1 拆分后的新布局见 §3.1 末尾,M2 落地记录与 M3 上机清单见 §6.1/§6.2,M3 wave14 实录(含挂死画像与建议)见 §6.3,wave15 的 race 根因分析与 B200 裁决矩阵见 §6.4,wave17 的定位/修复/重跑(mask 链移出 S 排空)见 §6.4.6。
 
 ## 0. 结论
 
@@ -442,6 +442,102 @@ ComputeLab B200 上拿不到 CUDA 态——先撞 Yama ptrace,prctl(PR_SET_PTRAC
 plan 侧把 sm100 撤出 `_VARLEN_BACKENDS` 回 sm89 packed fallback,等 A3
 定位后再回来重过 M3(pytest 全绿态可沿用,压测/bench 必须重来);dense
 侧(classic + ws/ballot)不受影响,见 C1_DESIGN §11.4。
+
+### 6.4.6 wave17 A3 裁决:调度差臂双双出局,病灶 = causal mask 链在 S 排空循环里,修复已落地
+
+**结论:两条预设臂(k_scale 位置 / LDTM 间距)全红出局;逐轴收缩后坐实
+病灶 = varlen causal 实例的 bottom-right mask 链编译进 S 排空循环(与四条
+`tcgen05.ld` 交错的 ~500 条谓词化 compare/select)。把 mask 挪到排空循环
+之后、对寄存器补打(数值逐位不变)即转绿——修复随本节落地
+(`qk_int_sv_f8_sm100_impl.cuh`,#ifdef SAGE_VARLEN 内,dense SASS 逐字节
+不变)。硬件层机理未定位,按 A2/A5 同格记入经验约束:S 排空的
+ld/wait 区间内不得混入 mask 指令。**
+
+#### 裁决总表(B200 alloc 4031738,umbriel-b200-042,独占 1 GPU;
+a2b 固定形状臂 = seed2-pack5 causal hd128,每轮 2000 launch 新进程;
+base 在本 alloc 10/10 轮 ≤80 次内击中,dense 对照(ws_stress WS=0 简版)
+同 alloc 全绿;日志 `logs-a3/`)
+
+| # | 臂/构建 | 单变量 | 结果(停在 iter) |
+|---|---|---|---|
+| 1 | base ctl_pre / ctl_post | — | 红 9 / 红 8 |
+| 2 | V1:peeled k_scale LDG 挪回 wait(S_done) 前 ×3 | E5 站点 1 | 红 2/7/13 |
+| 3 | V2:S 排空地址依赖链串行化(1 在飞)×3 | E5 站点 2 | 红 6/46/79 |
+| 4 | V1+V2 combo | 两站点交互 | 红 55 |
+| 5 | solo0(q=kv=7304 单序列 causal;batch=1、offset=0、delta=0,tensor map/grid/坐标与 dense 同构) | 形状轴全清零 | 红 2 |
+| 6 | solo(q=7304/kv=8161 单序列 causal) | delta≠0 | 红 6 |
+| 7 | nomask(a2b 形状,causal=False) | causal 轴 | 绿 2000 |
+| 8 | V6:dense 形态 mask(is_last-only、无符号;delta≠0 数值错,仅诊断)×3 | mask 块整体删出主循环 | **绿 3×2000** |
+| 9 | V7:排空按 tile 谓词分叉成 干净/带 mask 两个循环(数值不变)×3 | mask 链改分支化 | 红 691(后两轮绿;率降 ~50× 仍判红) |
+| 10 | nomask_short(非 causal,a2b 掺 kv=64 短序列)×2 | T=1 CTA / block-skip 无 causal | 绿 2×2000 |
+| 11 | causal_notrip1(causal,q=128/kv=8161×180,1440 CTA 全 T=64,straddle 谓词真发火)×2 | causal 机器无小 T | 绿 2×2000 |
+| 12 | **V8:mask 移到排空循环后,对寄存器补打,再做行 max(数值逐位不变)×3** | mask 链彻底出排空 | **绿 3×2000 → 落地** |
+| 13 | V9:in-loop mask 原位改无符号形态(dead-row 覆盖兜底,输出逐位不变)×3 | mask 链指令形态 | 红 18/4/(r3 红) |
+
+推论链(每行单变量):
+
+1. 行 2/3/4 ⇒ §6.4.4-A3 的两处 E5 调度差不是根因;V2 连挂死率都没动。
+   顺带修正 E5 两处记录:S 排空方向记反了(实测 dense 全 8 copy ≤2 在飞,
+   varlen c128 主循环才是 4 连发 R100/R68/R36/R4 四块不相交——A5 前科
+   形态,但 V2 串行化到 1 在飞仍红,A5 族解释整体出局);k_scale 后移是
+   4 个 varlen 实例 peeled copy 一致的形态,同样无害。
+2. 行 5 ⇒ 形状轴全灭:solo0 的 tensor map(rank-4 batch-1、box、步长)、
+   grid (58,8,1)、TMA 坐标逐项与 dense 等价,仍 iter=2 击中——病灶在
+   varlen TU 的 causal 实例二进制本身。
+3. 行 10 ⇒ µs 级 CTA 槽位 churn(T=1、block-skip)无 causal 不挂:C2 族
+   彻底出局(补齐 §6.4.5 A1 的另一半)。
+4. 行 11 ⇒ causal 机器(fmt 谓词、straddle 发火、signed trip 数学)在
+   均匀大 T 网格 2000 launch 不挂:causal 单独也不充分;触发需要
+   {mask 链在排空区间} × {混合/小 trip 的 causal 网格纹理}。
+5. 行 8/9/12/13 四臂合并把轴钉死在**位置**而非形态:链在排空内(谓词化
+   =base、无符号=V9、分支化=V7)都击中,链在排空外(V8)或不存在(V6)
+   转绿;V9 红同时排除"符号比较指令本身"这一层。
+6. 挂死签名复核:w16 vgdb 抓到的 PC kernel+0x7f10 与本机重建 SASS 逐地址
+   吻合 = 主循环 `wait(barrier_V)` 的 TRYWAIT(peeled copy 同款 wait 走
+   [R37+URZ] 寻址,可区分);out-of-line 自旋块 = 该 wait 的
+   `@!P0 BRA` 目标。挂住 CTA 从未到达 peeled copy,E5 站点 1 本就不可能
+   是它的死因——与行 2 的红互为印证。
+
+#### 修复(V8,随本节落地)与本机 gate
+
+改动:`process_tile` 内 S 排空循环只做 ld/wait/反量化(dense 指令形态,
+ptxas 自然回到 dense 的排空调度),mask 谓词命中的 tile 在循环结束后对
+RS_f32 寄存器补打 -5e6,再单独做行 max。同值同归约序 ⇒ 输出逐位不变,
+delta=0 的 equals-dense bitwise gate 继续成立;非 causal 实例同样受益
+(kv OOB 链同位移出)。
+
+| gate | 结果 |
+|---|---|
+| varlen probe 4 实例 × sm_100a / sm_110a | 0 spill / 0 stack,254/255 reg(与基线同档) |
+| `test_ptxas_gate` | 6/6 |
+| dense probe SASS(双 arch) | 与基线逐字节相同(改动整体在 #ifdef SAGE_VARLEN 内) |
+| 变体 SASS 复核 | 主循环排空区间 0 条谓词化 ISETP(base 508 条);mask FSEL 全部落在末次 `tcgen05.wait::ld` 之后 |
+| 实测二进制一致性 | 集群 `_C.abi3.so` 的 kernel SASS 与本机 probe 逐字节同形(V2/base 两树核过) |
+
+#### wave17 全量重跑(修复版 = 55d427a 修复 + 5635fa1 撤 gate,PRUNE=OFF,同 alloc)
+
+| gate | 结果 |
+|---|---|
+| golden 双轨 WS=0(golden-sm100) | `ok=2082 diff=0 missing=0`(skipped=198 为 RETIRED 预期;extra=25 = gate 撤销后新增可跑的 varlen case,golden-sm100 目录本就没有它们) |
+| golden 双轨 WS=1(golden-sm100-g1ws) | `ok=2107 diff=0 missing=0 extra=0` —— 25 个 varlen case 与修复前 golden **逐位相同**,V8 数值不变实机坐实 |
+| varlen pytest(sm100/共享/utils 三文件) | 207 passed / 97 skipped / 0 failed |
+| 全量 pytest(WS=0) | 436 passed / 395 skipped / 0 failed |
+| ragged 公开路径压测(w14_varlen_stress) | 2×6000 全绿 |
+| ws_stress 简版 WS=0 / WS=1 | 双绿(dense classic 与 ws kernel 无劣化) |
+| isolate 臂 a2b / a1 / a2(修复版) | 各 6000 全绿(修复前 a2b 在同 alloc ≤80 次必中) |
+| bench_varlen(M4 子集,dense 参照 WS=0 classic) | 等长 0.91-0.95×,ragged .25-1x **1.13-1.54×**;20 行全数落盘 `logs-a3/p2_varlen_bench.{csv,log}`,与 sm90/sm120 的 ragged 记录同轴 |
+
+#### 遗留与边界(诚实记录)
+
+- **机理未定位**:为什么排空区间内的谓词化 mask 指令流会让邻近 CTA 的
+  mbarrier completion 丢失,没有微架构层答案;V7 的 691 次击中说明该缺口
+  是率函数,"绿"只到 3×2000 + 全量 battery 的置信度,与 wave16 判绿口径
+  一致(6000 满轮)。已按 A2/A5 同格写入 HARDWARE_CHECKLIST 约束表。
+- gdb 侧新增可复用工具:`scripts-a3/a3_gdb2.sh`(cuda-gdb 从头带跑 +
+  python 动态定位挂死 SM + mbarrier 静态 smem 词导出);本轮修复坐实后
+  未再消耗 alloc 时间跑基线捕获。
+- 臂矩阵与全部变体 patch 留在集群 `SageAttention_refactor/{scripts-a3,logs-a3}/`
+  与 `*_impl.cuh` 顶层副本(v6mask/v7split/v8post/v9uns)。
 
 ## 6.5 M3 重跑处置(wave16)
 

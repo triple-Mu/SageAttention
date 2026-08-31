@@ -856,6 +856,15 @@ feat/varlen tip `117d63c`,即上面那轮右尺寸化之后的树。
 合入的两项(A1 + A3)是分支上最终留下的代码;A2、A5 只在实验里存在过,没有
 留在历史里。
 
+同族第三条经验约束(wave17 varlen 定位,SM100_VARLEN_DESIGN §6.4.6):
+**S 排空的 `tcgen05.ld`/`wait::ld` 区间内不得混入 mask 的 compare/select
+指令流**。varlen causal 实例把 bottom-right mask 编译成排空循环内约 500 条
+谓词化 ISETP/FSEL(逐 tile 发射,谓词真假无关),混合/小 trip 的 causal
+网格下 ~1/50-1/2000 launch 丢一个 mbarrier completion,单 CTA 永停在主循环
+`wait(barrier_V)`;把 mask 挪到排空循环之后(寄存器上补打,数值逐位不变)
+即转绿。B200 单变量矩阵(13 臂)与机理边界见 §6.4.6——A2/A5/本条同为
+"机理未定位、按禁区绕行"的记录:golden 全绿不足以放行,必须过定点压测。
+
 bench 口径:低层 `qattn_sm100_*_attn` op 直接对测(不含量化前后处理),形状
 d128 × seq{1k,4k,16k,32k,128k} × batch{1,4} × causal 两态 = 20 点,外加 d64
 两点作不回退对照;3 轮 A→B / B→A 交替、每形状取中位数、每点测前测后各查一次
