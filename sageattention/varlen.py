@@ -38,7 +38,10 @@ from .core import _LOG2E_V2, _check_qkv_common, _pad_qkv_head_dim, _warn_smooth_
 # Backends with a packed-layout attention kernel, mirroring the dispatch table
 # in csrc/sageattn/fwd_varlen_cuda.cu. Checking here rather than letting the op
 # raise keeps a device without one from paying for the quantization first.
-_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm90", "sm100", "sm120"})
+# sm100 is gated off pending the varlen kernel async-hang fix (C3 candidate;
+# minute-scale repro: SM100_VARLEN_DESIGN.md 6.4.5, cluster logs-w16/arms2).
+# The kernel and its op stay built for the A3 debugging arms.
+_VARLEN_BACKENDS = frozenset({"sm80", "sm89", "sm90", "sm120"})
 
 
 def _segment_ids(cu_seqlens: torch.Tensor, batch_size: int, total: int) -> torch.Tensor:

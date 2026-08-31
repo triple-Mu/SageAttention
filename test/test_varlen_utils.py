@@ -327,8 +327,9 @@ def test_varlen_downgrades_smooth_v():
 
 
 def test_varlen_accepts_sm100():
-    """The sm100 packed kernel landed: varlen resolves the backend exactly as
-    dense does (a build without the sm100 family still reports not-compiled)."""
+    """The sm100 packed kernel landed at the plan level; the python wrapper
+    gates it off again pending the async-hang fix (the plan op itself still
+    resolves it, which is what the A3 debugging arms rely on)."""
     p = Plan(*PLAN_OP(10, 0, 128, "sm100", None, None, None, True))
     if p.error:
         assert "not in this build" in p.error
