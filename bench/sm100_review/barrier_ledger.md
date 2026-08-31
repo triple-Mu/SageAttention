@@ -365,3 +365,139 @@ Deliberately NOT tied to the kv ring's stage semantics: `kv_empty(K_i)`
 fires when QK(i) retires, which can precede softmax's read of block i's
 scale — a per-slot k_scale copy could be overwritten one ring lap early
 (checked and rejected; the one-shot prefix copy has no such lifetime).
+
+---
+
+# mbarrier ledger — `qk_int_sv_f8_cuda_sm100_ws_persist.cu` (Phase B, persistent)
+
+Extension of the 16-warp ledger above. The persistent kernel launches
+`grid = min(total_tiles, #SMs)` CTAs; every warp role runs a grid-stride loop
+over **work items** `e = blockIdx.x, +gridDim.x, …` (one work item = one
+256-row Q tile × head × batch = the old blockIdx; qblk2 decoded REVERSED =
+static LPT). Nothing is ever re-initialized between work items: all
+barrier-phase variables are loop-carried, and the KV ring item counter runs
+globally. Everything not restated here (per-step event programs, H1-H13, the
+in-order UMMA queue argument) is inherited verbatim from the 16-warp ledger —
+per work item the event program is exactly the one-shot kernel's, with the
+deltas below. `trip0_w / trip1_w` are work item `w`'s trip counts;
+`w = 0, 1, …` indexes a CTA's own work items in order.
+
+## P1. Deltas to the pipeline inventory
+
+| pipe | delta vs one-shot |
+|---|---|
+| load_q | reused: full completes once per tile per work item (TMA expect_tx); mma waits ph `w&1` (one carried toggle covers both tiles). NEW empty side: `q_empty` (count 1), `tcgen05.commit` by mma once per work item after the work item's last QK **issue** (fires on retire of every prior MMA = both tiles' last QK, in-order queue); load waits ph `(w-1)&1` before work item `w>=1`'s Q0 load |
+| load_kv | unchanged expressions: item `n` is ABSOLUTE (running base `item0 += 2*trip1_w`), so slot `n%4`, full ph `(n/4)&1`, empty wait ph `(n/4-1)&1` for `n>=4` hold across work items; the per-work-item "last <=4 empty completions unconsumed" now ARE consumed by the next work item's loads (only the global-last <=4 dangle) |
+| mma_s0/s1, s_empty, corr_full | unchanged per work item; phases carried |
+| s_corr (vec) | unchanged completions; NEW final wait: softmax waits `vec_empty#trip_w` (ph carried) at the END of every work item — the completion that dangled in the one-shot kernel — so the next work item's step-0 vec store owns the slot. The pipe is now exactly 1:1 |
+| mma_corr empty | NEW completion: correction's `epilog(t)` also arrives `corr_empty[t]` (after its O/vec `tcgen05.ld` + `wait::ld` + `tcgen05 fence`), making completions per work item `trip_t` (rescales j=1..trip_t-1, then epilog). NEW wait: mma waits `corr_empty[t]` (ph carried) before `QK_t(0)` of work item `w>=1` — consuming the PREVIOUS work item's epilog completion (H14); `PV_t(0)` takes no wait (`pv1_started` resets per work item), `PV_t(j>=1)` waits as before |
+| epi_full | reused: completes once per tile per work item; epilogue warp waits ph `w&1` (one carried toggle covers both tiles) |
+| epi_empty[t] (NEW) | count 1; epilogue warp arrives after `cp.async.bulk.wait_group.read 0` (this work item's both store groups drained); correction waits ph `(w-1)&1` at the top of `epilog(t)` for `w>=1` before restaging sO[t] |
+| tmem_dealloc | unchanged one-shot: all arrivals moved AFTER the roles' work-item loops |
+
+Non-barrier note: sV_scale is restaged per work item by the correction
+warpgroup under a named-barrier sandwich (`bar.sync 1, 128` / write /
+`bar.sync 1, 128`). Correction is its only reader, every corr thread's
+old-row reads precede its own first bar arrival (program order), and the
+second bar publishes the new row — plain CTA-scope smem, no mbarrier, no
+entry in the counts below. sK_scale has no smem copy at all in this kernel
+(softmax reads gmem; same words, so per-tile bits are unchanged).
+
+## P2. Count check across the work-item sequence
+
+Per pipe, list completions and waits in GLOBAL order over a CTA's work items
+w = 0..W-1; each pipe's waits match completions 1:1 in order, so the carried
+phase toggles stay aligned (phase = cumulative index & 1 on both sides).
+
+| barrier | completions (global order) | waits (global order) | dangling at exit |
+|---|---|---|---|
+| q_full[t] | load expect_tx, one per work item: #0..#W-1 | mma, one per work item, ph w&1 | none |
+| q_empty | mma commit, one per work item: #0..#W-1 | load before work item w>=1's Q0: consumes #w-1 | #W-1 (harmless: only unmatched waits deadlock) |
+| kv_full/kv_empty[slot] | one per absolute item, exactly the one-shot expressions | same | last <=4 kv_empty completions |
+| s_full/s_empty[t] | trip_t_w per work item, phases carried | same counts | none |
+| vec_full[t] | (trip_t_w + 1) per work item | correction: 1 discard + (trip_t_w - 1) rescales + 1 epilog per work item | none |
+| vec_empty[t] | (trip_t_w + 1) per work item (correction) | softmax: trip_t_w step-end waits + 1 end-of-work-item wait | none (now exactly 1:1) |
+| corr_full[t] | trip_t_w per work item (PV commits) | correction: (trip_t_w - 1) rescales + epilog | none |
+| corr_empty[t] | per work item: rescale #1..#trip_t-1, then epilog | mma: [w>=1: QK_t(0)-side wait consumes the PREVIOUS epilog completion], then PV_t(j) j=1..trip_t-1 consume this work item's rescales | last epilog completion |
+| epi_full[t] | one per work item (128 corr arrivals) | epilogue warp, ph w&1 | none |
+| epi_empty[t] | one per work item (epilogue warp, after group drain) | correction in epilog(t) of work item w>=1: consumes #w-1 | #W-1 |
+| dealloc | 1 (384 arrivals, after all loops) | 1 (mma warp, ph 0) | none |
+
+Boundary trace (the only new interleaving), tile t, work items w -> w+1:
+```
+corr_empty[t]:  … rescale#trip-1(w), epilog(w)   |  [mma QK_t(0)-wait](w+1), rescale#1(w+1) …
+vec_empty[t]:   … #trip-1(w), #trip(w=epilog)    |  [softmax end-wait](w) consumes #trip(w); step-0 store(w+1) owns the slot
+q_empty:        commit(w)                        |  [load wait](w+1)
+epi_empty[t]:   drain-arrive(w)                  |  [correction wait in epilog(t)](w+1)
+```
+
+Degenerate cases: `trip0_w = trip1_w = 1` — corr_empty[t] completions per
+work item = {epilog} only; mma waits per work item (w>=1) = {QK_t(0)-side}
+only (`pv1_started` false at the tail skips the PV1 wait; the PV0(0) call
+never waits) — 1:1 holds. W = 1 (persistent grid degenerates to one work
+item per CTA): every new wait is skipped (`e == blockIdx.x`) except the
+softmax end-wait, which its own epilog completes; the ledger reduces to the
+one-shot kernel's plus that wait.
+
+## P3. Phase-alias freedom (new/changed pipes)
+
+Same criterion as §4: a wait on completion #n is safe iff #(n+2) cannot
+complete before the waiter observes #n.
+
+* `q_full[t]`: completion #(w+1) needs load's expect_tx of work item w+1,
+  which sits behind load's `q_empty#w` wait, which needs mma's commit at w,
+  issued AFTER mma's `q_full#w` waits. Depth 1. ✓
+* `q_empty`: completion #(w+1) needs mma to issue work item w+1's QKs,
+  behind mma's `q_full#(w+1)` wait -> load's Q(w+1) loads -> load consumed
+  `q_empty#w`. ✓
+* `corr_empty[t]` (with the epilog completion): completion #(n+1) is
+  produced by correction only after passing `vec_full`/`corr_full` waits
+  whose completions sit behind mma's consumption of #n (rescale case:
+  unchanged §4 argument; epilog case: `corr_full#(trip-1)` = the last PV,
+  which mma issues after consuming every rescale completion of the work
+  item). One extra step for the wrap: rescale#1(w+1) — two completions
+  after epilog(w) when trip_t=2 — needs `vec_full#1(w+1)` = softmax step 1
+  of w+1, which needs `s_full#1(w+1)` = QK_t(1) of w+1, which mma issues
+  after its QK_t(0)-side wait consumed epilog(w). ✓
+* `vec_empty[t]`: completions are correction's, each behind a `vec_full`
+  wait whose completion is softmax's store, each behind softmax's previous
+  `vec_empty` wait (now including the end-of-work-item wait) — the pipe is
+  1:1 alternating. ✓
+* `epi_full[t]` / `epi_empty[t]`: epi_full#(w+1) needs correction's staging
+  of w+1, behind its `epi_empty#w` wait; epi_empty#(w+1) needs the epilogue
+  warp to pass `epi_full#(w+1)`, behind correction's staging of w+1, behind
+  `epi_empty#w`'s consumption. Depth 1 both ways. ✓
+* 128-count barriers and warp drift: a correction warp cannot fall a full
+  phase behind on any x128 pipe because every next completion requires all
+  128 threads' arrivals, including the laggard's (the §4 rate-limit
+  argument, unchanged).
+
+## P4. New cross-work-item hazards
+
+| # | hazard | discharged by |
+|---|---|---|
+| H14 | `QK_t(0)` of work item w+1 overwrites vec_t (S_t cols [0,2)) before correction's epilog(t, w) read the final `(denom, row_max)`; and `PV_t(0)` of w+1 (enable_D=0) overwrites O_t while that epilog still reads it | epilog arrives `corr_empty[t]` only after its vec + O `tcgen05.ld` all completed (`wait::ld`) + `tcgen05 fence`; mma waits that completion (+ `fence_after_sync`) BEFORE issuing `QK_t(0)` of w+1, and `PV_t(0)` follows in the same thread's program order |
+| H15 | TMA Q load of work item w+1 overwrites sQ_t while a QK of w still reads it | load waits `q_empty#w`, completed by mma's `tcgen05.commit` issued after the last QK issue of w — commit fires only when those MMAs **retired** (same mechanism as H4) |
+| H16 | correction's sO[t] staging of w+1 races the bulk-store engine still reading sO[t] of w (WAR) | epilogue warp: `cp.async.bulk.wait_group.read 0` (engine finished reading) precedes its `epi_empty[t]` arrival (release); correction's STS sit behind its `epi_empty#w` wait (acquire) — the CUTLASS `tma_store_wait` reuse pattern |
+| H17 | softmax's step-0 vec store of w+1 clobbers the final vec of w before epilog read it | softmax's end-of-work-item `vec_empty#trip(w)` wait; correction arrives it only after the epilog's vec `wait::ld` (H8 mechanism, extended to the final completion) |
+| H18 | `QK_t(0)` of w+1 overwrites P_t cols while the tail `PV_1(w)` still reads P_1 | in-order UMMA queue, same thread: tail PV1 is issued before `QK_t(0)` of w+1 (H2 argument verbatim) |
+
+## P5. Liveness
+
+Extend the §7 witness schedule across work items: rank each CTA's spine as
+(work item 0 spine) < (work item 1 spine) < …, with the epilogue warp's and
+load warp's per-work-item programs interleaved as in §7. Every NEW wait's
+completion is produced strictly earlier in that order:
+
+* load's `q_empty#w`: mma's commit inside work item w's spine (fires on MMA
+  retirement — hardware progress, no wait in front of it).
+* mma's QK_t(0)-side `corr_empty` wait at w+1: correction's epilog(t, w),
+  whose own waits (`vec_full#trip(w)`: softmax's final vec, `corr_full`:
+  PV(w) retirement, `epi_empty#(w-1)`: the epilogue warp's drain of w-1)
+  are all inside work items <= w. The epilogue warp itself only waits
+  `epi_full` (correction's arrivals, shown live) and the bulk-group drain
+  (hardware DMA).
+* softmax's end-of-work-item `vec_empty#trip(w)`: correction's epilog(t, w)
+  read_vec, live per the previous point.
+* No role's post-boundary code is required for any of these producers, so
+  the order is well-founded and the kernel remains deadlock-free.

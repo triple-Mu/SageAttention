@@ -1133,3 +1133,84 @@ sim 模型经 accuracy gate 实证(误差带吻合),perf 侧的「ballot 命中�
 **判定**:12.4 的 bench 硬闸失败 ⇒ 按预设回退路径,**80934f2 单 commit
 revert**;c398bb5(sim)与 §12 文档保留,本节即判负记录。golden 轨不切
 换,后续 ws 路 bitwise gate 仍对 `golden-sm100-g1ws`。
+
+## 13. Phase B:persistent CTA(wave20 实现;上机待验收)
+
+BEYOND_CUDNN_PLAN §4.4 的第一步(NATURAL→LPT 里直接做了静态 LPT;CLC
+try_cancel 动态调度留二期,需 p0d probe 先行)。独立 TU
+`qk_int_sv_f8_cuda_sm100_ws_persist.cu` + 独立 kernel/launcher 入口,
+`SAGEATTN_SM100_WS_PERSIST=1` 且 ws 路已选中时走它(默认 off);
+**旧 ws TU 一个字节未动**,SASS gate 天然成立。
+
+### 13.1 动机链
+
+ws kernel 每 CTA 序幕重:TMEM alloc 握手、4 个 tensormap 加载(G4 只把
+prefetch 提前,冷加载本身还在)、28 个 mbarrier init、setmaxnreg ×4、
+sK_scale 预载 + `__syncthreads`。s4096 时每 CTA 只吃 16 个 KV 块,序幕
+占比高;短序列还叠 wave quantization(s1024 b1 只 128 CTA/148 SM,重启
+一次浪费一波)。wave14 侧写把 ws/cudnn 差距主因归到发射效率(eligible
+0.73 vs 0.50),cudnn 不需要 persistent 是因为它序幕薄;我们的序幕厚,
+persistent 的摊薄空间反而大。persistent 让一个 CTA 顺序吃多个 work
+item:序幕一次,TMEM/tensormap/barrier 全程复用,work item 之间 pipeline
+不排空(尾部 PV 与下一 tile 的 QK/TMA 自然重叠)。
+
+### 13.2 设计要点(实现即此)
+
+- **调度**:grid = min(total_tiles, #SM),1-D;grid-stride
+  `e = blockIdx.x + w*gridDim.x`;decode 序 qblk2 最快且**倒序**(causal
+  trip 随 qblk2 增长,重 tile 先发、跨 CTA 打散 = 静态 LPT;相邻 e 同
+  head,保持旧 grid 的 K/V L2 重叠)。16 warp 各自跑同一 e 序列,decode
+  只依赖 kernel 参数(每个 setmaxnreg 区域本地重物化,不跨界携带)。
+- **跨 work item 状态**:所有 mbarrier 不重 init、phase 变量 loop-carry;
+  KV ring 用全局 item 计数(slot/phase 表达式不变)。新增 3 个 barrier +
+  2 处新到达:`q_empty`(mma 在本 work item 最后一条 QK 发射后 commit,
+  load 等它再覆写 sQ)、`epi_empty[t]`(epilogue warp 排空 bulk-store
+  group 后到达,correction 等它再重铺 sO)、correction 的 epilog 追加
+  `corr_empty[t]` 到达(mma 在下一 work item 的 QK_t(0) 前 acquire,盖住
+  vec/O 复用,H14)、softmax 每 work item 末尾消费掉原先悬空的最后一个
+  `vec_empty` completion。完整账本:barrier_ledger.md persistent 节
+  (P1-P5,含逐 pipe 计数、phase-alias、H14-H18、liveness)。
+- **scale 通路**:sK_scale smem 预载不保留(行随 kv head 变),softmax
+  改回 gmem 广播 LDG(G2 的 L2 节省吐回,目标段 s1024-16384 行短,量
+  小;若 ncu 归因到它,升级路径 = 仿 sV_scale 重铺 + softmax0/1 会合)。
+  sV_scale 由 correction(唯一读者)每 work item 用 `bar.sync 1,128` 三
+  明治重铺——epilog 逐元素 LDG 版本实测把 88-reg 区压出 ~570B spill,
+  否决。
+- **bit-exact**:每 tile 的浮点序、TMA 搬运字节与非 persistent ws kernel
+  完全一致(scale 换传输不换值;O 复用走既有 enable_D=0;LSE 同式),
+  golden 双轨 diff=0 是硬闸。调度只改 tile→CTA 映射,输出无 CTA 间依赖。
+
+### 13.3 ptxas 门禁(全过;nvcc 13.3)
+
+```
+nvcc -std=c++17 -O3 --use_fast_math -cubin -Xptxas -v \
+     -gencode arch=compute_100a,code=sm_100a -I csrc/qattn \
+     -o /tmp/ws_persist_probe.cubin \
+     bench/sm100_review/qk_int_sv_f8_cuda_sm100_ws_persist_probe.cu   # sm_110a 同样跑
+```
+
+| TU | 入口 reg | spill/stack | 备注 |
+|---|---|---|---|
+| ws persist probe ×4 实例(sm_100a & sm_110a) | 128 | 0 / 0 | USETMAXREG TRY_ALLOC 0xc0 / DEALLOC 0x58 / 0x28 各 ×4(=192/88/40);无 C7508;static smem 1024B;bar.sync 用 barrier 1(报 2 barriers,预期) |
+
+打平 spill 的三处手术(都有注释锚点):sV_scale 回 smem(上文);mma 内层
+issue 循环 `#pragma unroll 1`(外层大循环里 frontend 展开叠 live);kblk
+经 `asm("" : "+r"(kv_dep) : "r"(qblk2))` 假依赖压到 decode 的 udiv 峰值
+之后(否则 ptxas 把它跨峰值存栈,d64 剩 4B spill 的根因)。
+
+### 13.4 上机判据(验收顺序)
+
+1. **golden 双轨**:`SAGEATTN_SM100_WS=1 SAGEATTN_SM100_WS_PERSIST=1` 对
+   `golden-sm100-g1ws` diff=0;`SAGEATTN_SM100_WS=0` 旧路对 `golden-sm100`
+   不受影响(构建 `-DSAGE_PRUNE_GENCODE=OFF` 对拍口径)。
+2. **压测**:`ws_stress.py` SWEEP + 8000×2 定点,重点盖新 barrier 的跨
+   work item 语义——多 work item / 单 work item(W=1 退化)/ trip=1 退化
+   / causal 尾块 OOB tile,盯 hang 与非法 phase(P2/P3 的账本假设)。
+3. **bench**:22 点 + BENCH_PROTOCOL 双闸,主看 s1024/s4096/s16384(战况
+   0.793/0.723/0.876),长序列(≥32k,已 1.035-1.052)只求不回退;d64
+   顺带采(persistent 不专为它,但序幕摊薄应同向)。
+4. **ncu**:`launch__waves` → 1;序幕摊薄证据(tensormap 冷加载/mbarrier
+   init/TMEM alloc 的每 tile 均摊次数下降);eligible warps/cycle 与
+   long_scoreboard 对 wave14 侧写复查;K scale LDG 回归的 L2 read 增量
+   单独归因(决定是否做 sK_scale 重铺)。
+5. 过线后再谈 auto 选路(现默认 off,不影响任何既有路径)。
