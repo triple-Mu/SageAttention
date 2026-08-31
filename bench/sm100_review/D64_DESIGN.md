@@ -13,6 +13,10 @@ XU%;「同结构差距」= 与 cutedsl 分支(同 16-warp WS 结构的 CuTe-DSL 
 > wave19 更新:M0 采集与 D1 裁决已完成,判据与修正全部在 §7——8.0 ms 不变量
 > 直测成立(§7.1),§1.4 反常归因为 softmax EX2 发射同相突发(§7.2),G3 的
 > d64 弹性判据落空(§7.4),ws/old 仍全 <1、auto 不翻(§7.6)。
+>
+> wave24 更新:vec_full 交付时机按 d64-only gate 重启并 **KEEP**(§8.5)
+> ——d64 ws/old 0.980 → 1.0302、wsp/old 1.0537,组合 auto 形态 12/12 全
+> ≥1.03;auto 翻转建议与复验条件见 §8.5.3。
 
 1. **d64 输 cudnn 的根子是算术强度,不是 tile 几何**。head_dim 减半把 FLOPs 砍
    半,但 int8-QK 的 softmax XU 工作量(I2F 1 + EX2 1 + e4m3 pack 0.5 ≈ 2.5
@@ -598,6 +602,7 @@ exp2(128×EX2)保持在前移 wait 之后,错相直接作用于本步 EX2 段。
   XU 56.7 / mio 0.927 应归因 vec_full 交付改动,不是 stagger。后续若
   重启 M1,机制得换(候选:vec 交付时机对 d64 单独成刀——vec_full 改
   动 d64 段独测 +7%,但它在 d128 主战场判负,C1_DESIGN §14.6/§15.5)。
+  **→ wave24 已按此条款兑现,d64-only gate 判 KEEP,本条款关闭(§8.5)。**
 - revert 后 SASS 恒等闸:16/16 实例(两 TU × d{64,128} × c{0,1} ×
   sm_{100a,110a})与 fc03183 逐条恒等;显式 fmaf(a034939)留在源码
   (它就是基线收缩出的那条 FFMA,C1_DESIGN §15.2)。
@@ -647,9 +652,63 @@ denom 收缩;按 §15.2 教训,本地闸加 FP opcode 逐类计数对账。
 全景);判负 → revert 本改动并**关死 §8.4 的重启条款**(vec 交付时机对
 d64 的独立收益即被证伪,M1 全线出局)。
 
-#### 8.5.3 wave24 B200 实测与判决
+#### 8.5.3 wave24 B200 实测与判决:**KEEP**(372f3cb)
 
-(待上机后回填)
+JID 4038279,umbriel-b200-049(第一次 alloc 落在 umbriel-b200-069,健康门
+load probe spread 5.8% 拦截,cancel 后排除重排;两个坏节点 019/069 都进
+exclude)。容器 pytorch_26.07,10.0a + PRUNE=OFF,单 alloc,完毕即
+cancel。树 sage-w13.tar.gz = 372f3cb。
+
+1. **golden 三轨全 diff=0**:ws0 ok=2082、ws1/wsp 各 ok=2107,diff=0
+   missing=0——wall 切 basic block 在显式 fmaf 之上,值契约成立(§15.2
+   教训的门禁闭环:本地 FP 逐类对账 → 上机零 diff)。
+2. **压测 6/6 零挂死**:d64main(SWEEP 两态 + 8000×2)、w1、trip256、
+   trip512、tiny、p_d64(persist 强制,SWEEP+8000×2)。
+3. **bench d64 12 点**(3 轮 median;spread:ws 0.12%/wsp 0.13%/old
+   0.70%/cudnn 0.71%;全部 exclusive):
+
+   | 比值 | wave19 基线 | wave23b 终树 | **wave24** | 判读 |
+   |---|---:|---:|---:|---|
+   | ws/old geomean | 0.980 | 0.9575 | **1.0302**(c0 1.0217 / c1 1.0388) | 判据「≥1.0 且无形状 <0.96」过;worst 0.9878(c0 b1 s4096),11/12 ≥1 |
+   | wsp/old geomean | — | 0.9399 | **1.0537**(c0 1.0803 / c1 1.0277) | worst 0.9798(c1 b4 s4096) |
+   | ws/cudnn geomean | ~0.64(w16 两点) | — | **0.6574**(c0 0.6723 / c1 0.6428) | 新读数记档;§1.2 可达带不变 |
+
+   跨会话可比性:old 列对 w23b 逐形状 geomean 1.0008(最大偏差 0.17%);
+   ws 列 w24 比 w23b 快 7.7%、wsp 快 12.2%——§15.5 差值账(vec_full 交付
+   对 d64 ~+7%)在单改动树上兑现。
+4. **d128 抽查 4 形状零影响**:ws/old 1.19-1.24、wsp/old c0 1.27-1.34 /
+   c1 1.07-1.08,与 wave20/23 参照带逐段吻合(SASS 逐字节恒等的运行时
+   佐证)。
+5. **ncu**(ws d64 s16384 nc b4h32,锁频口径):
+
+   | 指标 | w19 基线 | w23b 终树 | **wave24** |
+   |---|---:|---:|---:|
+   | duration | 14.92 ms | 15.45 | **14.28**(−4.3% vs 基线) |
+   | mio_throttle/issue | 0.954 | 1.059 | 1.016 |
+   | eligible/scheduler | 0.484 | 0.479 | **0.536** |
+   | XU %(inst active) | 54.3 | 52.5 | **56.8** |
+
+   XU 供给与 eligible 同向上探(56.8 ≈ 融合树的 56.7),锁频 duration 与
+   自由时钟 bench 本次同向(w23 的反向教训未再现);mio_throttle 比基线
+   略高(0.954→1.016)——vec 提前交付不是靠减 TMEM 口压力,而是把 XU 突发
+   从交付窗口挪走。PHASECHK 直接占样 2.91%→2.80%(此站位口径下几乎持平,
+   自旋大头本就不落在 trywait 指令本身)。
+
+**判决:KEEP**(预注册判据 8.5.2.3 过线)。§8.4 的重启条款由本节兑现并
+关闭(M1 的「vec 交付时机」候选已落地,其余 M1 lever 维持判负)。
+
+**auto 建议(M2)**:严格 ws-only 判据(12 点全 ≥1)差一个形状(c0 b1
+s4096 0.9878)不满足;但 auto 的实际组合(wave20 起 nc→persist、
+causal→per-tile ws)在 d64 上 **12/12 全 ≥1.0319**——nc 走 wsp/old
+geomean 1.0803、causal 走 ws/old 1.0388,组合 geomean 1.0593。建议下一
+步把 `sm100_ws_auto_pick` 的 `head_dim == 128` 放宽到 `|| == 64`(launcher
+注释同步改写:「384/512 TMEM 列」归因已在 §1.3 证伪,改引本节),作为
+独立 commit 走一次 22 点 d128 + 12 点 d64 的组合态复验;本 wave 不动
+launcher(keep 判决限于 vec_full 单改动)。
+
+数据:集群 `SageAttention_refactor/logs-w24/`(golden g_*.txt、
+stress_*.log、bench-d64/、bench-d128spot/、ncu/)、脚本 `scripts-w24/`、
+首次 alloc 健康门记录 `logs-w24-attempt1-node069/`。
 
 ## 附录 B:per tile-block 归一化(§1.4)
 
@@ -661,6 +720,10 @@ tile-block 比值 1.041/1.023 = 1.018,与 bench 的 ws/old 0.982 互为倒数。
 
 ## 附录 C:数据来源
 
+- **w24(§8.5)**:集群 `SageAttention_refactor/logs-w24/`(g_*.txt、
+  stress_*.log、bench-d64/、bench-d128spot/、ncu/)、脚本 `scripts-w24/`、
+  树 `sage-w13.tar.gz`(372f3cb);健康门拦截记录
+  `logs-w24-attempt1-node069/`。
 - **w23/w23b(§8.4)**:集群 `SageAttention_refactor/logs-w23/bench-d64/`
   (融合树)、`logs-w23b/{bench-d64,ncu,stress_*.log,g_*.txt}`(终树);
   会话脚本 `scripts-w23/`。
