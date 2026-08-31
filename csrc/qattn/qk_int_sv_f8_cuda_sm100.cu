@@ -143,10 +143,15 @@ bool sm100_ws_persist_pick(int is_causal)
 // 22-point bench + crossover-gap grid + long-row four-state sweep cover
 // qo_len 1024..131072 x causal both x b{1,4}, ws/old 1.09-1.37 with the
 // worst point 1.0911 (b1 s6144 non-causal); the old short-seq loss went away
-// with the r5 epilogue TMA store, the old long-seq loss with G1. d64 stays
-// out: still 7-9% slower (only 384 of the 512 TMEM columns used). The
-// (tensor_layout, is_causal) parameters stay as the hook for re-cutting if a
-// future regression needs it.
+// with the r5 epilogue TMA store, the old long-seq loss with G1. d64 joins
+// after the wave24 vec_full delivery fix (D64_DESIGN 8.5): the combination
+// this pick actually routes to (non-causal -> persistent, causal -> per-tile
+// ws, see sm100_ws_persist_pick) beats the classic kernel on all 12 measured
+// d64 shapes (>=1.032; nc persistent/old geomean 1.0803, causal ws/old
+// 1.0388, combined 1.0593). The earlier "only 384 of the 512 TMEM columns"
+// loss attribution was disproven (D64_DESIGN 1.3). The (tensor_layout,
+// is_causal) parameters stay as the hook for re-cutting if a future
+// regression needs it.
 bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout, int is_causal)
 {
     (void)tensor_layout;
@@ -154,7 +159,8 @@ bool sm100_ws_auto_pick(const torch::Tensor& query, int tensor_layout, int is_ca
     if (query.dim() != 4) {
         return false;  // malformed input: let the classic parse report it
     }
-    return query.size(3) == 128;
+    const int64_t head_dim = query.size(3);
+    return head_dim == 128 || head_dim == 64;
 }
 
 }  // namespace
