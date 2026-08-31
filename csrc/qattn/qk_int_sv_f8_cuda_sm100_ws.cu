@@ -41,22 +41,23 @@
 //   O0 [256,256+HD)          128xHD f32 PV acc, tile 0
 //   O1 [256+HD,256+2*HD)     tile 1 (d64 leaves [384,512) unused)
 //
-// Numerics contract (G1, C1_DESIGN.md section 9): correction and epilogue
-// float op sequences are still copied verbatim from
+// Numerics contract (G1, C1_DESIGN.md section 9; A' lazy max, section 12):
+// correction and epilogue float op sequences are still copied verbatim from
 // qk_int_sv_f8_cuda_sm100.cu (line references at each block; copies are
 // annotated instead of extracted into a shared header so the existing
 // kernel's TU keeps byte-identical device text - SASS gate). The softmax
 // step departs from the 128-thread kernel's value sequence: the S row stays
 // in the raw integer domain, the block row max is a balanced FMNMX tree
 // scaled back per k-scale class (bit-identical to the old serial fold -
-// rounding is monotone - so row_max / vec / o_scale / the correction
-// rescale factors are still bitwise those of the old kernel), the exp2
-// argument fuses the dequant into one fma (P moves by a rounding
-// placement, <= 1 ulp of the argument), and d_sum accumulates in 4 packed
-// f32x2 chains (reassociation). From G1 on this kernel is accuracy-gated
-// against fp32 SDPA (cos_sim > 0.99, rel_l1 < 0.06), not golden-bitwise
-// gated; the numerical analysis and the golden re-dump flow are in
-// C1_DESIGN.md section 9. The epilogue stages the converted output through
+// rounding is monotone), the exp2 argument fuses the dequant into one fma,
+// and d_sum accumulates in 4 packed f32x2 chains (reassociation). A'
+// (kRescaleThreshold below) additionally makes the row_max update lazy:
+// a block max within the threshold of the running max leaves row_max (and
+// so vec / o_scale / the correction rescale factors) untouched, and the P
+// fold offset drops by the threshold to keep P under 448. From G1 on this
+// kernel is accuracy-gated against fp32 SDPA (cos_sim > 0.99,
+// rel_l1 < 0.06), not golden-bitwise gated; the numerical analyses and the
+// golden re-dump flow are in C1_DESIGN.md sections 9 and 12. The epilogue stages the converted output through
 // sO and TMA-stores it (r5 lever B) - same values, same bytes, different
 // transport. Softmax reads each S row once - two x64
 // tcgen05.ld per KV block (the widest form ptxas accepts under the
@@ -500,6 +501,28 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
     static_assert(2 * 128 * kNumRegsSoftmax + 128 * kNumRegsCorrection + 128 * kNumRegsOther == 64 * 1024,
                   "warpgroup register budgets must exactly cover the SM register file");
 
+    // --- A' RESCALE_THRESHOLD lazy row max (C1_DESIGN.md section 12;
+    //     BEYOND_CUDNN_PLAN.md 4.5). cudnn DSL same mechanism and value:
+    //     prefill_d128_fp8_sm100.py:1242-1260 update_cond =
+    //     is_first | ((current_max - total_max) > RESCALE_THRESHOLD), fp8
+    //     threshold 4.0 via config_sm100.py rescale_threshold(). A block max
+    //     that does not beat the running max by more than the threshold
+    //     (log2 domain) does not update row_max, so o_scale is exactly 1.0
+    //     and the correction's all-one ballot skip hits on every
+    //     non-updating block (sim: randn warp-vote skip 0.13 -> ~1.0). The
+    //     e4m3 fold offset drops by the threshold so a stale max cannot
+    //     push P past 448: row_max >= challenger - T holds at every step
+    //     (the -5e6 init acts as a stale max; an update restores
+    //     row_max = challenger), keeping the exp2 argument at most
+    //     T + (S_FP8_OFFSET - T) = 8.807, the eager kernel's ceiling. A
+    //     fresh max now maps P to 448*2^-T (= 28) and staleness climbs it
+    //     back toward 448, so P spends up to T binades earlier in the e4m3
+    //     bottom (subnormal/zero); the accuracy budget of that trade is
+    //     quantified in bench/sm100_review/lazy_max_sim.py (threshold sweep
+    //     table in C1_DESIGN.md section 12).
+    constexpr float kRescaleThreshold = 4.0f;  // cudnn fp8 parity
+    constexpr float kLazyMaxFold      = S_FP8_OFFSET - kRescaleThreshold;
+
     // --- TMEM column plan (see file header) ---
     constexpr uint32_t TMEM_COL_S0     = 0;
     constexpr uint32_t TMEM_COL_S1     = 128;
@@ -794,13 +817,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         // (bit-identical to the old serial dequant+fold, see below), and the
         // exp2 argument is ONE packed fma per pair from the raw word:
         //   p = exp2(raw * (local_sm_scale*dequant) - row_max)
-        // where -row_max already carries the S_FP8_OFFSET fold. d_sum
-        // accumulates in 4 independent packed f32x2 chains. This replaces
-        // the 128-thread kernel's per-element value sequence (:420-474):
-        // row_max/vec/o_scale stay bit-identical, but P moves by the
+        // where -row_max already carries the fold offset. d_sum accumulates
+        // in 4 independent packed f32x2 chains. This replaces the 128-thread
+        // kernel's per-element value sequence (:420-474): P moves by the
         // rounding-placement difference of the fused dequant and d_sum is
         // reassociated - the kernel is accuracy-gated, not golden-bitwise
-        // gated, from G1 on. The whole row stays in registers, so nothing
+        // gated, from G1 on. A' (C1_DESIGN.md section 12) then makes the
+        // row_max update itself lazy (kRescaleThreshold above): row_max only
+        // adopts a challenger that wins by more than the threshold, and the
+        // fold offset is S_FP8_OFFSET - kRescaleThreshold so the stale max
+        // keeps P under 448. The whole row stays in registers, so nothing
         // touches TMEM between the vec store (aliases S cols [0,2)) and the
         // P store. is_last folds the causal/OOB mask like :431-444, in the
         // raw domain (-inf sentinel).
@@ -887,9 +913,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             //      m_local init (a masked/-5e6-sentinel lane could win the
             //      old fold the same way), and also absorbs the one NaN
             //      corner - d * (-inf) with a zero-amax d = 0 - because
-            //      fmaxf drops a NaN operand. row_max / o_scale / the vec
-            //      hand-off therefore stay bit-identical to the 128-thread
-            //      kernel (:454-458). ----
+            //      fmaxf drops a NaN operand. m_deq is therefore bit-
+            //      identical to the 128-thread kernel's serial fold; what
+            //      row_max does with it is the A' lazy update below. ----
             float m_deq;
             if constexpr (K_GRAN == QuantGranularity::kPerThread) {
                 m_deq = dequant_scale[0] * ws::tree_fmax_cls<0, 32>(&RS_row[0]);
@@ -903,9 +929,17 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             }
             m_deq = fmaxf(m_deq, -5000000.0f);
 
-            // ---- online softmax update (expressions of :454-458) ----
+            // ---- online softmax update (:454-458 structure with the A'
+            //      lazy-max threshold at the update site; kRescaleThreshold
+            //      above). The challenger folds the reduced offset, and
+            //      row_max adopts it only when it wins by more than the
+            //      threshold - otherwise row_max keeps m_prev's bits, the
+            //      subtraction below is exactly +0 and o_scale is exactly
+            //      1.0 (the correction ballot-skips those blocks). The
+            //      select compiles to FADD+FSETP+FSEL; no branch. ----
             const float m_prev  = row_max;
-            row_max             = max(row_max, fmaf(m_deq, local_sm_scale, -S_FP8_OFFSET));
+            const float m_chal  = fmaf(m_deq, local_sm_scale, -kLazyMaxFold);
+            row_max             = (m_chal - row_max > kRescaleThreshold) ? m_chal : row_max;
             const float o_scale = math::ptx_exp2(m_prev - row_max);
             denom *= o_scale;
 
@@ -926,10 +960,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             //      c_raw = local_sm_scale * dequant_scale the exp2 argument
             //      is ONE packed fma straight from the raw word - the old
             //      per-element dequant multiply is gone - and -row_max
-            //      already carries the S_FP8_OFFSET fold (row_max =
+            //      already carries the kLazyMaxFold offset (row_max =
             //      c*m - offset, so -row_max = offset - c*m: the same
             //      constant-domain form as cutedsl's LOG2_448 neg_off,
-            //      L1111-1113). P moves by the rounding placement -
+            //      L1111-1113; A' shrinks the offset by the threshold and
+            //      lets the argument climb back up to 8.807 on stale-max
+            //      blocks). P moves by the rounding placement -
             //      rnd(c*d) then fma, vs rnd(raw*d) then fma - i.e. <= 1 ulp
             //      of the argument; quantified in C1_DESIGN.md section 9.
             //      The FLT_MIN clamp (peeled step only, where masked -inf
@@ -1106,11 +1142,15 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             // skipped; the barrier traffic (corr_full wait / corr_empty
             // arrive) is kept, so the pipeline is unchanged - corr_empty now
             // means "rescale stored or skipped as the identity". A block that
-            // does not raise the running max hits this exactly: row_max =
-            // max(m_prev, challenger) returns m_prev bit-for-bit, so
-            // m_prev - rmax is +/-0 and ex2.approx(+/-0) = +1.0 by its
+            // does not update the running max hits this exactly: under the
+            // A' lazy threshold (kRescaleThreshold) row_max keeps m_prev's
+            // bits unless the challenger wins by more than the threshold,
+            // so m_prev - rmax is +0 and ex2.approx(+0) = +1.0 by its
             // special-value table (ex2.approx results rounding to 1.0 for
             // tiny negative arguments also skip - the multiplier IS 1.0f).
+            // A' turns this from the "block did not raise the max" case
+            // (randn warp-vote rate ~0.13) into the common case (~1.0,
+            // lazy_max_sim.py table in C1_DESIGN.md section 12).
             // Bit-exactness of the skip: x * 1.0f under mul.rn.ftz.f32x2
             // returns x for every value x this accumulator can hold. The one
             // FTZ divergence - a denormal x is flushed by the mul but kept by
