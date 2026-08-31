@@ -896,3 +896,67 @@ s_empty spin,cuda-gdb 按账本 §2 的 #2j/#2j+1 记法读 PC);bench 22 点
 (b4h32s16384c0 全 set,§7.5 历史序列 r5 16.35 → G1 14.69 → 目标带
 ≤14.0),BEYOND_CUDNN_PLAN §6 的 Phase A 预算(+3~8% 长序列)以 22 点
 对照 §1.1 的 need 列逐形状销账。
+
+### 11.4 wave16 上机实测(B200;ballot 落袋,P-chunk 判负 revert)
+
+口径:tree f591296(sage-w7,`TORCH_CUDA_ARCH_LIST=10.0a` + PRUNE=OFF)+
+ballot-only 对照树 65d30f7(sage-w7a,PRUNE 默认 ON,bench/bisect 用)+
+G2 基线 = 同容器同卡预建 sage-w6(a88057d)。B200 单卡独占
+(umb-b200-248,JID 4030119,pytorch_26.07-py3,torch 2.13.0a0 nv26.07 /
+CUDA 13.3 / cudnn 9.24)。原始数据:集群 `SageAttention_refactor/logs-w16/`。
+
+| 项 | 实测(wave16) |
+|---|---|
+| golden(WS=0,golden-sm100,f591296) | `ok=2082 diff=0 missing=0`(extra=25 varlen 预期)→ 过,classic TU 未动实证 |
+| golden(WS=1,golden-sm100-g1ws,f591296) | **挂死**(3/3 次,attn 段内;GPU util 100% / ~258 W 自旋) |
+| ws_stress(f591296,WS=1) | **首个 launch 即挂**(SWEEP s2048 c0,1/1)——不是低概率 race,是 tile 0 即死锁 |
+| golden(WS=1,65d30f7 ballot-only) | `diff=0`(ok=1315,missing=792=PRUNE 家族,预期)→ 11.1 的恒等论证在真机成立 |
+| ws_stress(65d30f7) | SWEEP + s32768 8000×2 零挂死(657s);s139264 300×2 零挂死;fallback 数值 cos≥0.9999997 / rel_l1≤5e-4 → 过 |
+| bench 22 点(ballot vs G2,同场) | geomean **1.0593**,min 1.0079(nc b1 s1024),22/22 全正 → **PASS**(判据 >1.005 / 无形状 <0.995) |
+| ncu(b4h32s16384c0,ballot) | duration **13.71 ms**(r5 16.35 → G1 14.69 → G2 14.48 → ballot 13.71),**目标带 ≤14.0 单 lever 达成**;L2 read 1093.2M ≈ G2 1087.1M(机制=省 TMEM 口争用,不省 L2,符合设计) |
+
+**P-chunk(dfbeb24)死锁画像**(cuda-gdb from-launch 断进,SIGINT 打断法;
+attach 模式在该节点拿不到 CUDA 态,见下):挂死实例
+`<128,128,512,128,per_warp,per_warp,half,MaskMode0,false,true>` grid(8,32,4)
+s2048 b4h32,tile 0 全块死锁——softmax 8 个 warp 全部自旋
+`SYNCS.PHASECHK.TRANS64.TRYWAIT [R2+0x50]`,correction 4 warp 自旋
+`[UR17+0x78]`,wg3 三个单 lane 活跃 warp 各在自己的 PHASECHK 自旋
+(`[UR17+0x60]/[0x68]/[0xa8]` 群),每块恰有 1 个 wg3 warp 已 EXIT。即
+「两次完成/步 + 常量 parity」方案在第 0 步就有 wait/parity 错配,不是
+概率窗口——§11.2 的 phase-alias 论证在真机被证伪,具体错位留给 revert 后
+的重设计(若重启,先做单 shape 冒烟再上 golden)。**判定:dfbeb24 整
+commit revert(11.2 预设的回退路径);65d30f7(ballot)落袋。**
+
+**ballot 单 lever 分段收益**(vs G2 同场,时间比 geomean;交叉核对
+wsg2-vs-w14ws 场漂移 1.0002,可信):
+
+| 段 | ballot/G2 | ws/old | ws/cudnn |
+|---|---|---|---|
+| 全 22 点 | 1.0593 | 1.2107 | 0.9019 |
+| d128(20) | 1.0614 | 1.2356 | 0.9331 |
+| s≥32768(8) | 1.0919 | 1.2233 | **1.0520** |
+| 其中 causal s≥32768(4) | 1.1073 | 1.2494 | 1.0768 |
+| s=16384(5) | 1.0664 | 1.1641 | 0.8958 |
+| s=4096(5) | 1.0388 | 1.1609 | 0.7464 |
+| s=1024(4) | 1.0133 | 1.3125 | 0.8468 |
+| d64(2) | 1.0385 | 0.9876 | 0.6416 |
+
+**长序列首要目标达成**:s≥32768 段 ws/cudnn geomean **1.0520**,8 形状中
+7 个 ≥1.0(唯一未过:nc b1 s32768 = 0.9926);causal 长序列最高 1.10-1.11。
+同场 cudnn 比 w14 慢 ~1.2%(drift),按 w14 cudnn 折算该段 geomean 仍
+≈1.04,结论稳。新目标线:ws/old 22 点 geomean **1.2107**(d128 1.2356),
+ws/cudnn **0.9019**(d128 0.9331);剩余差距集中在 s≤4096 与 d64。
+
+调试方法记档(后续 wave 直接用):ComputeLab B200 上 `cuda-gdb -p` attach
+拿不到 CUDA 态(先撞 Yama ptrace_scope,driver 侧再报 "No CUDA kernels";
+prctl(PR_SET_PTRACER_ANY) 只解决前者)——可靠姿势 = `cuda-gdb -batch
+--args python driver.py` 从头带跑 + 停滞检测后 `kill -INT` 打断,断点态
+`info cuda kernels/blocks/warps` + `x/i $pc` 全可用(死锁类 bug 不怕
+debugger 扰动;本轮 dense/varlen 两个挂死均一击命中)。
+
+**wave16 定版口径**:golden 双轨(WS=0 过 / WS=1 挂)+ 压测(w7 挂 /
+w7a 全绿)+ varlen A0(红,SM100_VARLEN_DESIGN §6.4.5)⇒ f591296 原样
+**不定版**。建议树 = revert dfbeb24(P-chunk)后重验 golden 双轨一轮
+(ballot 的 diff=0 与全套压测已在 w7a 实证,revert 后 dense ws TU 文本
+即 65d30f7 态);ballot(65d30f7)与 varlen fence(f3e617b)保留;
+sm100 varlen 按 §6.4.5 撤出 plan 等 A3。

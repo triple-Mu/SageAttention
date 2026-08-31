@@ -396,6 +396,63 @@ clamp 与 kv_len==0 覆盖)重过 M3;C3 成立 → 按 A3 命中的位形改源�
 约束写进 HARDWARE_CHECKLIST 的 A2/A5 节。矩阵全绿超过 4×6000 而 A0 曾挂
 ⇒ 回到 §6.3 的建议 (a),plan 侧撤 sm100 等根因。
 
+### 6.4.5 wave16 B200 裁决实录:C1 不充分、C2 出局、C3 上位
+
+口径:tree f591296(sage-w7,fence 已在内),两次独占 alloc
+(umb-b200-248 JID 4030119 / umb-b200-261 JID 4031148,第二次换节点全新
+context 复验,排除本会话多次 wedge-kill 的连带);driver 同 §6.3
+(`w14_isolate.py --component fwd` + 新增 `w16_isolate2.py` A1/A2/A2b 臂);
+日志 `SageAttention_refactor/logs-w16/{a0,a12,arms2}/`。
+
+| 臂 | 结果(挂死 iter) | 判读 |
+|---|---|---|
+| A0 fence 版(seed0/seed2 × 6000) | **红**:seed0 iter=4657(pack1)、seed2 iter=149(pack5);换新节点复验 seed2 iter=437(pack5) | fence 在场仍挂 ⇒ **C1(单靠 init fence)不充分**;fence 本身无害且封了文档要求的缺口,保留 |
+| A1(等长 4096 × b8h16,causal,零 block-skip / 零 trip) | **红**:iter=50(新节点)、iter=26/4(首 alloc) | 无裸退也挂 ⇒ **C2 出局**("消灭裸退"补丁救不了,不落) |
+| A2(极偏斜 [7936,128,128,128]) | **红**:iter=12(新节点)、iter=3/5(首 alloc) | 与 A1 同红,无对照价值,同指 C3 |
+| A2b(新增:seed2-pack5 固定形状 solo,q=[5968,5797,5930,7304,2641,6552,7560] kv=[4095,8029,4573,8161,5799,7450,7554],causal) | **红**:iter=7(新节点)、iter=5/23(首 alloc) | **固定形状可复现**——A3 每臂的裁决成本从 2×6000 掉到分钟级 |
+| dense classic 对照(WS=0,同 alloc 前后各一轮) | 全绿(两节点) | 病灶仍圈死在 varlen fwd kernel;设备/镜像健康 |
+
+**挂死断点实录**(cuda-gdb 从头带跑 + 停滞后 SIGINT 打断;attach 模式在
+ComputeLab B200 上拿不到 CUDA 态——先撞 Yama ptrace,prctl(PR_SET_PTRACER_ANY)
+之后 driver 仍报 "No CUDA kernels"——§6.4.4「随挂死附带」行的 attach 姿势作废,
+从头带跑姿势 1-2 击必中):3360 CTA 的 grid 只剩 1-2 个 CTA 永久自旋
+(其余全部正常退出),卡住 CTA 的 128 线程全活着,3 个 warp 停在主体内联
+`SYNCS.PHASECHK.TRANS64.TRYWAIT P0[UR9]`(紧跟 `BAR.SYNC.DEFER_BLOCKING`
+之后的相位等待),第 4 个 warp 停在 out-of-line 自旋块。单 CTA 局部
+「等不到的 completion」,不是全 grid 死锁——与 E1(记账逻辑错,应为确定性)
+不合,与「该 CTA 的某次 complete_tx/arrive 丢失」相容。
+
+判读要点(修正 §6.4.2/§6.4.3 的两处推断):
+
+1. **触发不是形状函数,是 launch 后压力函数**:seed 轮换 driver 下挂点
+   富集在该 seed 最大的 causal pack(seed2 5/5 都在 pack5,seed0 与 wave14
+   同落 pack1)——但 A1/A2/A2b 证明等长、q==kv、极偏斜 solo 全都能挂;
+   富集只反映「kernel 越大窗口越宽」。
+2. **复现率方差极大,别拿 rate 当信号**:同 driver 同 seed,wave14 1785/45,
+   本轮 4657→149→437→7-50;一次 wedge-kill 之后的 context 挂得更快的
+   梯度存在,但换新节点首个 varlen 臂(iter 437)仍挂,dense 对照始终绿
+   ——判绿判红只认 6000 满轮,不认 iter 数。
+3. C1 的 fence 修复保留(正确性缺口是真的),但根因在别处:**C3 上位**,
+   下一步 = §6.4.4 A3 的源级 A/B(peeled tile k_scale 读回位置 /
+   `num_tiles_s` 循环 LDTM 间距),用 A2b 固定形状臂做分钟级裁决;跑不出
+   禁区就升级到 UTMALDG/complete_tx 层面的窗口试验(如 init 后
+   加 dummy expect/arrive 一轮自检)。
+
+**处置(本轮定版口径)**:sm100 varlen 不定版——按 §6.3 建议 (a),
+plan 侧把 sm100 撤出 `_VARLEN_BACKENDS` 回 sm89 packed fallback,等 A3
+定位后再回来重过 M3(pytest 全绿态可沿用,压测/bench 必须重来);dense
+侧(classic + ws/ballot)不受影响,见 C1_DESIGN §11.4。
+
+## 6.5 M3 重跑处置(wave16)
+
+前置条件「fence 版压测全绿」未满足(§6.4.5 A0 红),M3 重跑整体**跳过**:
+pytest 全量 / ragged 压测 / bench_varlen 均未执行——对一个已判定撤出
+plan 的 kernel 补性能数据没有意义,wave14 的 pytest 全绿记录(§6.3)与
+bench_varlen 部分数据仍是现存基线。A3 修复落地后按 §6.2 清单整轮重跑,
+bench 口径注意:dense 参照按 SAGEATTN_SM100_WS=0(classic)跑才能与
+sm90/sm120 的 1.4-2.1× 记录同轴,wave14 的 d128 行是 auto=WS 参照,偏低
+13-16% 是参照口径差不是 varlen 劣化。
+
 ## 7. 风险(设计问题 4)
 
 | 风险 | 内容 | 缓解 |
