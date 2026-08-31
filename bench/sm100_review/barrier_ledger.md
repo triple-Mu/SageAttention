@@ -501,3 +501,45 @@ completion is produced strictly earlier in that order:
   read_vec, live per the previous point.
 * No role's post-boundary code is required for any of these producers, so
   the order is well-founded and the kernel remains deadlock-free.
+
+## P6. EX2 phase gate (wave22): the per-step vec_empty wait moved pre-exp2
+
+Causal instances only (`mask_mode == kCausal`; c0 code is untouched). Both
+softmax warpgroups' per-step `[w] vec_empty#j` moves from the step tail
+(after the P store) to directly after `arrive vec_full#j`, before the
+exp2/pack segment. (Branch-free by design: a tile-predicated move was tried
+first and ptxas carried the `tile` predicate across the setmaxnreg boundary
+on the stack — 8B frame, 6 LDL at the hot loop top on the ws TU — the
+asymmetry comes from correction's program order, not from code.) Every
+completion, count and phase sequence is untouched — it is the SAME wait
+consuming the SAME completion at the same cumulative index, only its
+position inside the softmax step moved, so every P2 row and P3 argument
+holds verbatim. Dynamics: correction consumes vec_0(j) first (it spins on
+vec_full_0 in the wave20 c1 profile, 19.7%/3.4%), so tile 0's moved wait is
+already complete and free; tile 1's completes only after correction also
+passed the O_0 rescale — tile 1's P store (s_empty_1#j, hence QK_1(j+1),
+hence softmax1's next step) runs about one rescale behind tile 0, a
+structural per-step phase offset between the two warpgroups' EX2 bursts on
+each SMSP (C1_DESIGN.md 13.6). SASS check (nvcc 13.3): in this branch-free
+form ptxas keeps the whole exp2 segment after the moved wait, so the offset
+applies within the step; scheduling is not contractual though (the rejected
+predicated form had the exp2 math hoisted above the wait — no data edge into
+the FP chain), and either placement yields the same steady-state stagger.
+
+* Deadlock (tile t): the moved wait's completion (correction's `arrive
+  vec_empty_t#j`) requires `vec_full_t#j` (arrived immediately above the
+  moved wait) plus correction's upstream pipes (vec_fulls of the OTHER tile
+  at step <= j, `corr_full`s of steps < j) — nothing softmax_t does after
+  its moved wait, and the two softmax warpgroups' pre-wait segments depend
+  only on mma/load progress. The §7/P5 witness order takes one edit:
+  softmax_t's step-j exp2 + P store now rank after correction's
+  rescale/discard(t,j) vec read, whose producers all rank earlier — still
+  well-founded. Step 0 degenerates to the discard pair (no rescale in
+  front), trip=1 to discard+final — both immediate.
+* H3/H8 unaffected: the wait still precedes the next vec store (step j+1's
+  or the final one), which is all those hazards need.
+* s_empty_t#j (P store + arrive) now sits after the moved wait: mma's
+  QK_t(j+1) / PV_t(j) observe a later completion in wall time, but no wait
+  edge changed — pure scheduling; tile 0's wait is free in the steady
+  profile and tile 1's delay is absorbed by the tensor pipe's slack in the
+  softmax-bound regime this targets.

@@ -1274,3 +1274,86 @@ routing 自检:torch.profiler 确认 PERSIST=1 时 launch 的是
    c1 的去错相/短 runway 修复(候选:两 tile 交错重错相、q_empty 提前
    commit)单独立项后再翻。手动 `SAGEATTN_SM100_WS_PERSIST=1` 两态照旧
    可用。
+
+### 13.6 wave22:causal EX2 去错相(EX2 phase gate;本地闸全过,待上机)
+
+#### 13.6.1 W=1 +13% 的本地 SASS 对照:静态代码生成同位,mask/trip 假设排除
+
+口径:nvcc 13.3,sm_100a,production 实例对(d128、kPerWarp、bf16、
+lse=false,mask 两态,即 auto 路径的默认 gran)。复现:对
+`bench/sm100_review/qk_int_sv_f8_cuda_sm100_ws{,_persist}_probe.cu` 的同款
+显式实例化改成上述四实例后
+`nvcc -std=c++17 -O3 --use_fast_math -cubin -gencode arch=compute_100a,code=sm_100a -I csrc/qattn`,
+`cuobjdump -sass` 按 backward-branch 切稳态循环计数。
+
+| 稳态循环(指令数/kv 块) | ws c0 | ws c1 | wsp c0 | wsp c1 |
+|---|---:|---:|---:|---:|
+| softmax step | 594 | 592 | 587 | 583 |
+| correction rescale 对(t0+t1) | 203 | 201 | 206 | 206 |
+| correction S1-only(causal 专属) | — | 102 | — | 104 |
+| mma 每块(QK0+PV1+QK1+PV0) | 209 | 216 | 216 | 220 |
+
+- softmax step 四份 op mix 完全一致:129 MUFU.EX2、128 I2FP、64 FFMA2、
+  67 FADD2、64 F2FP、87 FMNMX(+FMNMX3)、2 LDTM.x64、STTM.x2+x32;宏观
+  调度形状也一致(LDTM#1 → ~41 I2FP → LDTM#2 下沉(6.4 已知)→ k-scale
+  LDG/LDS 中段 → vec STTM → P STTM)。wsp 与 ws 的差别只有 k-scale 传输
+  (LDG vs sK_scale LDS 前缀),c0/c1 共有,解释不了 c1 专属斜率。
+- 额外发现:**四份 SASS 里 ptxas 都把整段 exp2/pack 提升到 vec STTM.x2
+  之上**(EX2 段起点在 loop 第 ~236 行,vec store 在 ~518 行)——源码
+  「vec 先发以便 O rescale 重叠」在 SASS 层早已不成立,基线即如此。这
+  直接影响 13.6.2 的机制表述。
+- **结论:±3% 之内的指令数与同形调度,+13% 不是 causal 实例的 mask/trip
+  代码生成**;归因收敛到动态相位(与链式去错相同源:W=1 时 QK00/QK10
+  背靠背发射,两 softmax 从第 0 块起就同相)。W=1 残差的最终归因需要上
+  机 per-barrier ledger(W=1 c1,wsp vs ws 同形状)。
+
+#### 13.6.2 修复:EX2 phase gate(vec_empty acquire 前移,branch-free)
+
+- **机制**:causal 实例(`kEx2PhaseGate = mask==kCausal`)softmax 两个
+  warpgroup 的 per-step `vec_empty` acquire 都从 step 尾(P store 之后)
+  移到 `arrive vec_full` 之后。错相来自 correction 的程序序而非代码分
+  支:correction 先消费 vec_0(wave20 c1 profile 里它在 vec_full_0 上自
+  旋 19.7%,永远领先)→ tile0 的前移 wait 到达时已完成,零开销;tile1
+  的 wait 要等 correction 再走完 O_0 rescale → tile1 的 P store(继而
+  QK_1(j+1)、softmax1 下一步)每步落后 tile0 约一个 rescale 时长——结
+  构性错相,替代跨 work item 的相位锁死(vec_full 19.7/3.4、softmax
+  mio 3%→11%)。SASS 实测(nvcc 13.3):branch-free 形态下 ptxas 把整段
+  exp2 保持在前移 wait 之后(129/129),错相直接作用于本步 EX2 段;调度
+  非契约(谓词化形态曾把 exp2 提到 wait 之上),两种摆放稳态错相量相同。
+- **branch-free 的由来**:tile 谓词版(只挪 tile1)实测让 ptxas 把
+  `tile` 谓词跨 setmaxnreg 边界放栈上(d64 c1 sm_100a:8B frame、6 LDL
+  在热循环顶部重载)——直接判弃,换无分支版,谓词彻底消失。
+- **语义**:同一个 wait、同一个 completion、同一 phase 序,只挪线程内
+  位置;计数/相位/liveness 论证见 barrier_ledger.md P6(含 tile0/tile1
+  双侧 deadlock 论证与 step-0/trip-1 退化 trace)。无浮点移动,
+  bit-exact,golden 双轨 diff=0 仍是硬闸。
+- **c0 一个字节不动**(wave20 验收态保持):见 13.6.3 SASS 范围。
+- **记档不做**:奇偶 item 交换 tile 处理序——tile↔warpgroup 是纯对称
+  relabel,不产生相位差,判无效;q_empty 提前 commit——需拆 q_empty[t]
+  双 barrier(ledger 计数变更),攻的是 item 边界 runway(截距项),
+  与本斜率问题不同源,若上机后 c1 仍差且 ncu 指向边界气泡再单独立项。
+
+#### 13.6.3 本地门禁(全过;nvcc 13.3)
+
+- ptxas probe(13.3 同命令)4 实例 × sm_100a/sm_110a:0 spill/stack、
+  128 entry、USETMAXREG TRY_ALLOC 0xc0 / DEALLOC 0x58 / 0x28 各 ×4。
+- SASS 范围(cuobjdump 按函数逐指令对照基线 fc03183):两 arch 上
+  MaskMode0 两实例(d64/d128)**逐字节相同**;MaskMode1 两实例指令数
+  持平(sm_100a ±0,sm_110a ±0/+8),差异即 wait 挪位与随动重排;
+  13.6.1 口径的 softmax steady loop 583→584,op mix 不变,新序列
+  `STTM.x2 → arrive vec_full → try_wait vec_empty → exp2 段 → STTM.x32`
+  已在 SASS 里逐条确认。
+
+#### 13.6.4 上机判据(B200)
+
+1. golden 双轨:`WS=1 PERSIST=1` 对 golden-sm100-g1ws diff=0;WS=0 路不
+   受影响。
+2. 压测(PERSIST=1,重点 causal):SWEEP 两态 + trip=1 退化 + W=1 退化
+   + s32768 8000×2,零挂死(P6 覆盖 step-0/trip-1 的退化 trace)。
+3. bench:c1 d128 十点 wsp/ws,现状 0.881(13.5 表)。判据:全段
+   geomean **≥0.95 视为方向成立**,≥1.0 则 auto 把 causal 也切
+   persistent(改 qk_int_sv_f8_cuda_sm100.cu 的选路);<0.90 判负回
+   退本 commit。c0 二十点回归闸:geomean 不低于 1.05(现 1.084)。
+4. ncu(s16384 c1):vec_full 自旋 19.7/3.4 是否回平(参照 ws 的
+   14.7/7.9);softmax mio 11% 的去向;kv_empty[1] 5.3% 的去向;顺带
+   W=1 c1 斜率复测(13.6.1 的遗留归因)。
