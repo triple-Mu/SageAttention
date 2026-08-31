@@ -47,7 +47,8 @@
 // annotated instead of extracted into a shared header so the existing
 // kernel's TU keeps byte-identical device text - SASS gate). The softmax
 // step departs from the 128-thread kernel's value sequence: the S row stays
-// in the raw integer domain, the block row max is a balanced FMNMX tree
+// in the raw integer domain, the block row max is a balanced max tree
+// (integer IMNMX on d64 steady steps since wave24, D64_DESIGN.md 8.5)
 // scaled back per k-scale class (bit-identical to the old serial fold -
 // rounding is monotone - so row_max / vec / o_scale / the correction
 // rescale factors are still bitwise those of the old kernel), the exp2
@@ -437,6 +438,38 @@ __device__ __forceinline__ float tree_fmax_cls(const uint32_t* r)
     }
 }
 
+// Integer twins of the two trees, over the row's original int32 S values
+// (wave24 = the wave22 vec_full delivery fix revived for d64 ONLY,
+// C1_DESIGN.md section 14 / D64_DESIGN.md section 8.5): int32 -> f32
+// conversion is exact and strictly monotone for |S| < 2^24, so one I2F of
+// the integer tree max is bit-identical to the fmax tree over the converted
+// row - and the row's 128 I2Fs leave the s_full -> vec_full window
+// correction spins on (they run fused into the exp2 arguments instead,
+// after the vec hand-off). d64 steady (non-peeled) steps only: the peeled
+// step's -inf mask sentinel needs the f32 trees above, and d128 keeps the
+// f32 trees on every step (the ungated change lost there, section 15.4).
+template<uint32_t N>
+__device__ __forceinline__ int32_t tree_imax(const uint32_t* r)
+{
+    if constexpr (N == 1) {
+        return static_cast<int32_t>(r[0]);
+    }
+    else {
+        return max(tree_imax<N / 2>(r), tree_imax<N / 2>(r + N / 2));
+    }
+}
+
+template<uint32_t I0, uint32_t N>
+__device__ __forceinline__ int32_t tree_imax_cls(const uint32_t* r)
+{
+    if constexpr (N == 1) {
+        return static_cast<int32_t>(r[8 * (I0 / 2) + (I0 % 2)]);
+    }
+    else {
+        return max(tree_imax_cls<I0, N / 2>(r), tree_imax_cls<I0 + N / 2, N / 2>(r));
+    }
+}
+
 }  // namespace ws
 
 // ---------------------------------------------------------------------------
@@ -790,7 +823,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         //
         // G1 (C1_DESIGN.md section 9): the row stays in the RAW integer
         // domain - no dequanted row is materialized. The block row max is a
-        // balanced FMNMX tree over the raw row scaled back per k-scale class
+        // balanced max tree over the raw row (integer on d64 steady steps
+        // since wave24, D64_DESIGN.md 8.5) scaled back per k-scale class
         // (bit-identical to the old serial dequant+fold, see below), and the
         // exp2 argument is ONE packed fma per pair from the raw word:
         //   p = exp2(raw * (local_sm_scale*dequant) - row_max)
@@ -807,6 +841,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
         // -------------------------------------------------------------------
         auto softmax_step = [&](auto is_last_t, uint32_t iter) {
             constexpr bool is_last = decltype(is_last_t)::value;
+            // wave24 (D64_DESIGN.md section 8.5): the wave22 vec_full
+            // delivery fix (int-domain row max + issue wall, C1_DESIGN.md
+            // section 14) is revived for d64 ONLY - ungated it lost on the
+            // d128 main battlefield (section 15.4) while carrying the whole
+            // d64 gain of the wave23 fused tree (section 15.5). Every gated
+            // branch below keeps the baseline text for d128, so d128
+            // instantiations compile to byte-identical SASS.
+            constexpr bool kVecFullD64 = (head_dim == 64);
 
             // K-scale(s) for this tile (mirrors :400-410; the raw word(s) were
             // prefetched into k_scale_pref during the previous step's ld shadow,
@@ -859,23 +901,31 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 }
             }
             tcgen05::tmem_ld_wait();
+            // d64 steady steps skip this loop: the row STAYS int32 - its 128
+            // I2Fs would otherwise sit inside the s_full -> vec_full window
+            // that correction spins on (wave24, C1_DESIGN.md section 14 /
+            // D64_DESIGN.md section 8.5); they run fused into the exp2
+            // arguments below instead, after the vec hand-off. d128 and the
+            // peeled step keep the baseline convert(+mask) here.
+            if constexpr (!kVecFullD64 || is_last) {
 #pragma unroll
-            for (uint32_t j = 0; j < CTA_K; j++) {
-                float raw = __int2float_rz(static_cast<int32_t>(RS_row[j]));  // exact, |S| < 2^24
-                if constexpr (is_last) {
-                    const uint32_t kv_idx = iter * CTA_K + j;
-                    bool           oob;
-                    if constexpr (mask_mode == MaskMode::kCausal) {
-                        oob = (kv_idx > q_idx) || (kv_idx >= kv_len);
+                for (uint32_t j = 0; j < CTA_K; j++) {
+                    float raw = __int2float_rz(static_cast<int32_t>(RS_row[j]));  // exact, |S| < 2^24
+                    if constexpr (is_last) {
+                        const uint32_t kv_idx = iter * CTA_K + j;
+                        bool           oob;
+                        if constexpr (mask_mode == MaskMode::kCausal) {
+                            oob = (kv_idx > q_idx) || (kv_idx >= kv_len);
+                        }
+                        else {
+                            oob = kv_idx >= kv_len;
+                        }
+                        if (oob) {
+                            raw = __uint_as_float(0xff800000u);  // -inf
+                        }
                     }
-                    else {
-                        oob = kv_idx >= kv_len;
-                    }
-                    if (oob) {
-                        raw = __uint_as_float(0xff800000u);  // -inf
-                    }
+                    RS_row[j] = __float_as_uint(raw);
                 }
-                RS_row[j] = __float_as_uint(raw);
             }
 
             // ---- block row max (G1): balanced fmax tree in the raw domain,
@@ -891,7 +941,25 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             //      hand-off therefore stay bit-identical to the 128-thread
             //      kernel (:454-458). ----
             float m_deq;
-            if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+            if constexpr (kVecFullD64 && !is_last) {
+                // d64 steady steps: integer max tree, one exact I2F at each
+                // tree root (ws::tree_imax note) - bit-identical to the f32
+                // tree over the converted row, with the vec store's
+                // dependency chain shrunk from 128 I2F + FMNMX tree to an
+                // IMNMX tree + 1 I2F per root.
+                if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+                    m_deq = dequant_scale[0] * __int2float_rz(ws::tree_imax_cls<0, 32>(&RS_row[0]));
+#pragma unroll
+                    for (uint32_t cls = 1; cls < kNumKScales; cls++) {
+                        m_deq =
+                            fmaxf(m_deq, dequant_scale[cls] * __int2float_rz(ws::tree_imax_cls<0, 32>(&RS_row[2 * cls])));
+                    }
+                }
+                else {
+                    m_deq = dequant_scale[0] * __int2float_rz(ws::tree_imax<CTA_K>(RS_row));
+                }
+            }
+            else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
                 m_deq = dequant_scale[0] * ws::tree_fmax_cls<0, 32>(&RS_row[0]);
 #pragma unroll
                 for (uint32_t cls = 1; cls < kNumKScales; cls++) {
@@ -930,6 +998,36 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
             tcgen05::tcgen05_fence_before_sync();
             ws::arrive_bar(bar_vfull);
 
+            // ---- issue wall (d64 only; wave24, C1_DESIGN.md section 14 /
+            //      D64_DESIGN.md section 8.5). Without it ptxas sinks the
+            //      vec STTM/arrive into the exp2/pack tail (baseline SASS:
+            //      STTM.x2 amid the F2FP burst, ~25 instructions before the
+            //      P store), so the hand-off correction spins on was
+            //      delivered a whole XU burst late - in-order issue makes
+            //      textual order issue order, and a straight-line block
+            //      lets the scheduler interleave freely. The wall is a
+            //      control dependence: an opaque never-taken early-out
+            //      (vec_gate is bar_vfull's shared-window address, nonzero
+            //      by the bars layout; the volatile asm hides the value
+            //      from NVVM, and ptxas cannot fold a runtime address),
+            //      which neither compiler can delete, and no instruction
+            //      below it can issue above the branch - or above the
+            //      arrive before it (hoisting the branch would make the
+            //      arrive conditional). Warp-uniform by construction
+            //      (bar_vfull is warpgroup-uniform), so the tcgen05
+            //      .aligned contract below holds. It splits the basic block
+            //      between the o_scale rescale and the d_sum accumulation -
+            //      bit-safe ONLY because denom's FFMA is an explicit fmaf
+            //      (the wave23 contraction lesson, see the o_scale note
+            //      above). Runtime cost: ISETP+BRA per step. ----
+            if constexpr (kVecFullD64) {
+                uint32_t vec_gate = bar_vfull;
+                asm volatile("" : "+r"(vec_gate));
+                if (vec_gate == 0) {
+                    return;
+                }
+            }
+
             // ---- p = exp2(fma(raw, c_raw, -row_max)), d_sum, e4m3 pack from
             //      the retained raw row (G1 domain fold). With
             //      c_raw = local_sm_scale * dequant_scale the exp2 argument
@@ -962,7 +1060,19 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 }
             }
             const float neg_row_max = -row_max;
-            float       acc[8];  // 4 packed f32x2 d_sum accumulators
+            // Retained-row word -> f32 exp2 operand: d128 and the peeled
+            // step hold f32 bits; d64 steady steps hold the raw int32 and
+            // convert here - the same exact I2F the baseline convert loop
+            // ran before the vec hand-off, just past it now (wave24).
+            auto col_f32 = [&](uint32_t rw) {
+                if constexpr (kVecFullD64 && !is_last) {
+                    return __int2float_rz(static_cast<int32_t>(rw));
+                }
+                else {
+                    return __uint_as_float(rw);
+                }
+            };
+            float acc[8];  // 4 packed f32x2 d_sum accumulators
 #pragma unroll
             for (uint32_t k = 0; k < 8; k++) {
                 acc[k] = 0.0f;
@@ -985,16 +1095,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 1)
                 float a[4];
                 ws::f32x2_fma(a[0],
                               a[1],
-                              __uint_as_float(RS_row[4 * w]),
-                              __uint_as_float(RS_row[4 * w + 1]),
+                              col_f32(RS_row[4 * w]),
+                              col_f32(RS_row[4 * w + 1]),
                               c01,
                               c01,
                               neg_row_max,
                               neg_row_max);
                 ws::f32x2_fma(a[2],
                               a[3],
-                              __uint_as_float(RS_row[4 * w + 2]),
-                              __uint_as_float(RS_row[4 * w + 3]),
+                              col_f32(RS_row[4 * w + 2]),
+                              col_f32(RS_row[4 * w + 3]),
                               c23,
                               c23,
                               neg_row_max,

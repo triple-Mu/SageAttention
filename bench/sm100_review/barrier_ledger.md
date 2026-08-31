@@ -158,13 +158,19 @@ load (elected thread): issue order `Q0, K0, Q1, V0, (K_i, V_i)*` for
 softmax_t (each of 128 threads; step j):
 ```
 [w] s_full#j
-ld chunks 0-3 (one ld + wait::ld each) -> dequant+mask row kept in regs, m_local
+ld x64 x2 (one collective wait::ld) -> raw row kept in regs (d64 steady
+  steps keep it int32 since wave24, D64_DESIGN 8.5; d128 and the peeled
+  step convert+mask to f32 here); block row max (integer tree on d64
+  steady steps, one I2F per tree root)
 m/denom update; st vec=(m_prev,row_max) -> wait::st, fence, arrive vec_full#j
-exp2+pack from the retained row (no TMEM reads);
+issue wall (d64 only, wave24): opaque never-taken branch after the arrive;
+  the segment below cannot issue before the vec hand-off. Pure control
+  flow - completions, counts and phases of every pipe unchanged
+(I2F+)exp2+pack from the retained row (no TMEM reads);
   denom = fmaf(o_scale, denom, d_sum) (explicit since wave23: any control
-  flow inserted between the old *= / += pair - both reverted wave22 changes
-  did this - splits the basic block and stops the pair contracting on its
-  own; the fmaf keeps the baseline's FFMA bit pattern in every code shape)
+  flow inserted between the old *= / += pair - the issue wall above is one
+  such instance - splits the basic block and stops the pair contracting on
+  its own; the fmaf keeps the baseline's FFMA bit pattern in every code shape)
 st P -> wait::st, fence, arrive s_empty#j
 [w] vec_empty#j
 ```
@@ -255,7 +261,7 @@ arbitrary later phase — see p0c_umma_pipeline.cu.)
 | H6 | PV_t(j) accumulates into O_t while correction's rescale is mid-flight | mma waits `corr_empty#(j-1)` (128 arrivals, each after `wait::st` + fence of the rescale) before issuing PV_t(j); a warp that ballot-skipped the rescale (wave14) has no in-flight TMEM write to order — its arrival is trivially safe |
 | H7 | correction reads O_t (rescale j / epilog) before PV_t(j-1) finished accumulating | `corr_full#(j-1)` completes when the PV chain retired (tcgen05.commit semantics) |
 | H8 | softmax_t's vec store of step j+1 (or the final vec) clobbers vec_t(j) before correction read it | softmax waits `vec_empty#j` at the end of step j; correction arrives only after its vec `tcgen05.ld` + `wait::ld` |
-| H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: all four S chunks are loaded (and the row retained in registers) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
+| H9 | softmax reads S cols [0,2) after its own vec store aliased them | vacuous by construction: the whole S row is loaded (and retained in registers - raw int32 on d64 steady steps since wave24) before the vec store; the exp2/pack segment and the P store touch no S column afterwards |
 | H10 | `tmem_dealloc` while any warp still touches TMEM | 384 dealloc arrivals, each after the thread's last TMEM op (+ fence); the final PV retired transitively before correction's epilog arrivals (H7); mma warp waits ph 0 then deallocs collectively |
 | H11 | generic-proxy smem writes feeding async-proxy readers | sV_scale / sK_scale are written pre-`__syncthreads` and read by correction / softmax over the generic proxy — plain sync suffices (sK_scale: section 9). The one generic->async edge in the kernel body is correction's sO staging feeding the bulk-store engine: every thread issues `fence.proxy.async.shared::cta` after its STS and before its epi_full arrival, and the epilogue warp's TMA store is ordered behind the barrier wait (SS-twin lesson applied) |
 | H12 | epilogue TMA store reads sO[t] before all 128 correction threads staged it | epi_full[t] completes only after 128 arrivals, each preceded by that thread's STS + `fence.proxy.async` |

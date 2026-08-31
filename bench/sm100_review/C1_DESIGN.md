@@ -1358,7 +1358,7 @@ lse=false,mask 两态,即 auto 路径的默认 gran)。复现:对
    14.7/7.9);softmax mio 11% 的去向;kv_empty[1] 5.3% 的去向;顺带
    W=1 c1 斜率复测(13.6.1 的遗留归因)。
 
-## 14. wave22:vec_full 交付时机修复——int-domain row max + issue wall(**wave23 上机判负,已 revert**,§15)
+## 14. wave22:vec_full 交付时机修复——int-domain row max + issue wall(**wave23 上机判负,已 revert**,§15;**wave24 按 d64-only gate 重启**,D64_DESIGN §8.5)
 
 攻坚对象:§13.5 的遗留 —— c0 稳态里 correction 自旋 vec_full 21.3%
 (s4096/s16384 同值,persistent 只吃序幕没动它)。改动两件套,均落在
@@ -1647,3 +1647,6 @@ wave23 收口:
   判据以 bench 为准。
 - 数据:集群 `logs-w23b/`(golden/stress/bench-d64/ncu),对照
   `logs-w23/`;树 archive `sage-w12.tar.gz`(复验树版本)。
+- 后续:本节的差值账(vec_full 交付对 d64 单独 ~+7%)在 wave24 兑现为
+  d64-only gate 重启(§14 两件套 gate 到 head_dim==64,d128 SASS 逐字节
+  不动),设计、门禁与判决见 D64_DESIGN §8.5。

@@ -602,6 +602,55 @@ exp2(128×EX2)保持在前移 wait 之后,错相直接作用于本步 EX2 段。
   sm_{100a,110a})与 fc03183 逐条恒等;显式 fmaf(a034939)留在源码
   (它就是基线收缩出的那条 FFMA,C1_DESIGN §15.2)。
 
+### 8.5 wave24:vec_full 交付时机 d64 单独成刀(§8.4 重启条款兑现)
+
+分支 wave24/d64-vecfull,基线 d5210ca(= fc03183 + 显式 fmaf a034939 同款
+7a7c84d)。把 §14(C1_DESIGN)被 revert 的 vec_full 交付两件套(int-domain
+row max + issue wall,1865bf3/1d71ed4)原样取回,但 gate 到
+`head_dim == 64`(`kVecFullD64`,if constexpr;ws 与 persist 两 TU 同
+gate)。**EX2 phase gate(§8.1-8.4 判负的 moved vec_empty wait)不回归**。
+
+依据 = §15.5(C1_DESIGN)的差值账:融合树 d64 ws/old 1.0269,终树(仅
+gate)0.9575,ws 列跨节点比慢 7.4% 全落在 vec_full 交付改动上 → 该改动对
+d64 单独贡献约 +7%;它只在 d128 主战场判负(§15.4),d64-only gate 把
+d128 摘出去(每个 gated 分支的 d128 侧保持基线文本,构造性保证 SASS 逐字
+节不动)。值契约:显式 fmaf 已在基线,wall 切开 basic block 不再影响
+denom 收缩;按 §15.2 教训,本地闸加 FP opcode 逐类计数对账。
+
+#### 8.5.1 本地门禁(全过;nvcc 13.3,复现命令同 §5/§13.3)
+
+| 项 | 结果 |
+|---|---|
+| ptxas,两 TU probe 各 4 实例 × sm_100a/sm_110a | 16/16:0 spill / 0 stack / 128 entry;USETMAXREG 0xc0/0x58/0x28 各 ×4 |
+| d128 SASS(按函数对基线 d5210ca) | 8/8 实例逐字节恒等 |
+| FP opcode 逐类对账(8 个 d64 实例,全函数 + 稳态循环两口径) | FFMA/FMUL/FADD/MUFU/F2FP/FFMA2/FADD2 全守恒;变化仅设计集:FMNMX/FMNMX3 → VIMNMX/VIMNMX3(sm_100a)或 IMNMX(sm_110a),I2FP +1(per-warp)/+4(per-thread)= 树根,+1 BRA/+1-2 ISETP 等 = wall |
+| 站点形态(persist sm_100a d64 c0 稳态步) | LDTM→STTM.x2 窗口 511→97 条(I2FP 128→1、EX2 128→0、F2FP 46→0);序 = STTM.x2 → fence → arrive → `@!P0 BRA` → I2F/EX2 突发 |
+| softmax 区峰值(nvdisasm -lrm=count) | d64 各实例 ≤176(基线 154-165;预算 191);d128 不变 |
+| numpy 位级自检 | imax_domain_sim.py 复跑 PASS |
+
+稳态循环口径 = 最小的含 128 MUFU 回跳段(两侧都恰 129 MUFU = 128 行 EX2 +
+1 o_scale EX2),loop body:sm_100a c0 594→600 条。
+
+#### 8.5.2 上机判据(B200,预注册)
+
+1. golden 三轨 diff=0 硬闸(WS=0 / WS=1 / WS=1+PERSIST=1)。
+2. d64 压测面零挂死:SWEEP 两态 + s32768 8000×2 + trip/W 退化。
+3. bench d64 12 点(7.6 口径,3 轮 median):ws/old 与 wsp/old,对照
+   wave23b 终树 0.9575/0.9399 与 wave19 无改动基线 0.980。判据:**单改动
+   geomean ≥1.0 且无形状 <0.96 才 keep**(§15.5 差值账预期 ~+7%);
+   ws/cudnn 新读数记档。
+4. d128 抽查 4 形状:与基线同场同值(SASS 恒等的运行时佐证)。
+5. ncu d64 s16384 nc b4h32:vec_full 自旋相位与 mio_throttle/XU 方向
+   (对照 §8.4 终树的 mio 1.06 / XU 51.9)。
+
+裁决预案:keep → launcher auto 注释改判据(d64 翻不翻 ws/persist 看 12 点
+全景);判负 → revert 本改动并**关死 §8.4 的重启条款**(vec 交付时机对
+d64 的独立收益即被证伪,M1 全线出局)。
+
+#### 8.5.3 wave24 B200 实测与判决
+
+(待上机后回填)
+
 ## 附录 B:per tile-block 归一化(§1.4)
 
 定义:SM·µs per tile-block = duration_ms × 148 ÷ N_unit × 1000,
